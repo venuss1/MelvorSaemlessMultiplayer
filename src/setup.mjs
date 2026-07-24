@@ -2194,11 +2194,20 @@ class Sync {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
           this.ctx.patch(CombatManager, m).after(function () {
-            // If local player stops combat, release our claim
+            // If local player stops combat (and we're the attacker), release claim
+            // and send stop event so the spectator also stops
             if (m === 'stop' && sync._combatOwner === 'me' && !sync._applyingRemote) {
               sync._combatOwner = null;
               sync.transport.send({ t: Msg.COMBAT_RELEASE });
+              // Also send a combat_event stop so spectator stops too
+              sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
               logger.info(`[COMBAT] Released combat (stopped)`);
+            }
+            // If spectator stops (they shouldn't be fighting, but just in case),
+            // also notify the attacker
+            if (m === 'stop' && sync._combatOwner === 'peer' && !sync._applyingRemote) {
+              sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
+              logger.info(`[COMBAT] Spectator stopped combat, notifying attacker`);
             }
             sendCombatState();
           });
@@ -2220,76 +2229,14 @@ class Sync {
     this._applyingRemote = true;
     try {
       if (msg.kind === 'state') {
-        // Full state sync — monster selection, HP, paused
-        if (msg.monsterId) {
-          const monster = game.monsters.getObjectByID(msg.monsterId);
-          const currentMonsterId = cm.enemy.monster ? cm.enemy.monster.id : null;
-          const enemyIsDead = cm.enemy.hitpoints <= 0;
-          logger.info(`[COMBAT] State sync: monster=${msg.monsterId}, found=${!!monster}, current=${currentMonsterId}, enemyDead=${enemyIsDead}, hp=${cm.enemy.hitpoints}, areaId=${msg.areaId}`);
-          // Re-select if monster is different OR enemy is dead (needs respawn)
-          if (monster && cm.enemy && (currentMonsterId !== msg.monsterId || enemyIsDead)) {
-            try {
-              // Find the area this monster belongs to
-              let area = null;
-              if (msg.areaId) {
-                area = game.combatAreas.getObjectByID(msg.areaId)
-                    || game.slayerAreas.getObjectByID(msg.areaId)
-                    || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
-                    || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
-                    || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
-              }
-              logger.info(`[COMBAT] Area from areaId: ${area ? area.id : 'not found'}`);
-              if (!area && monster._area) { area = monster._area; logger.info(`[COMBAT] Area from monster._area: ${area.id}`); }
-              if (!area) {
-                if (game.combatAreas && game.combatAreas.allObjects) {
-                  for (const a of game.combatAreas.allObjects) {
-                    if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
-                  }
-                }
-                if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
-                  for (const a of game.slayerAreas.allObjects) {
-                    if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
-                  }
-                }
-                if (area) logger.info(`[COMBAT] Area from search: ${area.id}`);
-              }
-              if (area && cm.selectMonster) {
-                logger.info(`[COMBAT] Calling selectMonster(${monster.id}, ${area.id})`);
-                try {
-                  cm.selectMonster(monster, area);
-                } catch (e) { logger.warn(`[COMBAT] selectMonster threw: ${e.message}`); }
-                cm.selectedMonster = monster;
-                if (cm.selectedArea !== undefined) cm.selectedArea = area;
-                // selectMonster sets up the monster but may leave HP at 0.
-                // Call spawnEnemy to properly spawn with full HP and image.
-                if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) {
-                  try { cm.spawnEnemy(); } catch (e) { logger.warn(`[COMBAT] spawnEnemy threw: ${e.message}`); }
-                }
-                logger.info(`[COMBAT] selectMonster done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
-              } else {
-                logger.info(`[COMBAT] Fallback: setNewMonster + initializeForCombat`);
-                cm.enemy.setNewMonster(monster);
-                cm.enemy.initializeForCombat();
-                cm.selectedMonster = monster;
-                if (cm.selectedArea !== undefined && area) cm.selectedArea = area;
-                if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) {
-                  try { cm.spawnEnemy(); } catch (e) { logger.warn(`[COMBAT] spawnEnemy threw: ${e.message}`); }
-                }
-                logger.info(`[COMBAT] Fallback done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
-              }
-            } catch (e) { logger.warn(`[COMBAT] selectMonster failed: ${e.message}`); }
-          } else {
-            logger.info(`[COMBAT] Monster already selected and alive — skipping selectMonster`);
-          }
-        }
-        // Sync HP values (only if provided and enemy is alive)
-        if (msg.enemyHp !== undefined && msg.enemyHp > 0 && cm.enemy) {
+        // State sync — just update HP, don't re-select monster
+        // Monster selection is handled by COMBAT_CLAIM, not state sync
+        if (msg.enemyHp !== undefined && cm.enemy) {
           cm.enemy.hitpoints = msg.enemyHp;
         }
         if (msg.playerHp !== undefined && cm.player) {
           cm.player.hitpoints = msg.playerHp;
         }
-        // Full combat render
         this._renderCombat();
       } else if (msg.kind === 'damage') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
@@ -2301,7 +2248,7 @@ class Sync {
           target.hitpoints = Math.max(0, target.hitpoints - msg.amount);
         }
         // Show damage splash for visual feedback
-        if (target.splashManager && target.splashManager.add) {
+        if (msg.amount > 0 && target.splashManager && target.splashManager.add) {
           try {
             target.splashManager.add({
               source: msg.source || 'Attack',
@@ -2310,14 +2257,10 @@ class Sync {
             });
           } catch (e) { /* skip splash */ }
         }
-        // Set render queue flags so the game's render loop picks it up
         if (target.renderQueue) {
           target.renderQueue.hitpoints = true;
           target.renderQueue.damageSplash = true;
         }
-        // Note: Don't reset HP on death — let the game's tick loop process
-        // death normally (onEnemyDeath) so monster drops work. The crash in
-        // rewardSlayerTaskCurrency is handled by patching that method.
         this._renderCombat();
       } else if (msg.kind === 'heal') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
@@ -2327,8 +2270,7 @@ class Sync {
         } else {
           target.hitpoints = Math.min(target.stats ? target.stats.maxHitpoints : target.hitpoints, target.hitpoints + msg.amount);
         }
-        // Show heal splash
-        if (target.splashManager && target.splashManager.add) {
+        if (msg.amount > 0 && target.splashManager && target.splashManager.add) {
           try {
             target.splashManager.add({
               source: 'Heal',
@@ -2341,6 +2283,14 @@ class Sync {
           target.renderQueue.hitpoints = true;
           target.renderQueue.damageSplash = true;
         }
+        this._renderCombat();
+      } else if (msg.kind === 'stop') {
+        // Attacker stopped combat — stop our combat too
+        logger.info(`[COMBAT] Peer stopped combat`);
+        if (cm.stop) {
+          try { cm.stop(); } catch (e) { /* skip */ }
+        }
+        this._combatOwner = null;
         this._renderCombat();
       }
     } catch (e) { logger.error('applyCombatEvent failed', e); }
@@ -2386,42 +2336,52 @@ class Sync {
   _applyCombatClaim(msg) {
     const cm = game.combat;
     if (!cm) return;
-    logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}`);
+    logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}, area: ${msg.areaId}`);
     this._combatOwner = 'peer';
-    // Don't pause combat — that hides the enemy visual.
-    // Instead, we just set _combatOwner='peer' which prevents our local
-    // damage patches from sending (the peer is the attacker, not us).
-    // The enemy stays visible, we just don't attack.
-    // Sync the monster selection so we see the same enemy
+    // Stop our combat — we're spectating, not attacking
+    // This prevents double-damage: only the attacker's game runs combat
+    if (cm.stop) {
+      try { cm.stop(); } catch (e) { /* skip */ }
+    }
+    // Select the same monster so we can see it — but DON'T start combat
     if (msg.monsterId) {
       this._applyingRemote = true;
       try {
         const monster = game.monsters.getObjectByID(msg.monsterId);
-        if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId || cm.enemy.hitpoints <= 0)) {
-          let area = null;
-          if (msg.areaId) {
-            area = game.combatAreas.getObjectByID(msg.areaId)
-                || game.slayerAreas.getObjectByID(msg.areaId)
-                || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
-                || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
-                || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
-          }
-          if (!area && monster._area) area = monster._area;
-          if (!area) {
-            if (game.combatAreas && game.combatAreas.allObjects) {
-              for (const a of game.combatAreas.allObjects) {
-                if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+        if (monster && cm.enemy) {
+          // Only select if different monster or dead
+          const currentId = cm.enemy.monster ? cm.enemy.monster.id : null;
+          if (currentId !== msg.monsterId || cm.enemy.hitpoints <= 0) {
+            let area = null;
+            if (msg.areaId) {
+              area = game.combatAreas.getObjectByID(msg.areaId)
+                  || game.slayerAreas.getObjectByID(msg.areaId)
+                  || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
+                  || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
+                  || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
+            }
+            if (!area && monster._area) area = monster._area;
+            if (!area) {
+              if (game.combatAreas && game.combatAreas.allObjects) {
+                for (const a of game.combatAreas.allObjects) {
+                  if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+                }
+              }
+              if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
+                for (const a of game.slayerAreas.allObjects) {
+                  if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+                }
               }
             }
-            if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
-              for (const a of game.slayerAreas.allObjects) {
-                if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+            if (area && cm.selectMonster) {
+              cm.selectMonster(monster, area);
+              if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) cm.spawnEnemy();
+              // Stop combat again — selectMonster auto-starts it
+              if (cm.stop) {
+                try { cm.stop(); } catch (e) { /* skip */ }
               }
+              logger.info(`[COMBAT] Spectator selected monster: ${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
             }
-          }
-          if (area && cm.selectMonster) {
-            cm.selectMonster(monster, area);
-            if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) cm.spawnEnemy();
           }
         }
       } catch (e) { logger.warn(`[COMBAT] claim selectMonster failed: ${e.message}`); }
@@ -2435,7 +2395,6 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Peer released combat`);
     this._combatOwner = null;
-    // Restore our pause state — we can attack again if we want
     // Don't auto-unpause; let the player decide
   }
 
