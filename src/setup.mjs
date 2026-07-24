@@ -1265,43 +1265,64 @@ class Sync {
 
     // Replace unlockPlotOnClick entirely — the newer Melvor version uses
     // currencyCosts/itemCosts instead of gpCost (which is @deprecated).
-    // The original function throws when gpCost is undefined, preventing
-    // the after hook from running. So we replace it completely.
-    const origUnlockPlot = Farming.prototype.unlockPlotOnClick;
+    // The original function throws "Cannot read properties of undefined
+    // (reading 'item')" because it tries to access itemCosts items that
+    // don't exist. It eats gold before throwing and leaves the DOM broken.
+    // So we replace it completely and do everything ourselves.
     Farming.prototype.unlockPlotOnClick = function (plot) {
       if (!plot) {
         logger.warn('[FARM] unlockPlotOnClick called with no plot');
         return;
       }
+      // Already unlocked — do nothing
+      if (plot.state !== 0) {
+        logger.info(`[FARM] unlockPlotOnClick: plot ${plot.id} already unlocked (state=${plot.state})`);
+        return;
+      }
       const gpBefore = game.gp ? game.gp.amount : 0;
-      logger.info(`[FARM] unlockPlotOnClick: plot=${plot.id}, state=${plot.state}, level=${plot.level}, abyssalLevel=${plot.abyssalLevel}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${gpBefore}`);
+      logger.info(`[FARM] unlockPlotOnClick: plot=${plot.id}, state=${plot.state}, level=${plot.level}, myLevel=${this._level}, myGP=${gpBefore}`);
 
-      // Try the original first — it handles costs properly
-      let originalSucceeded = false;
+      // Pay costs using the Costs system (handles currencyCosts + itemCosts)
+      let paid = false;
       try {
-        origUnlockPlot.call(this, plot);
-        originalSucceeded = (plot.state === 1);
-        logger.info(`[FARM] original returned: state=${plot.state}, gp=${game.gp ? game.gp.amount : 'no-gp'}, succeeded=${originalSucceeded}`);
+        if (this.getPlotUnlockCosts) {
+          const costs = this.getPlotUnlockCosts(plot);
+          logger.info(`[FARM] getPlotUnlockCosts returned: ${costs ? typeof costs : 'null'}`);
+          if (costs) {
+            // Check if we can afford it
+            if (costs.checkIfOwned && costs.checkIfOwned()) {
+              costs.consumeCosts();
+              paid = true;
+              logger.info(`[FARM] Paid costs via Costs API for ${plot.id}, gp now=${game.gp ? game.gp.amount : 'no-gp'}`);
+            } else {
+              logger.warn(`[FARM] Cannot afford costs for ${plot.id}`);
+              // Can't afford — don't unlock
+              return;
+            }
+          }
+        }
       } catch (e) {
-        logger.warn(`[FARM] original threw: ${e.message}`);
-        // The original may have eaten gold before throwing — restore it
+        logger.warn(`[FARM] Cost payment threw: ${e.message}`);
+        // Restore any GP that was eaten
         if (game.gp && game.gp.amount < gpBefore) {
           const eaten = gpBefore - game.gp.amount;
-          try { game.gp.add(eaten); logger.info(`[FARM] Restored ${eaten} GP eaten by failed original`); }
-          catch (e2) { logger.warn(`[FARM] Could not restore GP: ${e2.message}`); }
+          try { game.gp.add(eaten); logger.info(`[FARM] Restored ${eaten} GP after cost error`); }
+          catch (e2) { /* skip */ }
         }
       }
 
-      // If the unlock failed (state still 0), force it without charging
-      if (plot.state === 0) {
-        plot.state = 1; // Empty
-        if (this.showPlotsInCategory) {
-          try { this.showPlotsInCategory(plot.category); } catch (e) { /* skip */ }
+      // Force the unlock — set state to Empty
+      plot.state = 1;
+      logger.info(`[FARM] Unlocked plot ${plot.id}, state=${plot.state}, paid=${paid}`);
+
+      // Re-render the UI completely
+      try {
+        if (this.showPlotsInCategory && plot.category) {
+          this.showPlotsInCategory(plot.category);
         }
-        logger.info(`[FARM] Force unlocked plot: ${plot.id}`);
-      } else {
-        logger.info(`[FARM] Unlocked plot SUCCESS: ${plot.id}`);
-      }
+      } catch (e) { logger.warn(`[FARM] showPlotsInCategory threw: ${e.message}`); }
+      try { if (this.render) this.render(); } catch (e) { /* skip */ }
+      try { if (this.renderPlotVisibility) this.renderPlotVisibility(); } catch (e) { /* skip */ }
 
       // Sync to peer
       sendPlot(plot);
