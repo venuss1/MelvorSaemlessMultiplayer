@@ -2502,7 +2502,7 @@ class Sync {
       }
     }
 
-    // Harvesting: selected vein
+    // Harvesting: selected vein + vein intensity
     const hv = game.harvesting;
     if (hv) {
       const send = () => {
@@ -2517,7 +2517,20 @@ class Sync {
           veins,
         });
       };
+      // Throttle intensity updates — reduceVeinIntensity fires every action tick
+      let lastHarvestSend = 0;
+      const throttledSend = () => {
+        const now = Date.now();
+        if (now - lastHarvestSend < 2000) return;
+        lastHarvestSend = now;
+        send();
+      };
       if (typeof Harvesting.prototype.onVeinClick === 'function') this.ctx.patch(Harvesting, 'onVeinClick').after(() => send());
+      // Sync vein intensity changes during active harvesting
+      if (typeof Harvesting.prototype.reduceVeinIntensity === 'function') this.ctx.patch(Harvesting, 'reduceVeinIntensity').after(() => throttledSend());
+      if (typeof Harvesting.prototype.postAction === 'function') this.ctx.patch(Harvesting, 'postAction').after(() => throttledSend());
+      // Sync passive vein regen
+      if (typeof Harvesting.prototype.passiveTick === 'function') this.ctx.patch(Harvesting, 'passiveTick').after(() => throttledSend());
     }
 
     // Archaeology: dig site selection, tools, museum
@@ -4364,21 +4377,85 @@ class Sync {
   }
 
   // ---- Stats sync -------------------------------------------------------
+  // game.stats is a Statistics object with named StatTracker properties
+  // (Woodcutting, Fishing, ..., General, Combat, GolbinRaid, Shop) plus
+  // MappedStatTracker properties (Items, Monsters).
+  // Each StatTracker has a .stats Map<number, number>.
+  // We patch StatTracker.prototype.add/set/inc to detect changes and sync
+  // all trackers as { trackerName: { statId: value, ... }, ... }.
   _patchStats() {
     if (!game.stats) return;
+    // Build a map from tracker instance -> tracker name for quick lookup
+    const trackerNames = new Map();
+    const namedTrackerKeys = [
+      'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
+      'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
+      'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
+      'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
+      'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
+      'General', 'Combat', 'GolbinRaid', 'Shop',
+    ];
+    for (const key of namedTrackerKeys) {
+      if (game.stats[key]) trackerNames.set(game.stats[key], key);
+    }
+    // MappedStatTrackers (Items, Monsters) — track separately
+    const mappedTrackerKeys = ['Items', 'Monsters'];
+    for (const key of mappedTrackerKeys) {
+      if (game.stats[key]) trackerNames.set(game.stats[key], key);
+    }
+
+    const serializeAll = () => {
+      const data = {};
+      // Named StatTrackers
+      for (const key of namedTrackerKeys) {
+        const tracker = game.stats[key];
+        if (!tracker || !tracker.stats) continue;
+        const entries = {};
+        for (const [statId, val] of tracker.stats) entries[statId] = val;
+        data[key] = entries;
+      }
+      // MappedStatTrackers (Items, Monsters) — keyed by object ID
+      for (const key of mappedTrackerKeys) {
+        const mst = game.stats[key];
+        if (!mst || !mst.statsMap) continue;
+        const mapped = {};
+        for (const [obj, tracker] of mst.statsMap) {
+          if (!tracker || !tracker.stats) continue;
+          const entries = {};
+          for (const [statId, val] of tracker.stats) entries[statId] = val;
+          if (obj && obj.id) mapped[obj.id] = entries;
+        }
+        data[key] = mapped;
+      }
+      return data;
+    };
+
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      // Send all stat values — stats are a Map<number, number>
-      const stats = {};
-      if (game.stats.stats) {
-        for (const [key, val] of game.stats.stats) stats[key] = val;
-      }
-      this.transport.send({ t: Msg.STATS, stats });
+      this.transport.send({ t: Msg.STATS, stats: serializeAll() });
     };
-    // Patch add/set/inc on the stat tracker
-    for (const m of ['add', 'set', 'inc']) {
-      if (typeof Statistics.prototype[m] === 'function') {
-        this.ctx.patch(Statistics, m).after(() => send());
+    // Throttle — stats change very frequently during active play
+    let lastStatsSend = 0;
+    const throttledSend = () => {
+      const now = Date.now();
+      if (now - lastStatsSend < 3000) return;
+      lastStatsSend = now;
+      send();
+    };
+
+    // Patch StatTracker.prototype.add/set/inc — these are the actual methods
+    if (typeof StatTracker !== 'undefined' && StatTracker.prototype) {
+      for (const m of ['add', 'set', 'inc']) {
+        if (typeof StatTracker.prototype[m] === 'function') {
+          try {
+            this.ctx.patch(StatTracker, m).after(function () {
+              // Only sync if this tracker is one of ours (not a dummy)
+              const name = trackerNames.get(this);
+              if (!name) return;
+              throttledSend();
+            });
+          } catch { /* skip */ }
+        }
       }
     }
   }
@@ -4387,14 +4464,45 @@ class Sync {
     if (!game.stats || !msg.stats) return;
     this._applyingRemote = true;
     try {
-      for (const [key, val] of Object.entries(msg.stats)) {
-        // Stats keys may be numeric stat IDs or string keys. Try numeric first
-        // (the common case), then fall back to the raw string key.
-        const numKey = Number(key);
-        if (!isNaN(numKey) && game.stats.stats.set) {
-          game.stats.stats.set(numKey, val);
-        } else if (game.stats.stats.set) {
-          game.stats.stats.set(key, val);
+      const namedTrackerKeys = [
+        'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
+        'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
+        'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
+        'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
+        'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
+        'General', 'Combat', 'GolbinRaid', 'Shop',
+      ];
+      for (const key of namedTrackerKeys) {
+        const tracker = game.stats[key];
+        const remoteData = msg.stats[key];
+        if (!tracker || !tracker.stats || !remoteData) continue;
+        for (const [statId, val] of Object.entries(remoteData)) {
+          const numKey = Number(statId);
+          const k = isNaN(numKey) ? statId : numKey;
+          // Use Math.max to avoid overwriting higher stat values with stale lower ones
+          const current = tracker.stats.get(k) || 0;
+          tracker.stats.set(k, Math.max(current, val));
+        }
+      }
+      // MappedStatTrackers (Items, Monsters)
+      for (const key of ['Items', 'Monsters']) {
+        const mst = game.stats[key];
+        const remoteMapped = msg.stats[key];
+        if (!mst || !mst.statsMap || !remoteMapped) continue;
+        for (const [objId, entries] of Object.entries(remoteMapped)) {
+          // Find the object in the registry
+          const registry = mst.registry;
+          if (!registry) continue;
+          const obj = registry.getObjectByID(objId);
+          if (!obj) continue;
+          const tracker = mst.statsMap.get(obj);
+          if (!tracker || !tracker.stats) continue;
+          for (const [statId, val] of Object.entries(entries)) {
+            const numKey = Number(statId);
+            const k = isNaN(numKey) ? statId : numKey;
+            const current = tracker.stats.get(k) || 0;
+            tracker.stats.set(k, Math.max(current, val));
+          }
         }
       }
       if (game.stats.renderMutatedStats) try { game.stats.renderMutatedStats(); } catch { /* noop */ }
@@ -4946,6 +5054,16 @@ class Sync {
         }
       }
     }
+    // Harvesting veins (intensity)
+    let harvestingVeins = null;
+    if (game.harvesting) {
+      harvestingVeins = [];
+      for (const vein of game.harvesting.actions.allObjects) {
+        if (vein && typeof vein.currentIntensity === 'number') {
+          harvestingVeins.push({ id: vein.id, intensity: vein.currentIntensity, max: vein.maxIntensity });
+        }
+      }
+    }
     // Farming plots
     let farmingPlots = null;
     if (game.farming) {
@@ -4998,7 +5116,7 @@ class Sync {
       });
     }
 
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState, combatEventState, potions };
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, harvestingVeins, farming: farmingPlots, combat: combatState, combatEventState, potions };
 
     // Mastery (per-action XP + mastery pool XP per realm)
     const mastery = [];
@@ -5257,11 +5375,38 @@ class Sync {
       snapshot.fishContest = fishData;
     }
 
-    // Game stats (Statistics tracker)
-    if (game.stats && game.stats.stats) {
+    // Game stats — serialize all StatTrackers on the Statistics object
+    if (game.stats) {
       const statsData = {};
       try {
-        for (const [key, val] of game.stats.stats) statsData[key] = val;
+        const namedKeys = [
+          'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
+          'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
+          'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
+          'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
+          'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
+          'General', 'Combat', 'GolbinRaid', 'Shop',
+        ];
+        for (const key of namedKeys) {
+          const tracker = game.stats[key];
+          if (!tracker || !tracker.stats) continue;
+          const entries = {};
+          for (const [statId, val] of tracker.stats) entries[statId] = val;
+          statsData[key] = entries;
+        }
+        // MappedStatTrackers
+        for (const key of ['Items', 'Monsters']) {
+          const mst = game.stats[key];
+          if (!mst || !mst.statsMap) continue;
+          const mapped = {};
+          for (const [obj, tracker] of mst.statsMap) {
+            if (!tracker || !tracker.stats) continue;
+            const entries = {};
+            for (const [statId, val] of tracker.stats) entries[statId] = val;
+            if (obj && obj.id) mapped[obj.id] = entries;
+          }
+          statsData[key] = mapped;
+        }
       } catch { /* noop */ }
       snapshot.stats = statsData;
     }
@@ -5547,6 +5692,23 @@ class Sync {
         }
         if (game.mining.renderRockHP) game.mining.renderRockHP();
         if (game.mining.renderRockStatus) game.mining.renderRockStatus();
+      }
+      // Harvesting veins — skip the vein the local player is harvesting
+      if (msg.harvestingVeins && game.harvesting) {
+        let localVeinId = null;
+        try {
+          if (game.harvesting.selectedVein && game.harvesting.selectedVein.id) localVeinId = game.harvesting.selectedVein.id;
+          else if (game.harvesting.activeProgressVein && game.harvesting.activeProgressVein.id) localVeinId = game.harvesting.activeProgressVein.id;
+        } catch { /* noop */ }
+        for (const v of msg.harvestingVeins) {
+          if (localVeinId && v.id === localVeinId) continue;
+          const vein = game.harvesting.actions.getObjectByID(v.id);
+          if (!vein) continue;
+          if (typeof v.intensity === 'number') vein.currentIntensity = v.intensity;
+          if (typeof v.max === 'number') vein.maxIntensity = v.max;
+        }
+        if (game.harvesting.renderVeinIntensity) game.harvesting.renderVeinIntensity();
+        if (game.harvesting.renderVeinStatus) game.harvesting.renderVeinStatus();
       }
       // Farming plots
       if (msg.farming && game.farming) {
