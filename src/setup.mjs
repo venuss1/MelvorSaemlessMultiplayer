@@ -2165,6 +2165,34 @@ class Sync {
       };
     }
 
+    // Patch loadNextEnemy — prevent crash when area/monster not selected
+    if (typeof CombatManager.prototype.loadNextEnemy === 'function') {
+      const orig3 = CombatManager.prototype.loadNextEnemy;
+      CombatManager.prototype.loadNextEnemy = function () {
+        try { return orig3.call(this); }
+        catch (e) { logger.warn(`loadNextEnemy caught: ${e.message}`); }
+      };
+    }
+
+    // Patch CombatManager.tick — skip combat ticks when spectating (peer is attacking)
+    // This prevents double-hitting: only the attacker's game runs combat
+    if (typeof CombatManager.prototype.tick === 'function') {
+      this.ctx.patch(CombatManager, 'tick').before(function () {
+        if (sync._combatOwner === 'peer') {
+          // Skip this tick entirely — return false to cancel? No, before can't cancel.
+          // Instead, we'll set paused=true temporarily so the tick does nothing.
+          this._rmpWasPaused = this.paused;
+          if (!this.paused) this.paused = true;
+        }
+      });
+      this.ctx.patch(CombatManager, 'tick').after(function () {
+        if (sync._combatOwner === 'peer' && this._rmpWasPaused === false) {
+          this.paused = false;
+          this._rmpWasPaused = undefined;
+        }
+      });
+    }
+
     // Patch pause/unpause — sync combat pause state and release claim on stop
     for (const m of ['pause', 'stop', 'start']) {
       if (typeof CombatManager.prototype[m] === 'function') {
@@ -2337,6 +2365,8 @@ class Sync {
           cm.enemy.renderQueue.stats = true;
           cm.enemy.renderQueue.attacks = true;
         }
+        // setRenderAll sets ALL render queue flags at once
+        if (cm.enemy.setRenderAll) cm.enemy.setRenderAll();
         if (cm.enemy.renderHitpoints) cm.enemy.renderHitpoints();
         if (cm.enemy.renderImageAndName) cm.enemy.renderImageAndName();
         if (cm.enemy.render) cm.enemy.render();
@@ -2350,6 +2380,9 @@ class Sync {
       }
       // Full combat manager render — updates the entire combat tab
       if (cm.render) cm.render();
+      // onPageChange forces a full re-render of the combat page
+      if (cm.onPageChange) cm.onPageChange();
+      if (cm.renderLocation) cm.renderLocation();
     } catch (e) { /* skip render errors */ }
   }
 
