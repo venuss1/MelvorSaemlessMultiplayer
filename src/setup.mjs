@@ -431,6 +431,7 @@ class Sync {
     }
     this._startWatcher();
     this._startProgressBroadcaster();
+    this._startPeriodicStateSync();
     logger.info(`========== [MP] PATCHES DONE: ${ok} ok, ${fail} failed, ${patches.length - ok - fail} skipped ==========`);
 
     // Log what game systems are actually available
@@ -493,6 +494,7 @@ class Sync {
     if (this._saveTimer) { clearInterval(this._saveTimer); this._saveTimer = null; }
     if (this._progressTimer) { clearInterval(this._progressTimer); this._progressTimer = null; }
     if (this._combatStateInterval) { clearInterval(this._combatStateInterval); this._combatStateInterval = null; }
+    if (this._stateSyncTimer) { clearInterval(this._stateSyncTimer); this._stateSyncTimer = null; }
   }
 
   // Debounced render — batches multiple updates into a single render frame.
@@ -3348,6 +3350,42 @@ class Sync {
 
   // ---- Active-action watcher -------------------------------------------
 
+  _startPeriodicStateSync() {
+    // Every 10 seconds, send a full state sync to keep both players
+    // in sync even if individual patches miss something.
+    this._stateSyncTimer = setInterval(() => {
+      if (!this.transport.isConnected || this._applyingRemote) return;
+      try {
+        // Send XP for all skills
+        for (const skill of game.skills.allObjects) {
+          const xpMsg = { t: Msg.XP, skillId: skill.id, xp: skill.xp };
+          if (skill.hasAbyssalLevels) xpMsg.abyssalXp = skill.abyssalXP;
+          this.transport.send(xpMsg);
+        }
+        // Send mastery sync for all skills with mastery
+        for (const skill of game.skills.allObjects) {
+          if (!skill.hasMastery || !skill.actionMastery) continue;
+          for (const [action, am] of skill.actionMastery) {
+            if (action && action.id && am) {
+              this.transport.send({ t: Msg.MASTERY, skillId: skill.id, actionId: action.id, xp: am.xp });
+            }
+          }
+          if (skill._masteryPoolXP) {
+            skill._masteryPoolXP.forEach((xp, realm) => {
+              if (realm && realm.id) {
+                this.transport.send({ t: Msg.MASTERY_POOL, skillId: skill.id, realmId: realm.id, xp });
+              }
+            });
+          }
+        }
+        // Send currencies
+        if (game.currencies) for (const c of game.currencies.allObjects) {
+          this.transport.send({ t: Msg.CURRENCY, currencyId: c.id, qty: c._amount });
+        }
+      } catch (e) { logger.warn('periodic state sync failed', e); }
+    }, 10000);
+  }
+
   _startWatcher() {
     this._watcher = setInterval(() => this._watchActiveAction(), 1000);
     this._watchActiveAction();
@@ -3462,7 +3500,189 @@ class Sync {
       };
     }
     const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState };
-    logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots, combat: ${combatState ? 'yes' : 'no'}`);
+
+    // Mastery (per-action XP + mastery pool XP per realm)
+    const mastery = [];
+    for (const skill of game.skills.allObjects) {
+      if (!skill.hasMastery || !skill.actionMastery) continue;
+      const actions = [];
+      for (const [action, am] of skill.actionMastery) {
+        if (action && action.id && am) actions.push({ actionId: action.id, xp: am.xp });
+      }
+      const pools = [];
+      if (skill._masteryPoolXP) {
+        skill._masteryPoolXP.forEach((xp, realm) => {
+          if (realm && realm.id) pools.push({ realmId: realm.id, xp });
+        });
+      }
+      mastery.push({ skillId: skill.id, actions, pools });
+    }
+    if (mastery.length > 0) snapshot.mastery = mastery;
+
+    // Agility courses
+    if (game.agility) {
+      const ag = game.agility;
+      const agilityData = [];
+      for (const [realm, course] of ag.courses) {
+        const obstacles = {};
+        for (const [tier, ob] of course.builtObstacles) obstacles[tier] = ob ? ob.id : null;
+        const pillars = {};
+        for (const [tier, pi] of course.builtPillars) pillars[tier] = pi ? pi.id : null;
+        agilityData.push({ realmId: realm.id, obstacles, pillars });
+      }
+      snapshot.agility = { courses: agilityData, activeObstacle: ag.currentlyActiveObstacle };
+    }
+
+    // Astrology upgrades
+    if (game.astrology) {
+      const as = game.astrology;
+      const astrologyUpgrades = [];
+      try {
+        if (as.standardModifierUpgrades) {
+          for (const mod of as.standardModifierUpgrades) {
+            if (mod && mod.recipe && mod.recipe.id) astrologyUpgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought });
+          }
+        }
+      } catch { /* noop */ }
+      snapshot.astrology = { upgrades: astrologyUpgrades };
+    }
+
+    // Summoning (marks + selected non-shard costs)
+    if (game.summoning) {
+      const su = game.summoning;
+      const summoningData = { marks: [], costs: [] };
+      try {
+        if (su.marksUnlocked) {
+          for (const [recipe, count] of su.marksUnlocked) {
+            if (recipe && recipe.id) summoningData.marks.push({ recipeId: recipe.id, count });
+          }
+        }
+        if (su.selectedNonShardCosts) {
+          for (const [recipe, item] of su.selectedNonShardCosts) {
+            if (recipe && recipe.id) summoningData.costs.push({ recipeId: recipe.id, itemId: item ? item.id : null });
+          }
+        }
+      } catch { /* noop */ }
+      snapshot.summoning = summoningData;
+    }
+
+    // Slayer task + unlocks
+    if (game.slayer) {
+      const sl = game.slayer;
+      const slayerData = {};
+      try {
+        if (game.combat && game.combat.slayerTask) {
+          const t = game.combat.slayerTask;
+          slayerData.active = !!t.active;
+          slayerData.monsterId = t.monster ? t.monster.id : null;
+          slayerData.killsLeft = t.killsLeft || 0;
+          slayerData.extended = !!t.extended;
+          if (t.realm) slayerData.realmId = t.realm.id;
+          if (t.category) slayerData.categoryId = t.category.id;
+        }
+      } catch { /* noop */ }
+      snapshot.slayer = slayerData;
+    }
+
+    // Township
+    if (game.township) {
+      const tw = game.township;
+      const townshipData = { biomes: [], resources: {}, totalTicks: 0, legacyTicks: 0 };
+      try {
+        if (tw.biomes) for (const biome of tw.biomes.allObjects) {
+          const buildings = {};
+          if (biome.buildingsBuilt) for (const [b, count] of biome.buildingsBuilt) buildings[b.id] = count;
+          townshipData.biomes.push({ id: biome.id, buildings });
+        }
+        if (tw.resources) for (const r of tw.resources.allObjects) {
+          townshipData.resources[r.id] = { amount: r._amount, cap: r._cap };
+        }
+        townshipData.totalTicks = tw.totalTicks || 0;
+        townshipData.legacyTicks = tw.legacyTicks || 0;
+      } catch { /* noop */ }
+      snapshot.township = townshipData;
+    }
+
+    // Cartography
+    if (game.cartography) {
+      const ca = game.cartography;
+      const cartoData = { pois: [], paperRecipeId: null };
+      try {
+        if (ca.worldMaps) for (const wm of ca.worldMaps.allObjects) {
+          if (wm.pointsOfInterest) for (const poi of wm.pointsOfInterest) {
+            if (poi && poi.isDiscovered) cartoData.pois.push({ mapId: wm.id, poiId: poi.id });
+          }
+        }
+        if (ca.selectedPaperRecipe) cartoData.paperRecipeId = ca.selectedPaperRecipe.id;
+      } catch { /* noop */ }
+      snapshot.cartography = cartoData;
+    }
+
+    // Clue hunt
+    if (game.clueHunt) {
+      const ch = game.clueHunt;
+      const clueData = { steps: [], currentStep: 0 };
+      try {
+        if (ch.clueProgress) clueData.steps = ch.clueProgress.map(s => ({
+          id: s.id, progress: s.progress, required: s.required, complete: s.complete,
+        }));
+        if (typeof ch.currentStep === 'number') clueData.currentStep = ch.currentStep;
+      } catch { /* noop */ }
+      snapshot.clueHunt = clueData;
+    }
+
+    // Corruption (abyssal)
+    if (game.corruption) {
+      const co = game.corruption;
+      const corruptionData = { rows: [] };
+      try {
+        if (co.corruptionEffects && co.corruptionEffects.unlockedRows) {
+          for (const row of co.corruptionEffects.unlockedRows) {
+            corruptionData.rows.push({ id: row.id, effectId: row.effect ? row.effect.id : null });
+          }
+        }
+      } catch { /* noop */ }
+      snapshot.corruption = corruptionData;
+    }
+
+    // Raids (golbin raid)
+    if (game.golbinRaid) {
+      const r = game.golbinRaid;
+      const raidData = {};
+      try {
+        if (typeof r.wave === 'number') raidData.wave = r.wave;
+        if (typeof r.waveProgress === 'number') raidData.waveProgress = r.waveProgress;
+        if (r.selectedDifficulty) raidData.selectedDifficulty = r.selectedDifficulty.id;
+        if (r.history) raidData.history = r.history.slice(-20); // last 20 entries
+      } catch { /* noop */ }
+      snapshot.raid = raidData;
+    }
+
+    // Fishing contest
+    if (game.fishing && game.fishing.contest) {
+      const fc = game.fishing.contest;
+      const fishData = {};
+      try {
+        fishData.isActive = !!fc.isActive;
+        fishData.activeFishId = fc.activeFish ? fc.activeFish.id : null;
+        if (typeof fc.actionsRemaining === 'number') fishData.actionsRemaining = fc.actionsRemaining;
+        if (fc.playerResults) fishData.results = fc.playerResults.map(r => ({
+          fishId: r.fish ? r.fish.id : null, score: r.score, timestamp: r.timestamp,
+        }));
+      } catch { /* noop */ }
+      snapshot.fishContest = fishData;
+    }
+
+    // Game stats (Statistics tracker)
+    if (game.stats && game.stats.stats) {
+      const statsData = {};
+      try {
+        for (const [key, val] of game.stats.stats) statsData[key] = val;
+      } catch { /* noop */ }
+      snapshot.stats = statsData;
+    }
+
+    logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots, ${mastery.length} mastery skills, combat: ${combatState ? 'yes' : 'no'}`);
     logger.info('========== [MP] SNAPSHOT BUILT ==========');
     return snapshot;
   }
@@ -3693,6 +3913,80 @@ class Sync {
           game.combat.player.hitpoints = cs.playerHp;
           if (game.combat.player.renderHitpoints) game.combat.player.renderHitpoints();
         }
+      }
+      // Mastery from snapshot
+      if (msg.mastery) {
+        for (const ms of msg.mastery) {
+          const skill = this._skillById(ms.skillId);
+          if (!skill || !skill.hasMastery || !skill.actionMastery) continue;
+          for (const a of (ms.actions || [])) {
+            const action = skill.actions && skill.actions.getObjectByID(a.actionId);
+            if (!action) continue;
+            const am = skill.actionMastery.get(action);
+            if (!am) continue;
+            if (typeof a.xp === 'number') {
+              am.xp = a.xp;
+              am.level = exp.xpToLevel(a.xp);
+            }
+          }
+          for (const p of (ms.pools || [])) {
+            const realm = game.realms.getObjectByID(p.realmId);
+            if (realm && skill._masteryPoolXP) {
+              skill._masteryPoolXP.set(realm, p.xp);
+            }
+          }
+          if (skill.renderQueue && skill.renderQueue.actionMastery) {
+            for (const a of (ms.actions || [])) {
+              const action = skill.actions && skill.actions.getObjectByID(a.actionId);
+              if (action) skill.renderQueue.actionMastery.add(action);
+            }
+          }
+          if (skill.renderMasteryPool) try { skill.renderMasteryPool(); } catch { /* skip */ }
+        }
+      }
+      // Agility from snapshot
+      if (msg.agility && game.agility) {
+        this._applyAgility({ courses: msg.agility.courses, activeObstacle: msg.agility.activeObstacle });
+      }
+      // Astrology from snapshot
+      if (msg.astrology && game.astrology) {
+        this._applyAstrology({ upgrades: msg.astrology.upgrades });
+      }
+      // Summoning from snapshot
+      if (msg.summoning && game.summoning) {
+        this._applySummoning(msg.summoning);
+      }
+      // Slayer from snapshot
+      if (msg.slayer && game.slayer) {
+        this._applySlayer(msg.slayer);
+      }
+      // Township from snapshot
+      if (msg.township && game.township) {
+        this._applyTownship(msg.township);
+      }
+      // Cartography from snapshot
+      if (msg.cartography && game.cartography) {
+        this._applyCartography(msg.cartography);
+      }
+      // Clue hunt from snapshot
+      if (msg.clueHunt && game.clueHunt) {
+        this._applyClueHunt(msg.clueHunt);
+      }
+      // Corruption from snapshot
+      if (msg.corruption && game.corruption) {
+        this._applyCorruption(msg.corruption);
+      }
+      // Raid from snapshot
+      if (msg.raid && game.golbinRaid) {
+        this._applyRaid(msg.raid);
+      }
+      // Fishing contest from snapshot
+      if (msg.fishContest && game.fishing && game.fishing.contest) {
+        this._applyFishingContest(msg.fishContest);
+      }
+      // Stats from snapshot
+      if (msg.stats && game.stats) {
+        this._applyStats({ stats: msg.stats });
       }
       this._forceRender();
     } catch (e) { logger.error('snapshot apply failed', e); }
