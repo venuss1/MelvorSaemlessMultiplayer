@@ -4108,6 +4108,7 @@ class Sync {
       tickTimestamp: game.tickTimestamp,
       merchantsPermitRead: game.merchantsPermitRead,
       isPaused: game._isPaused,
+      visibleCompletion: game.completion ? game.completion.visibleCompletion : undefined,
     });
   }
 
@@ -4125,6 +4126,9 @@ class Sync {
         } else {
           game._isPaused = msg.isPaused;
         }
+      }
+      if (msg.visibleCompletion !== undefined && game.completion) {
+        try { game.completion.setVisibleCompletion(msg.visibleCompletion); } catch { /* noop */ }
       }
     } catch (e) { logger.error('applyGameState failed', e); }
     finally { this._applyingRemote = false; }
@@ -4824,11 +4828,12 @@ class Sync {
       beingSelected: (game.levelCapIncreasesBeingSelected || []).map(c => c.id),
     };
 
-    // Game state (tickTimestamp, merchantsPermitRead, pause)
+    // Game state (tickTimestamp, merchantsPermitRead, pause, visibleCompletion)
     snapshot.gameState = {
       tickTimestamp: game.tickTimestamp,
       merchantsPermitRead: game.merchantsPermitRead,
       isPaused: game._isPaused,
+      visibleCompletion: game.completion ? game.completion.visibleCompletion : undefined,
     };
 
     // Lore books read
