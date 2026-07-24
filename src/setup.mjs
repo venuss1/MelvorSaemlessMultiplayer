@@ -1257,6 +1257,28 @@ class Sync {
       sync._sendFarmingPlot(plot);
     };
 
+    // Patch unlockPlotOnClick — bypass level check so both players can unlock
+    // The original checks: if (!this.game.gp.canAfford(plot.gpCost) || this.level < plot.level) return;
+    // We replace it to only check GP, not level (levels may not be synced)
+    const origUnlock = Farming.prototype.unlockPlotOnClick;
+    Farming.prototype.unlockPlotOnClick = function (plot) {
+      if (!plot) return;
+      // Only check GP cost, skip level requirement
+      const gpCost = plot.gpCost || 0;
+      if (gpCost > 0 && game.gp && !game.gp.canAfford(gpCost)) return;
+      if (gpCost > 0 && game.gp) game.gp.remove(gpCost);
+      // Also handle currencyCosts (newer API) if present
+      if (plot.currencyCosts && plot.currencyCosts.length > 0) {
+        for (const cost of plot.currencyCosts) {
+          // Skip if can't afford — but don't block the unlock entirely
+          // The sync will handle giving the plot to the other player for free
+        }
+      }
+      plot.state = 1; // Empty
+      if (this.showPlotsInCategory) this.showPlotsInCategory(plot.category);
+      logger.info(`[FARM] Unlocked plot: ${plot.id}`);
+    };
+
     // Plot unlock — sync so both players get unlocked plots
     this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
       sendPlot(plot);
@@ -1374,7 +1396,10 @@ class Sync {
     try {
       for (const p of msg.plots) {
         const plot = farming.plots.getObjectByID(p.id);
-        if (!plot) continue;
+        if (!plot) {
+          logger.warn(`[FARM] Plot not found: ${p.id}`);
+          continue;
+        }
 
         // Handle plot unlock: if the plot was unlocked by the other player,
         // unlock it here too (without charging)
@@ -1382,6 +1407,10 @@ class Sync {
           // Plot is unlocked on the other side but locked here — unlock it
           plot.state = 1; // Empty
           logger.info(`[FARM] Synced plot unlock: ${p.id}`);
+          // Force show plots in category to update UI
+          if (farming.showPlotsInCategory && plot.category) {
+            try { farming.showPlotsInCategory(plot.category); } catch (e) { /* skip */ }
+          }
         }
 
         // Handle planting: if the other player planted, plant here too
@@ -1433,10 +1462,14 @@ class Sync {
 
         // Handle compost: sync compost item and level
         if (p.compostItemId !== undefined) {
-          const compostItem = p.compostItemId ? game.items.getObjectByID(p.compostItemId) : undefined;
+          // CompostItem is in game.items but also accessible via farming.composts
+          let compostItem = p.compostItemId ? game.items.getObjectByID(p.compostItemId) : undefined;
+          if (!compostItem && farming.composts) {
+            compostItem = farming.composts.getObjectByID(p.compostItemId);
+          }
           if (compostItem) {
-            // Try to apply compost via the game method
-            if (farming.compostPlot && plot.compostLevel < p.compostLevel) {
+            // Try to apply compost via the game method (only works on empty plots)
+            if (farming.compostPlot && plot.compostLevel < p.compostLevel && plot.state === 1) {
               try {
                 const amount = p.compostLevel - plot.compostLevel;
                 farming.compostPlot(plot, compostItem, amount);
@@ -1448,8 +1481,12 @@ class Sync {
                 logger.warn(`[FARM] Compost failed, set directly: ${p.id}`);
               }
             } else {
+              // Direct set — works for any plot state
               plot.compostItem = compostItem;
               plot.compostLevel = p.compostLevel;
+              if (farming.renderQueue && farming.renderQueue.compost) {
+                farming.renderQueue.compost.add(plot);
+              }
             }
           } else {
             plot.compostItem = undefined;
@@ -1459,7 +1496,14 @@ class Sync {
 
         // Sync selected recipe
         if (p.selectedRecipeId !== undefined) {
-          plot.selectedRecipe = p.selectedRecipeId ? game.items.getObjectByID(p.selectedRecipeId) : undefined;
+          let selectedRecipe = null;
+          if (farming.actions) {
+            selectedRecipe = farming.actions.getObjectByID(p.selectedRecipeId);
+          }
+          if (!selectedRecipe && game.items) {
+            selectedRecipe = game.items.getObjectByID(p.selectedRecipeId);
+          }
+          plot.selectedRecipe = p.selectedRecipeId ? selectedRecipe : undefined;
         }
       }
       // Re-render farming UI
