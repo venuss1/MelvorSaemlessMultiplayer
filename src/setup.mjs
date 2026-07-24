@@ -363,6 +363,7 @@ class Sync {
     this.actionLock = actionLock;
     this._applyingRemote = false;
     this._combatOwner = null;  // 'me' = I'm attacking, 'peer' = peer is attacking, null = no one
+    this._becomingSpectator = false;  // true while becoming spectator (prevents stop events)
     this._combatWasPaused = false;  // remember pause state before we forced pause
     this._watcher = null;
     this._lastActiveSkillId = null;
@@ -2194,18 +2195,24 @@ class Sync {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
           this.ctx.patch(CombatManager, m).after(function () {
+            // Skip sending events if we're applying remote (spectator becoming spectator)
+            if (sync._applyingRemote) return;
             // If local player stops combat (and we're the attacker), release claim
             // and send stop event so the spectator also stops
-            if (m === 'stop' && sync._combatOwner === 'me' && !sync._applyingRemote) {
+            if (m === 'stop' && sync._combatOwner === 'me') {
               sync._combatOwner = null;
               sync.transport.send({ t: Msg.COMBAT_RELEASE });
               // Also send a combat_event stop so spectator stops too
               sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
               logger.info(`[COMBAT] Released combat (stopped)`);
             }
-            // If spectator stops (they shouldn't be fighting, but just in case),
-            // also notify the attacker
-            if (m === 'stop' && sync._combatOwner === 'peer' && !sync._applyingRemote) {
+            // Only send spectator stop if it was a REAL user stop, not
+            // the automatic stop from becoming a spectator.
+            // We detect this by checking if _combatOwner is still 'peer'
+            // after the stop — if it is, it was a user action.
+            // But _applyCombatClaim sets _combatOwner='peer' BEFORE calling stop,
+            // so we need a flag to distinguish.
+            if (m === 'stop' && sync._combatOwner === 'peer' && !sync._becomingSpectator) {
               sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
               logger.info(`[COMBAT] Spectator stopped combat, notifying attacker`);
             }
@@ -2338,6 +2345,7 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}, area: ${msg.areaId}`);
     this._combatOwner = 'peer';
+    this._becomingSpectator = true;  // Prevent stop patch from sending events
     // Stop our combat — we're spectating, not attacking
     // This prevents double-damage: only the attacker's game runs combat
     if (cm.stop) {
@@ -2387,6 +2395,7 @@ class Sync {
       } catch (e) { logger.warn(`[COMBAT] claim selectMonster failed: ${e.message}`); }
       finally { this._applyingRemote = false; }
     }
+    this._becomingSpectator = false;  // Re-enable stop patch events
     this._renderCombat();
   }
 
