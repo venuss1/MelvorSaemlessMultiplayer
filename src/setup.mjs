@@ -4189,16 +4189,6 @@ class Sync {
           for (const poi of wm.pointsOfInterest.allObjects) {
             if (poi.isDiscovered) {
               const poiData = { poiId: poi.id };
-              // Discovery modifiers with movesLeft counter
-              if (poi.discoveryModifiers) {
-                const mods = [];
-                for (const mod of poi.discoveryModifiers) {
-                  if (typeof mod.movesLeft === 'number') {
-                    mods.push({ id: mod.id, movesLeft: mod.movesLeft });
-                  }
-                }
-                if (mods.length > 0) poiData.discoveryMods = mods;
-              }
               // Fast travel unlock status
               if (poi.fastTravel && typeof poi.fastTravel.isUnlocked === 'boolean') {
                 poiData.fastTravelUnlocked = poi.fastTravel.isUnlocked;
@@ -4296,16 +4286,6 @@ class Sync {
                 }
                 if (ca.renderQueue && ca.renderQueue.poiMarkers) {
                   ca.renderQueue.poiMarkers.add(poi);
-                }
-              }
-              // Apply discovery modifiers (movesLeft)
-              if (poi && p.discoveryMods && poi.discoveryModifiers) {
-                for (const dm of p.discoveryMods) {
-                  const mod = poi.discoveryModifiers.find(m => m.id === dm.id);
-                  if (mod && typeof dm.movesLeft === 'number') {
-                    // Sync movesLeft — take the max to preserve the longer-lasting bonus
-                    mod.movesLeft = Math.max(mod.movesLeft || 0, dm.movesLeft);
-                  }
                 }
               }
               // Apply fast travel unlock status
@@ -5479,13 +5459,6 @@ class Sync {
             if (wm.pointsOfInterest) for (const poi of wm.pointsOfInterest.allObjects) {
               if (poi.isDiscovered) {
                 const poiData = { poiId: poi.id };
-                if (poi.discoveryModifiers) {
-                  const mods = [];
-                  for (const mod of poi.discoveryModifiers) {
-                    if (typeof mod.movesLeft === 'number') mods.push({ id: mod.id, movesLeft: mod.movesLeft });
-                  }
-                  if (mods.length > 0) poiData.discoveryMods = mods;
-                }
                 if (poi.fastTravel && typeof poi.fastTravel.isUnlocked === 'boolean') {
                   poiData.fastTravelUnlocked = poi.fastTravel.isUnlocked;
                 }
