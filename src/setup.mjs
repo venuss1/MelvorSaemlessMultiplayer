@@ -2665,7 +2665,8 @@ class Sync {
             const digSite = s.actions.getObjectByID(ds.id);
             if (!digSite) continue;
             digSite.selectedMapIndex = ds.mapIndex;
-            if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? game.items.getObjectByID(tid) : null).filter(Boolean);
+            // ArchaeologyTool extends NamespacedObject, not Item — use s.tools
+            if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? s.tools.getObjectByID(tid) : null).filter(Boolean);
           }
           if (msg.donatedItems && s.museum && s.museum.donatedItems) {
             for (const itemId of msg.donatedItems) {
@@ -3791,17 +3792,19 @@ class Sync {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const r = game.golbinRaid;
       const history = (r.history || []).map(h => ({
-        wave: h.wave, coins: h.coins, timestamp: h.timestamp,
+        wave: h.wave, coins: h.raidCoinsEarned, timestamp: h.timestamp,
       }));
       // Live raid loadout: equipment, food, passives, modifiers, state.
       const loadout = {};
       if (r.player) {
         const p = r.player;
         loadout.equipment = {};
-        if (p.equipment) {
-          for (const slot of p.equipment.slotArray || []) {
-            const eq = p.equipment.getItemInSlot(slot);
-            if (eq && eq.item) loadout.equipment[slot] = { itemId: eq.item.id, qty: eq.quantity, set: eq.set };
+        if (p.equipment && p.equipment.equippedItems) {
+          // equippedItems is Record<string, EquippedItem>; EquippedItem has .item and .quantity
+          for (const [slotId, eqItem] of Object.entries(p.equipment.equippedItems)) {
+            if (eqItem && eqItem.item && !eqItem.isEmpty) {
+              loadout.equipment[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
+            }
           }
         }
         loadout.food = null;
@@ -3809,8 +3812,8 @@ class Sync {
           loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
         }
       }
-      loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.id, value: m.value }));
-      loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.id, value: m.value }));
+      loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
+      loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
       loadout.state = r.state;
       loadout.killCount = r.killCount;
       loadout.posModsSelected = r.posModsSelected;
@@ -3843,7 +3846,7 @@ class Sync {
         exclusiveItemSelection,
         itemCategoryBeingSelected: r.itemCategoryBeingSelected || null,
         isSelectingPositiveModifier: r.isSelectingPositiveModifier || false,
-        randomModifiersBeingSelected: (r.randomModifiersBeingSelected || []).map(m => ({ id: m.id, value: m.value })),
+        randomModifiersBeingSelected: (r.randomModifiersBeingSelected || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value })),
       });
     };
     for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'continueRaid', 'equipItemCallback', 'addFoodCallback', 'selectRandomModifier', 'rerollPassiveCallback', 'pause', 'unpause']) {
@@ -3891,7 +3894,20 @@ class Sync {
         for (const h of msg.history) {
           const exists = r.history.find(local => local.wave === h.wave && local.timestamp === h.timestamp);
           if (!exists) {
-            r.history.push(h);
+            // RaidHistory requires: skillLevels, equipment, inventory, food,
+            // wave, kills, timestamp, raidCoinsEarned, difficulty.
+            // We only sync the primitive fields; fill the rest with defaults.
+            r.history.push({
+              wave: h.wave || 0,
+              kills: h.kills || 0,
+              timestamp: h.timestamp || 0,
+              raidCoinsEarned: h.coins || h.raidCoinsEarned || 0,
+              difficulty: h.difficulty || 0,
+              skillLevels: h.skillLevels || [],
+              equipment: h.equipment || [],
+              inventory: h.inventory || [],
+              food: h.food || null,
+            });
           }
         }
       }
@@ -3923,13 +3939,13 @@ class Sync {
         // Modifiers — set directly (these are runtime-only during a raid)
         if (lo.randomPlayerModifiers) {
           r.randomPlayerModifiers = lo.randomPlayerModifiers.map(m => {
-            const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+            const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
             return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
           });
         }
         if (lo.randomEnemyModifiers) {
           r.randomEnemyModifiers = lo.randomEnemyModifiers.map(m => {
-            const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+            const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
             return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
           });
         }
@@ -3950,7 +3966,7 @@ class Sync {
       if (typeof msg.isSelectingPositiveModifier === 'boolean') r.isSelectingPositiveModifier = msg.isSelectingPositiveModifier;
       if (msg.randomModifiersBeingSelected) {
         r.randomModifiersBeingSelected = msg.randomModifiersBeingSelected.map(m => {
-          const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+          const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
           return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
         });
       }
@@ -4368,7 +4384,7 @@ class Sync {
             // Refinements — replace if remote has more
             if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
               local.refinements = remote.refinements.map(r => {
-                const mod = game.modifiers && game.modifiers.getObjectByID(r.id);
+                const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
                 return mod ? { ...mod, value: r.value } : { id: r.id, value: r.value };
               });
             }
@@ -4550,7 +4566,9 @@ class Sync {
     };
     if (game.activeLevelCapIncreases) {
       for (const cap of game.activeLevelCapIncreases) {
-        if (cap && cap.id) data.active.push({ id: cap.id, skillId: cap.skill ? cap.skill.id : null });
+        // SkillLevelCapIncrease has no .skill property; only send the id,
+        // which is all _applyLevelCaps uses to look up the cap object.
+        if (cap && cap.id) data.active.push({ id: cap.id });
       }
     }
     if (game.levelCapIncreasesBeingSelected) {
@@ -5546,16 +5564,19 @@ class Sync {
         if (typeof r.wave === 'number') raidData.wave = r.wave;
         if (typeof r.waveProgress === 'number') raidData.waveProgress = r.waveProgress;
         if (r.selectedDifficulty) raidData.selectedDifficulty = (typeof r.selectedDifficulty === 'number') ? r.selectedDifficulty : r.selectedDifficulty.id;
-        if (r.history) raidData.history = r.history.slice(-20); // last 20 entries
+        if (r.history) raidData.history = r.history.slice(-20).map(h => ({
+          wave: h.wave, coins: h.raidCoinsEarned, timestamp: h.timestamp,
+        })); // last 20 entries, primitive fields only
         // Live raid loadout
         const loadout = {};
         if (r.player) {
           const p = r.player;
           loadout.equipment = {};
-          if (p.equipment) {
-            for (const slot of p.equipment.slotArray || []) {
-              const eq = p.equipment.getItemInSlot(slot);
-              if (eq && eq.item) loadout.equipment[slot] = { itemId: eq.item.id, qty: eq.quantity, set: eq.set };
+          if (p.equipment && p.equipment.equippedItems) {
+            for (const [slotId, eqItem] of Object.entries(p.equipment.equippedItems)) {
+              if (eqItem && eqItem.item && !eqItem.isEmpty) {
+                loadout.equipment[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
+              }
             }
           }
           loadout.food = null;
@@ -5563,8 +5584,8 @@ class Sync {
             loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
           }
         }
-        loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.id, value: m.value }));
-        loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.id, value: m.value }));
+        loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
+        loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
         loadout.state = r.state;
         loadout.killCount = r.killCount;
         loadout.posModsSelected = r.posModsSelected;
@@ -5638,7 +5659,7 @@ class Sync {
     snapshot.levelCaps = {
       levelCapIncreasesBought: game._levelCapIncreasesBought,
       abyssalLevelCapIncreasesBought: game._abyssalLevelCapIncreasesBought,
-      active: (game.activeLevelCapIncreases || []).map(c => ({ id: c.id, skillId: c.skill ? c.skill.id : null })),
+      active: (game.activeLevelCapIncreases || []).map(c => ({ id: c.id })),
       beingSelected: (game.levelCapIncreasesBeingSelected || []).map(c => c.id),
     };
 
@@ -6119,15 +6140,17 @@ class Sync {
           }
           if (typeof p.state === 'number') plot.state = p.state;
           if (p.plantedRecipeId !== undefined) {
-            plot.plantedRecipe = p.plantedRecipeId ? game.items.getObjectByID(p.plantedRecipeId) : undefined;
+            // FarmingRecipe is a MasteryAction in game.farming.actions, not an Item
+            plot.plantedRecipe = p.plantedRecipeId ? game.farming.actions.getObjectByID(p.plantedRecipeId) : undefined;
           }
           if (p.compostItemId !== undefined) {
+            // CompostItem extends Item, so game.items is correct
             plot.compostItem = p.compostItemId ? game.items.getObjectByID(p.compostItemId) : undefined;
           }
           if (typeof p.compostLevel === 'number') plot.compostLevel = p.compostLevel;
           if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
           if (p.selectedRecipeId !== undefined) {
-            plot.selectedRecipe = p.selectedRecipeId ? game.items.getObjectByID(p.selectedRecipeId) : undefined;
+            plot.selectedRecipe = p.selectedRecipeId ? game.farming.actions.getObjectByID(p.selectedRecipeId) : undefined;
           }
           if (typeof p.abyssalLevel === 'number' && 'abyssalLevel' in plot) {
             plot.abyssalLevel = p.abyssalLevel;
@@ -6234,7 +6257,8 @@ class Sync {
             const digSite = ar.actions.getObjectByID(ds.id);
             if (!digSite) continue;
             if (typeof ds.mapIndex === 'number') digSite.selectedMapIndex = ds.mapIndex;
-            if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? game.items.getObjectByID(tid) : null).filter(Boolean);
+            // ArchaeologyTool extends NamespacedObject, not Item — use ar.tools
+            if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? ar.tools.getObjectByID(tid) : null).filter(Boolean);
           }
           if (ad.donatedItems && ar.museum && ar.museum.donatedItems) {
             for (const itemId of ad.donatedItems) {
@@ -6370,7 +6394,8 @@ class Sync {
               const digSite = ar.actions.getObjectByID(ds.id);
               if (!digSite) continue;
               if (typeof ds.mapIndex === 'number') digSite.selectedMapIndex = ds.mapIndex;
-              if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? game.items.getObjectByID(tid) : null).filter(Boolean);
+              // ArchaeologyTool extends NamespacedObject, not Item — use ar.tools
+              if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? ar.tools.getObjectByID(tid) : null).filter(Boolean);
             }
             if (ar.museum && ar.museum.donatedItems) {
               for (const itemId of ss.archaeology.donatedItems || []) {
@@ -7599,8 +7624,10 @@ export function setup(ctx) {
 
   // Fallback: if character is already loaded (onCharacterLoaded may have
   // fired before the mod loaded), try installing patches immediately.
+  // game.character doesn't exist; check game.combat.player instead, which
+  // is set up during character load.
   try {
-    if (game && game.character && game.character.loaded) {
+    if (game && game.combat && game.combat.player) {
       logger.info('Character already loaded, installing sync patches immediately');
       syncInstance.install();
     }
