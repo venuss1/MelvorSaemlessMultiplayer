@@ -1783,6 +1783,24 @@ class Sync {
         this.ctx.patch(Agility, m).after(() => send());
       }
     }
+
+    // Patch the activeObstacle getter to not throw when no obstacle is built.
+    // The game throws "Tried to get active obstacle, but none is built" which
+    // crashes the entire tick loop. We make it return undefined instead.
+    try {
+      const desc = Object.getOwnPropertyDescriptor(Agility.prototype, 'activeObstacle');
+      if (desc && desc.get) {
+        const origGet = desc.get;
+        Object.defineProperty(Agility.prototype, 'activeObstacle', {
+          get() {
+            try { return origGet.call(this); }
+            catch (e) { return undefined; }
+          },
+          configurable: true,
+        });
+        logger.info('[AGILITY] Patched activeObstacle getter to not throw');
+      }
+    } catch (e) { logger.warn('[AGILITY] Could not patch activeObstacle getter:', e.message); }
   }
 
   _sendAgility() {
@@ -1809,18 +1827,98 @@ class Sync {
         if (!realm) continue;
         const course = ag.courses.get(realm);
         if (!course) continue;
+
+        // Sync obstacles — try buildObstacle first, fall back to direct set
         for (const [tier, obId] of Object.entries(c.obstacles)) {
-          const ob = obId ? game.items.getObjectByID(obId) : null;
-          if (ob) course.builtObstacles.set(Number(tier), ob);
-          else course.builtObstacles.delete(Number(tier));
+          const tierNum = Number(tier);
+          const currentOb = course.builtObstacles.get(tierNum);
+          const currentId = currentOb ? currentOb.id : null;
+          if (obId === currentId) continue; // already in sync
+
+          if (obId) {
+            // Build the obstacle
+            const ob = game.items.getObjectByID(obId);
+            if (!ob) { logger.warn(`[AGILITY] Obstacle not found: ${obId}`); continue; }
+            // Remove existing obstacle at this tier first
+            if (currentOb && typeof ag.destroyObstacle === 'function') {
+              try { ag.destroyObstacle(course, tierNum); }
+              catch (e) { logger.warn(`[AGILITY] destroyObstacle failed: ${e.message}`); }
+            }
+            // Try to build (this consumes costs and updates modifiers)
+            let built = false;
+            if (typeof ag.buildObstacle === 'function') {
+              try {
+                ag.buildObstacle(course, ob, tierNum);
+                built = true;
+                logger.info(`[AGILITY] Built obstacle ${obId} at tier ${tierNum}`);
+              } catch (e) {
+                logger.warn(`[AGILITY] buildObstacle failed: ${e.message}`);
+              }
+            }
+            if (!built) {
+              // Fallback: direct set (may not update modifiers properly)
+              course.builtObstacles.set(tierNum, ob);
+              logger.info(`[AGILITY] Direct-set obstacle ${obId} at tier ${tierNum}`);
+            }
+          } else {
+            // Remove obstacle at this tier
+            if (currentOb && typeof ag.destroyObstacle === 'function') {
+              try { ag.destroyObstacle(course, tierNum); }
+              catch (e) { /* skip */ }
+            } else {
+              course.builtObstacles.delete(tierNum);
+            }
+          }
         }
+
+        // Sync pillars
         for (const [tier, piId] of Object.entries(c.pillars)) {
-          const pi = piId ? game.items.getObjectByID(piId) : null;
-          if (pi) course.builtPillars.set(Number(tier), pi);
-          else course.builtPillars.delete(Number(tier));
+          const tierNum = Number(tier);
+          const currentPi = course.builtPillars.get(tierNum);
+          const currentId = currentPi ? currentPi.id : null;
+          if (piId === currentId) continue;
+
+          if (piId) {
+            const pi = game.items.getObjectByID(piId);
+            if (!pi) { logger.warn(`[AGILITY] Pillar not found: ${piId}`); continue; }
+            if (currentPi && typeof ag.destroyPillar === 'function') {
+              try { ag.destroyPillar(course, tierNum); }
+              catch (e) { /* skip */ }
+            }
+            let built = false;
+            if (typeof ag.buildPillar === 'function') {
+              try { ag.buildPillar(course, pi, tierNum); built = true; }
+              catch (e) { logger.warn(`[AGILITY] buildPillar failed: ${e.message}`); }
+            }
+            if (!built) course.builtPillars.set(tierNum, pi);
+          } else {
+            if (currentPi && typeof ag.destroyPillar === 'function') {
+              try { ag.destroyPillar(course, tierNum); }
+              catch (e) { /* skip */ }
+            } else {
+              course.builtPillars.delete(tierNum);
+            }
+          }
         }
       }
-      if (typeof msg.activeObstacle === 'number') ag.currentlyActiveObstacle = msg.activeObstacle;
+
+      // Only set active obstacle if there's actually an obstacle built at that tier
+      if (typeof msg.activeObstacle === 'number') {
+        const realm = game.realms.getObjectByID(game.currentRealm?.id || 'melvorD:Melvor');
+        const course = realm ? ag.courses.get(realm) : null;
+        if (course && course.builtObstacles.has(msg.activeObstacle)) {
+          ag.currentlyActiveObstacle = msg.activeObstacle;
+        } else {
+          // Find any built obstacle to set as active, or -1 if none
+          let anyTier = -1;
+          for (const [tier, ob] of course?.builtObstacles || []) {
+            if (ob) { anyTier = tier; break; }
+          }
+          ag.currentlyActiveObstacle = anyTier;
+          logger.info(`[AGILITY] Active obstacle adjusted to ${anyTier} (requested ${msg.activeObstacle})`);
+        }
+      }
+
       if (ag.render) ag.render();
       if (ag.renderBuiltObstacles) ag.renderBuiltObstacles();
       if (ag.renderCourseModifiers) ag.renderCourseModifiers();
