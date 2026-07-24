@@ -853,11 +853,21 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       const sets = [];
       for (let i = 0; i < game.combat.player.equipmentSets.length; i++) {
-        const eq = game.combat.player.equipmentSets[i].equipment;
+        const eqSet = game.combat.player.equipmentSets[i];
+        const eq = eqSet.equipment;
         const slots = {};
         for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
           slots[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
         }
+        // Per-set spell/prayer selection
+        const spellSel = eqSet.spellSelection || {};
+        const prayerSel = eqSet.prayerSelection;
+        slots.__spellSelection = {
+          attackId: spellSel.attack ? spellSel.attack.id : null,
+          curseId: spellSel.curse ? spellSel.curse.id : null,
+          auroraId: spellSel.aurora ? spellSel.aurora.id : null,
+        };
+        slots.__prayerSelection = prayerSel ? [...prayerSel].map(ap => ap.id) : [];
         sets.push(slots);
       }
       sync.transport.send({
@@ -950,7 +960,7 @@ class Sync {
         // Unequip slots that are no longer equipped remotely.
         // unequipItem already returns the item to bank internally
         for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
-          if (!remoteSlots[slotId]) {
+          if (remoteSlots[slotId] === undefined) {
             const slot = game.equipmentSlots.getObjectByID(slotId);
             if (slot) {
               try { eq.unequipItem(slot); } catch (e) { logger.warn(`unequip ${slotId} failed: ${e.message}`); }
@@ -960,6 +970,7 @@ class Sync {
         // Equip / update slots to match remote.
         // equipItem already removes the item from bank internally
         for (const [slotId, remote] of Object.entries(remoteSlots)) {
+          if (slotId === '__spellSelection' || slotId === '__prayerSelection') continue;
           const local = eq.equippedItems[slotId];
           const item = this._itemById(remote.itemId);
           if (!item) { logger.warn(`equip: item not found: ${remote.itemId}`); continue; }
@@ -980,6 +991,34 @@ class Sync {
           } catch (e) {
             logger.warn(`equip ${slotId} with ${remote.itemId} failed: ${e.message}`);
           }
+        }
+        // Per-set spell selection
+        if (remoteSlots.__spellSelection && eqSet.spellSelection) {
+          const ss = remoteSlots.__spellSelection;
+          try {
+            if (ss.attackId) {
+              const sp = game.attackSpells.getObjectByID(ss.attackId);
+              if (sp && game.combat.player.selectAttackSpell) game.combat.player.selectAttackSpell(sp, false);
+            }
+            if (ss.curseId) {
+              const sp = game.curseSpells && game.curseSpells.getObjectByID(ss.curseId);
+              if (sp && game.combat.player.toggleCurse) game.combat.player.toggleCurse(sp, false);
+            }
+            if (ss.auroraId) {
+              const sp = game.auroraSpells && game.auroraSpells.getObjectByID(ss.auroraId);
+              if (sp && game.combat.player.toggleAurora) game.combat.player.toggleAurora(sp, false);
+            }
+          } catch { /* skip */ }
+        }
+        // Per-set prayer selection
+        if (remoteSlots.__prayerSelection && eqSet.prayerSelection) {
+          try {
+            eqSet.prayerSelection.clear();
+            for (const pid of remoteSlots.__prayerSelection) {
+              const pr = game.prayers && game.prayers.getObjectByID(pid);
+              if (pr) eqSet.prayerSelection.add(pr);
+            }
+          } catch { /* skip */ }
         }
       }
       // Switch to the remote's selected equipment set.
@@ -1602,6 +1641,7 @@ class Sync {
       growthTime: plot.growthTime,
       remainingTimeMs,
       selectedRecipeId: plot.selectedRecipe ? plot.selectedRecipe.id : null,
+      abyssalLevel: typeof plot.abyssalLevel === 'number' ? plot.abyssalLevel : 0,
     };
   }
 
@@ -1814,6 +1854,11 @@ class Sync {
           }
           plot.selectedRecipe = p.selectedRecipeId ? selectedRecipe : undefined;
         }
+
+        // Sync abyssal level (required for abyssal farming plots)
+        if (typeof p.abyssalLevel === 'number' && 'abyssalLevel' in plot) {
+          plot.abyssalLevel = p.abyssalLevel;
+        }
       }
       // Re-render farming UI
       if (farming.render) farming.render();
@@ -1876,9 +1921,23 @@ class Sync {
       for (const [tier, ob] of course.builtObstacles) obstacles[tier] = ob ? ob.id : null;
       const pillars = {};
       for (const [tier, pi] of course.builtPillars) pillars[tier] = pi ? pi.id : null;
-      courses.push({ realmId: realm.id, obstacles, pillars });
+      // Blueprints: { name, obstacles: {tier: id}, pillars: {tier: id} }
+      const blueprints = [];
+      if (course.blueprints) for (const [slot, bp] of course.blueprints) {
+        const bpObstacles = {};
+        if (bp.obstacles) for (const [tier, ob] of bp.obstacles) bpObstacles[tier] = ob ? ob.id : null;
+        const bpPillars = {};
+        if (bp.pillars) for (const [tier, pi] of bp.pillars) bpPillars[tier] = pi ? pi.id : null;
+        blueprints.push({ slot, name: bp.name || '', obstacles: bpObstacles, pillars: bpPillars });
+      }
+      courses.push({ realmId: realm.id, obstacles, pillars, blueprints });
     }
-    this.transport.send({ t: Msg.AGILITY, courses, activeObstacle: ag.currentlyActiveObstacle });
+    // obstacleBuildCount: how many times each obstacle has been built
+    const buildCounts = [];
+    if (ag.obstacleBuildCount) for (const [ob, count] of ag.obstacleBuildCount) {
+      buildCounts.push({ id: ob.id, count });
+    }
+    this.transport.send({ t: Msg.AGILITY, courses, activeObstacle: ag.currentlyActiveObstacle, buildCounts });
   }
 
   _applyAgility(msg) {
@@ -1980,6 +2039,42 @@ class Sync {
           }
           ag.currentlyActiveObstacle = anyTier;
           logger.info(`[AGILITY] Active obstacle adjusted to ${anyTier} (requested ${msg.activeObstacle})`);
+        }
+      }
+
+      // Sync blueprints per course
+      for (const c of msg.courses) {
+        if (!c.blueprints) continue;
+        const realm = game.realms.getObjectByID(c.realmId);
+        if (!realm) continue;
+        const course = ag.courses.get(realm);
+        if (!course || !course.blueprints) continue;
+        for (const bp of c.blueprints) {
+          const bpObstacles = new Map();
+          for (const [tier, obId] of Object.entries(bp.obstacles || {})) {
+            if (obId) {
+              const ob = (ag.actions && ag.actions.getObjectByID(obId)) || game.items.getObjectByID(obId);
+              if (ob) bpObstacles.set(Number(tier), ob);
+            }
+          }
+          const bpPillars = new Map();
+          for (const [tier, piId] of Object.entries(bp.pillars || {})) {
+            if (piId) {
+              const pi = (ag.pillars && ag.pillars.getObjectByID(piId)) || game.items.getObjectByID(piId);
+              if (pi) bpPillars.set(Number(tier), pi);
+            }
+          }
+          course.blueprints.set(bp.slot, { name: bp.name, obstacles: bpObstacles, pillars: bpPillars });
+        }
+      }
+
+      // Sync obstacle build counts (take max to avoid losing progress)
+      if (msg.buildCounts && ag.obstacleBuildCount) {
+        for (const bc of msg.buildCounts) {
+          const ob = (ag.actions && ag.actions.getObjectByID(bc.id)) || game.items.getObjectByID(bc.id);
+          if (!ob) continue;
+          const cur = ag.obstacleBuildCount.get(ob) || 0;
+          if (bc.count > cur) ag.obstacleBuildCount.set(ob, bc.count);
         }
       }
 
@@ -2352,6 +2447,32 @@ class Sync {
       if (typeof Fletching.prototype.selectAltRecipeOnClick === 'function') this.ctx.patch(Fletching, 'selectAltRecipeOnClick').after(() => send());
     }
 
+    // Generic artisan skill recipe selection sync (Herblore, Smithing, Crafting, Runecrafting, Fletching)
+    // These all extend ArtisanSkill which has selectedRecipe and selectedRecipeInRealm.
+    for (const skillName of ['herblore', 'smithing', 'crafting', 'runecrafting', 'fletching']) {
+      const sk = game[skillName];
+      if (!sk || !sk.selectedRecipeInRealm) continue;
+      const sendArtisan = () => {
+        if (this._applyingRemote || !this.transport.isConnected) return;
+        const recipes = [];
+        // selectedRecipeInRealm: Map<Realm, Recipe>
+        for (const [realm, recipe] of sk.selectedRecipeInRealm) {
+          recipes.push({ realmId: realm.id, recipeId: recipe ? recipe.id : null });
+        }
+        this.transport.send({
+          t: Msg.SKILL_SELECT, skillId: `melvorD:${skillName.charAt(0).toUpperCase() + skillName.slice(1)}`,
+          artisanRecipes: recipes,
+          selectedRecipeId: sk.selectedRecipe ? sk.selectedRecipe.id : null,
+        });
+      };
+      const proto = sk.constructor.prototype;
+      for (const m of ['selectRecipeOnClick', 'createButtonOnClick', 'resetToDefaultSelectedRecipeBasedOnRealm', 'updateRealmSelection']) {
+        if (typeof proto[m] === 'function') {
+          try { this.ctx.patch(sk.constructor, m).after(() => sendArtisan()); } catch { /* skip */ }
+        }
+      }
+    }
+
     // Harvesting: selected vein
     const hv = game.harvesting;
     if (hv) {
@@ -2385,13 +2506,17 @@ class Sync {
         }
         const donated = [];
         if (ar.museum && ar.museum.donatedItems) for (const item of ar.museum.donatedItems) donated.push(item.id);
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Archaeology', digSites, donatedItems: donated });
+        const museumRewards = [];
+        if (ar.museum && ar.museum.rewards) for (const rw of ar.museum.rewards.allObjects) {
+          if (rw.awarded) museumRewards.push(rw.id);
+        }
+        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Archaeology', digSites, donatedItems: donated, museumRewards });
       };
       for (const m of ['setMapAsActive', 'toggleTool', 'setToolAsActive', 'startDigging']) {
         if (typeof Archaeology.prototype[m] === 'function') this.ctx.patch(Archaeology, m).after(() => send());
       }
       if (ar.museum) {
-        for (const m of ['donateItem', 'donateAllGenericArtefacts', 'giveReward']) {
+        for (const m of ['donateItem', 'donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
           if (typeof ArchaeologyMuseum.prototype[m] === 'function') this.ctx.patch(ArchaeologyMuseum, m).after(() => send());
         }
       }
@@ -2465,11 +2590,39 @@ class Sync {
         }
         case 'melvorD:Fletching': {
           const s = game.fletching;
-          if (!s || !msg.altRecipes) break;
-          for (const a of msg.altRecipes) {
+          if (!s) break;
+          if (msg.altRecipes) for (const a of msg.altRecipes) {
             const recipe = s.actions.getObjectByID(a.recipeId);
             if (recipe) s.setAltRecipes.set(recipe, a.altIndex);
           }
+          // Artisan recipe selection (from generic artisan sync)
+          if (msg.artisanRecipes && s.selectedRecipeInRealm) {
+            for (const ar of msg.artisanRecipes) {
+              const realm = game.realms.getObjectByID(ar.realmId);
+              if (!realm) continue;
+              const recipe = ar.recipeId ? s.actions.getObjectByID(ar.recipeId) : null;
+              if (recipe) s.selectedRecipeInRealm.set(realm, recipe);
+            }
+          }
+          if (msg.selectedRecipeId) s.selectedRecipe = s.actions.getObjectByID(msg.selectedRecipeId);
+          if (s.render) s.render();
+          break;
+        }
+        case 'melvorD:Herblore':
+        case 'melvorD:Smithing':
+        case 'melvorD:Crafting':
+        case 'melvorD:Runecrafting': {
+          const s = game[msg.skillId.charAt('melvorD:'.length).toLowerCase()];
+          if (!s) break;
+          if (msg.artisanRecipes && s.selectedRecipeInRealm) {
+            for (const ar of msg.artisanRecipes) {
+              const realm = game.realms.getObjectByID(ar.realmId);
+              if (!realm) continue;
+              const recipe = ar.recipeId ? s.actions.getObjectByID(ar.recipeId) : null;
+              if (recipe) s.selectedRecipeInRealm.set(realm, recipe);
+            }
+          }
+          if (msg.selectedRecipeId) s.selectedRecipe = s.actions.getObjectByID(msg.selectedRecipeId);
           if (s.render) s.render();
           break;
         }
@@ -2497,6 +2650,12 @@ class Sync {
             for (const itemId of msg.donatedItems) {
               const item = game.items.getObjectByID(itemId);
               if (item) s.museum.donatedItems.add(item);
+            }
+          }
+          if (msg.museumRewards && s.museum && s.museum.rewards) {
+            for (const rwId of msg.museumRewards) {
+              const rw = s.museum.rewards.getObjectByID(rwId);
+              if (rw) rw.awarded = true;
             }
           }
           if (s.render) s.render();
@@ -3957,6 +4116,7 @@ class Sync {
             upgradeActions: m._upgradeActions || 0,
             charges: m.charges || 0,
             refinements: (m.refinements || []).map(r => ({ id: r.id, value: r.value })),
+            artefactValues: m.artefactValues ? { tiny: m.artefactValues.tiny || 0, small: m.artefactValues.small || 0, medium: m.artefactValues.medium || 0, large: m.artefactValues.large || 0 } : null,
           });
         }
         out.push({ digSiteId: digSite.id, maps });
@@ -4089,6 +4249,14 @@ class Sync {
                 const mod = game.modifiers && game.modifiers.getObjectByID(r.id);
                 return mod ? { ...mod, value: r.value } : { id: r.id, value: r.value };
               });
+            }
+            // Artefact values — take max per size to preserve best drops
+            if (remote.artefactValues && local.artefactValues) {
+              for (const sz of ['tiny', 'small', 'medium', 'large']) {
+                if (typeof remote.artefactValues[sz] === 'number') {
+                  local.artefactValues[sz] = Math.max(local.artefactValues[sz] || 0, remote.artefactValues[sz]);
+                }
+              }
             }
           }
         }
@@ -4624,10 +4792,20 @@ class Sync {
     const playerState = {};
     if (game.combat.player) {
       for (let i = 0; i < game.combat.player.equipmentSets.length; i++) {
+        const set = game.combat.player.equipmentSets[i];
         const slots = {};
-        for (const [slotId, eqItem] of Object.entries(game.combat.player.equipmentSets[i].equipment.equippedItems)) {
+        for (const [slotId, eqItem] of Object.entries(set.equipment.equippedItems)) {
           slots[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
         }
+        // Per-set spell selection (attack/curse/aurora) and prayer selection
+        const spellSel = set.spellSelection || {};
+        const prayerSel = set.prayerSelection;
+        slots.__spellSelection = {
+          attackId: spellSel.attack ? spellSel.attack.id : null,
+          curseId: spellSel.curse ? spellSel.curse.id : null,
+          auroraId: spellSel.aurora ? spellSel.aurora.id : null,
+        };
+        slots.__prayerSelection = prayerSel ? [...prayerSel].map(ap => ap.id) : [];
         equipSets.push(slots);
       }
       // Player combat state
@@ -4635,7 +4813,7 @@ class Sync {
       playerState.prayerPoints = game.combat.player.prayerPoints;
       playerState.soulPoints = game.combat.player.soulPoints;
       playerState.prayers = [];
-      if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) playerState.prayers.push(ap.prayer.id);
+      if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) playerState.prayers.push(ap.id);
       playerState.food = [];
       if (game.combat.player.food && game.combat.player.food.slots) {
         for (let i = 0; i < game.combat.player.food.slots.length; i++) {
@@ -4716,7 +4894,15 @@ class Sync {
         }
       }
     }
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState, combatEventState };
+    // Active potions
+    const potions = [];
+    if (game.potions && game.potions.activePotions) {
+      game.potions.activePotions.forEach((active, action) => {
+        potions.push({ actionId: action.id, itemId: active.item.id, charges: active.charges });
+      });
+    }
+
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState, combatEventState, potions };
 
     // Mastery (per-action XP + mastery pool XP per realm)
     const mastery = [];
@@ -4863,6 +5049,29 @@ class Sync {
           digSiteMaps: this._serializeDigSiteMaps(),
         };
       } catch { /* noop */ }
+    }
+
+    // Archaeology (dig sites, tools, museum donations, museum rewards)
+    if (game.archaeology) {
+      const ar = game.archaeology;
+      const archData = {};
+      try {
+        archData.digSites = [];
+        if (ar.actions) for (const ds of ar.actions.allObjects) {
+          archData.digSites.push({
+            id: ds.id,
+            mapIndex: ds.selectedMapIndex,
+            tools: (ds.selectedTools || []).map(t => t ? t.id : null),
+          });
+        }
+        archData.donatedItems = [];
+        if (ar.museum && ar.museum.donatedItems) for (const item of ar.museum.donatedItems) archData.donatedItems.push(item.id);
+        archData.museumRewards = [];
+        if (ar.museum && ar.museum.rewards) for (const rw of ar.museum.rewards.allObjects) {
+          if (rw.awarded) archData.museumRewards.push(rw.id);
+        }
+      } catch { /* noop */ }
+      snapshot.archaeology = archData;
     }
 
     // Clue hunt
@@ -5045,15 +5254,18 @@ class Sync {
           const eqSet = game.combat.player.equipmentSets[i];
           if (!eqSet) continue;
           const eq = eqSet.equipment;
+          // Remove local items not present remotely (skip internal keys)
           for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
-            if (!remoteSlots[slotId]) {
+            if (remoteSlots[slotId] === undefined) {
               const slot = game.equipmentSlots.getObjectByID(slotId);
               if (slot) {
                 try { eq.unequipItem(slot); } catch (e) { /* skip */ }
               }
             }
           }
+          // Equip remote items (skip internal __ keys)
           for (const [slotId, remote] of Object.entries(remoteSlots)) {
+            if (slotId === '__spellSelection' || slotId === '__prayerSelection') continue;
             const local = eq.equippedItems[slotId];
             const item = this._itemById(remote.itemId);
             if (!item) continue;
@@ -5067,6 +5279,34 @@ class Sync {
               try { game.bank.addItem(item, remote.qty, false, false, true, false); } catch (e) { /* skip */ }
             }
             try { eq.equipItem(item, slot, remote.qty); } catch (e) { /* skip */ }
+          }
+          // Per-set spell selection
+          if (remoteSlots.__spellSelection && eqSet.spellSelection) {
+            const ss = remoteSlots.__spellSelection;
+            try {
+              if (ss.attackId) {
+                const sp = game.attackSpells.getObjectByID(ss.attackId);
+                if (sp && game.combat.player.selectAttackSpell) game.combat.player.selectAttackSpell(sp, false);
+              }
+              if (ss.curseId) {
+                const sp = game.curseSpells && game.curseSpells.getObjectByID(ss.curseId);
+                if (sp && game.combat.player.toggleCurse) game.combat.player.toggleCurse(sp, false);
+              }
+              if (ss.auroraId) {
+                const sp = game.auroraSpells && game.auroraSpells.getObjectByID(ss.auroraId);
+                if (sp && game.combat.player.toggleAurora) game.combat.player.toggleAurora(sp, false);
+              }
+            } catch { /* skip */ }
+          }
+          // Per-set prayer selection
+          if (remoteSlots.__prayerSelection && eqSet.prayerSelection) {
+            try {
+              eqSet.prayerSelection.clear();
+              for (const pid of remoteSlots.__prayerSelection) {
+                const pr = game.prayers && game.prayers.getObjectByID(pid);
+                if (pr) eqSet.prayerSelection.add(pr);
+              }
+            } catch { /* skip */ }
           }
         }
         // Properly update stats and UI for equipment changes
@@ -5177,6 +5417,24 @@ class Sync {
         }
         if (t.renderProgress) { try { t.renderProgress(); } catch { /* noop */ } }
       }
+      // Active potions from snapshot
+      if (msg.potions && game.potions) {
+        try {
+          // Remove all existing potions
+          game.potions.activePotions.forEach((ap, action) => {
+            try { game.potions.removePotion(action, true); } catch { /* skip */ }
+          });
+          // Add remote potions
+          for (const p of msg.potions) {
+            const item = this._itemById(p.itemId);
+            if (item) {
+              try { game.potions.usePotion(item, true); } catch { /* skip */ }
+            }
+          }
+          if (game.potions.computeProvidedStats) game.potions.computeProvidedStats();
+          if (game.potions.render) game.potions.render();
+        } catch { /* skip */ }
+      }
       // Mining rock HP — skip the rock the local player is mining.
       if (msg.rockHP && game.mining) {
         let localRockId = null;
@@ -5214,6 +5472,9 @@ class Sync {
           if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
           if (p.selectedRecipeId !== undefined) {
             plot.selectedRecipe = p.selectedRecipeId ? game.items.getObjectByID(p.selectedRecipeId) : undefined;
+          }
+          if (typeof p.abyssalLevel === 'number' && 'abyssalLevel' in plot) {
+            plot.abyssalLevel = p.abyssalLevel;
           }
         }
         if (game.farming.render) game.farming.render();
@@ -5304,6 +5565,32 @@ class Sync {
       // Cartography from snapshot
       if (msg.cartography && game.cartography) {
         this._applyCartography(msg.cartography);
+      }
+      // Archaeology from snapshot
+      if (msg.archaeology && game.archaeology) {
+        const ar = game.archaeology;
+        const ad = msg.archaeology;
+        try {
+          if (ad.digSites && ar.actions) for (const ds of ad.digSites) {
+            const digSite = ar.actions.getObjectByID(ds.id);
+            if (!digSite) continue;
+            if (typeof ds.mapIndex === 'number') digSite.selectedMapIndex = ds.mapIndex;
+            if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? game.items.getObjectByID(tid) : null).filter(Boolean);
+          }
+          if (ad.donatedItems && ar.museum && ar.museum.donatedItems) {
+            for (const itemId of ad.donatedItems) {
+              const item = game.items.getObjectByID(itemId);
+              if (item) ar.museum.donatedItems.add(item);
+            }
+          }
+          if (ad.museumRewards && ar.museum && ar.museum.rewards) {
+            for (const rwId of ad.museumRewards) {
+              const rw = ar.museum.rewards.getObjectByID(rwId);
+              if (rw) rw.awarded = true;
+            }
+          }
+          if (ar.museum && ar.museum.render) try { ar.museum.render(); } catch { /* noop */ }
+        } catch { /* noop */ }
       }
       // Clue hunt from snapshot
       if (msg.clueHunt && game.clueHunt) {
