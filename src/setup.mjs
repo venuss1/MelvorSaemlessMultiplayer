@@ -69,6 +69,7 @@ const Msg = Object.freeze({
   TOWNSHIP_TASKS: 'township_tasks',
   CARTOGRAPHY: 'cartography',
   STATS: 'stats',
+  COMBAT_EVENT: 'combat_event',
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
   UNLOCK_ALL: 'unlock_all',
@@ -386,6 +387,7 @@ class Sync {
       ['SkillSelections', () => this._patchSkillSelections()],
       ['PlayerState', () => this._patchPlayerState()],
       ['CombatAreas', () => this._patchCombatAreas()],
+      ['CombatEvents', () => this._patchCombatEvents()],
       ['AncientRelics', () => this._patchAncientRelics()],
       ['SkillTree', () => this._patchSkillTree()],
       ['Township', () => this._patchTownship()],
@@ -473,6 +475,7 @@ class Sync {
     if (this._watcher) { clearInterval(this._watcher); this._watcher = null; }
     if (this._saveTimer) { clearInterval(this._saveTimer); this._saveTimer = null; }
     if (this._progressTimer) { clearInterval(this._progressTimer); this._progressTimer = null; }
+    if (this._combatStateInterval) { clearInterval(this._combatStateInterval); this._combatStateInterval = null; }
   }
 
   // Debounced render — batches multiple updates into a single render frame.
@@ -1995,6 +1998,200 @@ class Sync {
     finally { this._applyingRemote = false; }
   }
 
+  // ---- Combat event sync (damage, healing, monster selection) ------------
+  _patchCombatEvents() {
+    const cm = game.combat;
+    if (!cm) return;
+    const sync = this;
+
+    // Throttle: send at most every 100ms to avoid flooding
+    let lastSend = 0;
+    const sendCombatEvent = (data) => {
+      if (sync._applyingRemote || !sync.transport.isConnected) return;
+      const now = Date.now();
+      if (now - lastSend < 80) return; // throttle ~12 updates/sec
+      lastSend = now;
+      sync.transport.send({ t: Msg.COMBAT_EVENT, ...data });
+    };
+
+    // Send full combat state (monster, HP, paused) — used for periodic sync
+    const sendCombatState = () => {
+      if (sync._applyingRemote || !sync.transport.isConnected) return;
+      const cm = game.combat;
+      const enemy = cm.enemy;
+      const player = cm.player;
+      sync.transport.send({
+        t: Msg.COMBAT_EVENT,
+        kind: 'state',
+        paused: cm.paused,
+        monsterId: enemy.monster ? enemy.monster.id : null,
+        areaId: cm.selectedMonster ? (cm.selectedMonster._area ? cm.selectedMonster._area.id : null) : null,
+        enemyHp: enemy.hitpoints,
+        enemyMaxHp: enemy.stats ? enemy.stats.maxHitpoints : 0,
+        playerHp: player.hitpoints,
+        playerMaxHp: player.stats ? player.stats.maxHitpoints : 0,
+      });
+    };
+
+    // Patch Enemy.damage — fires after enemy takes damage
+    if (typeof Enemy !== 'undefined' && Enemy.prototype && typeof Enemy.prototype.damage === 'function') {
+      this.ctx.patch(Enemy, 'damage').after(function (amount, source) {
+        if (amount <= 0) return;
+        sendCombatEvent({
+          kind: 'damage',
+          target: 'enemy',
+          amount,
+          source: typeof source === 'string' ? source : 'Attack',
+          monsterId: this.monster ? this.monster.id : null,
+          hp: this.hitpoints,
+          maxHp: this.stats ? this.stats.maxHitpoints : 0,
+        });
+      });
+    }
+
+    // Patch Player.damage — fires after player takes damage
+    if (typeof Player !== 'undefined' && Player.prototype && typeof Player.prototype.damage === 'function') {
+      this.ctx.patch(Player, 'damage').after(function (amount, source) {
+        if (amount <= 0) return;
+        sendCombatEvent({
+          kind: 'damage',
+          target: 'player',
+          amount,
+          source: typeof source === 'string' ? source : 'Attack',
+          hp: this.hitpoints,
+          maxHp: this.stats ? this.stats.maxHitpoints : 0,
+        });
+      });
+    }
+
+    // Patch Character.heal — fires after healing (both player and enemy)
+    if (typeof Character !== 'undefined' && Character.prototype && typeof Character.prototype.heal === 'function') {
+      this.ctx.patch(Character, 'heal').after(function (amount) {
+        if (amount <= 0) return;
+        const isEnemy = this === game.combat.enemy;
+        sendCombatEvent({
+          kind: 'heal',
+          target: isEnemy ? 'enemy' : 'player',
+          amount,
+          hp: this.hitpoints,
+          maxHp: this.stats ? this.stats.maxHitpoints : 0,
+        });
+      });
+    }
+
+    // Patch spawnEnemy — sync when a new monster spawns
+    if (typeof CombatManager.prototype.spawnEnemy === 'function') {
+      this.ctx.patch(CombatManager, 'spawnEnemy').after(() => {
+        sendCombatState();
+      });
+    }
+
+    // Patch selectMonster — sync monster selection
+    if (typeof CombatManager.prototype.selectMonster === 'function') {
+      this.ctx.patch(CombatManager, 'selectMonster').after(() => {
+        sendCombatState();
+      });
+    }
+
+    // Patch pause/unpause — sync combat pause state
+    // CombatManager has a `paused` property, patch the methods that change it
+    for (const m of ['pause', 'stop', 'start']) {
+      if (typeof CombatManager.prototype[m] === 'function') {
+        try {
+          this.ctx.patch(CombatManager, m).after(() => sendCombatState());
+        } catch (e) { /* skip if already patched */ }
+      }
+    }
+
+    // Periodic state sync every 2 seconds (catches up any missed events)
+    this._combatStateInterval = setInterval(() => {
+      if (sync.transport.isConnected && !sync._applyingRemote) {
+        sendCombatState();
+      }
+    }, 2000);
+  }
+
+  _applyCombatEvent(msg) {
+    const cm = game.combat;
+    if (!cm) return;
+    this._applyingRemote = true;
+    try {
+      if (msg.kind === 'state') {
+        // Full state sync — monster selection, HP, paused
+        // Sync monster if different
+        if (msg.monsterId) {
+          const monster = game.monsters.getObjectByID(msg.monsterId);
+          if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId)) {
+            try { cm.enemy.setNewMonster(monster); } catch (e) { /* skip */ }
+          }
+        }
+        // Sync paused state
+        if (typeof msg.paused === 'boolean' && cm.paused !== msg.paused) {
+          // Don't force pause/unpause — just note the state
+          // (actual pause control is complex and could fight with local player)
+        }
+        // Sync HP values
+        if (msg.enemyHp !== undefined && cm.enemy) {
+          if (cm.enemy.hitpoints !== msg.enemyHp) {
+            cm.enemy.hitpoints = msg.enemyHp;
+            if (cm.enemy.renderHitpoints) cm.enemy.renderHitpoints();
+            if (cm.enemy.render) cm.enemy.render();
+          }
+        }
+        if (msg.playerHp !== undefined && cm.player) {
+          if (cm.player.hitpoints !== msg.playerHp) {
+            cm.player.hitpoints = msg.playerHp;
+            if (cm.player.renderHitpoints) cm.player.renderHitpoints();
+          }
+        }
+      } else if (msg.kind === 'damage') {
+        const target = msg.target === 'enemy' ? cm.enemy : cm.player;
+        if (!target) return;
+        // Apply damage directly to hitpoints
+        if (msg.hp !== undefined) {
+          target.hitpoints = msg.hp;
+        } else {
+          target.hitpoints = Math.max(0, target.hitpoints - msg.amount);
+        }
+        // Show damage splash for visual feedback
+        if (target.splashManager && target.splashManager.add) {
+          try {
+            target.splashManager.add({
+              source: msg.source || 'Attack',
+              amount: msg.amount,
+              xOffset: 0,
+            });
+            if (target.splashManager.render) target.splashManager.render();
+          } catch (e) { /* skip splash */ }
+        }
+        // Render HP bar
+        if (target.renderHitpoints) target.renderHitpoints();
+        if (target.render) target.render();
+      } else if (msg.kind === 'heal') {
+        const target = msg.target === 'enemy' ? cm.enemy : cm.player;
+        if (!target) return;
+        if (msg.hp !== undefined) {
+          target.hitpoints = msg.hp;
+        } else {
+          target.hitpoints = Math.min(target.stats ? target.stats.maxHitpoints : target.hitpoints, target.hitpoints + msg.amount);
+        }
+        // Show heal splash
+        if (target.splashManager && target.splashManager.add) {
+          try {
+            target.splashManager.add({
+              source: 'Heal',
+              amount: msg.amount,
+              xOffset: 0,
+            });
+            if (target.splashManager.render) target.splashManager.render();
+          } catch (e) { /* skip splash */ }
+        }
+        if (target.renderHitpoints) target.renderHitpoints();
+      }
+    } catch (e) { logger.error('applyCombatEvent failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
   // ---- Ancient relics sync ----------------------------------------------
   _patchAncientRelics() {
     if (!game.ancientRelics) return;
@@ -2831,8 +3028,20 @@ class Sync {
         if (data) farmingPlots.push(data);
       }
     }
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots };
-    logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots`);
+    // Combat state
+    let combatState = null;
+    if (game.combat && game.combat.enemy) {
+      combatState = {
+        monsterId: game.combat.enemy.monster ? game.combat.enemy.monster.id : null,
+        enemyHp: game.combat.enemy.hitpoints,
+        enemyMaxHp: game.combat.enemy.stats ? game.combat.enemy.stats.maxHitpoints : 0,
+        playerHp: game.combat.player ? game.combat.player.hitpoints : 0,
+        playerMaxHp: game.combat.player && game.combat.player.stats ? game.combat.player.stats.maxHitpoints : 0,
+        paused: game.combat.paused,
+      };
+    }
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState };
+    logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots, combat: ${combatState ? 'yes' : 'no'}`);
     logger.info('========== [MP] SNAPSHOT BUILT ==========');
     return snapshot;
   }
@@ -3041,6 +3250,24 @@ class Sync {
         if (game.farming.renderGrowthState) game.farming.renderGrowthState();
         if (game.farming.renderPlotVisibility) game.farming.renderPlotVisibility();
         if (game.farming.renderPlotUnlockQuantities) game.farming.renderPlotUnlockQuantities();
+      }
+      // Combat state from snapshot
+      if (msg.combat && game.combat) {
+        const cs = msg.combat;
+        if (cs.monsterId && game.combat.enemy) {
+          const monster = game.monsters.getObjectByID(cs.monsterId);
+          if (monster && (!game.combat.enemy.monster || game.combat.enemy.monster.id !== cs.monsterId)) {
+            try { game.combat.enemy.setNewMonster(monster); } catch (e) { /* skip */ }
+          }
+        }
+        if (typeof cs.enemyHp === 'number' && game.combat.enemy) {
+          game.combat.enemy.hitpoints = cs.enemyHp;
+          if (game.combat.enemy.renderHitpoints) game.combat.enemy.renderHitpoints();
+        }
+        if (typeof cs.playerHp === 'number' && game.combat.player) {
+          game.combat.player.hitpoints = cs.playerHp;
+          if (game.combat.player.renderHitpoints) game.combat.player.renderHitpoints();
+        }
       }
       this._forceRender();
     } catch (e) { logger.error('snapshot apply failed', e); }
@@ -3598,6 +3825,7 @@ class Sync {
       [Msg.SKILL_SELECT]: (m) => this._applySkillSelect(m),
       [Msg.PLAYER_STATE]: (m) => this._applyPlayerState(m),
       [Msg.COMBAT_AREA]: (m) => this._applyCombatArea(m),
+      [Msg.COMBAT_EVENT]: (m) => this._applyCombatEvent(m),
       [Msg.ANCIENT_RELIC]: (m) => this._applyAncientRelic(m),
       [Msg.SKILL_TREE]: (m) => this._applySkillTree(m),
       [Msg.TOWNSHIP]: (m) => this._applyTownship(m),
