@@ -1259,28 +1259,26 @@ class Sync {
 
     // Patch unlockPlotOnClick — bypass level check so both players can unlock
     // The original checks: if (!this.game.gp.canAfford(plot.gpCost) || this.level < plot.level) return;
-    // We replace it to only check GP, not level (levels may not be synced)
-    const origUnlock = Farming.prototype.unlockPlotOnClick;
-    Farming.prototype.unlockPlotOnClick = function (plot) {
+    // We use a before patch to temporarily boost the farming _level so the
+    // level check passes, then restore it in the after patch.
+    // Note: level is a getter that returns _level, so we must set _level.
+    let savedFarmingLevel = null;
+    this.ctx.patch(Farming, 'unlockPlotOnClick').before(function (plot) {
       if (!plot) return;
-      // Only check GP cost, skip level requirement
-      const gpCost = plot.gpCost || 0;
-      if (gpCost > 0 && game.gp && !game.gp.canAfford(gpCost)) return;
-      if (gpCost > 0 && game.gp) game.gp.remove(gpCost);
-      // Also handle currencyCosts (newer API) if present
-      if (plot.currencyCosts && plot.currencyCosts.length > 0) {
-        for (const cost of plot.currencyCosts) {
-          // Skip if can't afford — but don't block the unlock entirely
-          // The sync will handle giving the plot to the other player for free
-        }
-      }
-      plot.state = 1; // Empty
-      if (this.showPlotsInCategory) this.showPlotsInCategory(plot.category);
-      logger.info(`[FARM] Unlocked plot: ${plot.id}`);
-    };
-
-    // Plot unlock — sync so both players get unlocked plots
+      // Save current level and temporarily set it high enough to pass the check
+      savedFarmingLevel = this._level;
+      this._level = Math.max(this._level, plot.level || 1, 120);
+    });
     this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
+      // Restore the original farming level
+      if (savedFarmingLevel !== null) {
+        this._level = savedFarmingLevel;
+        savedFarmingLevel = null;
+      }
+      // Check if the unlock actually succeeded (plot.state changed to 1)
+      if (plot && plot.state === 1) {
+        logger.info(`[FARM] Unlocked plot: ${plot.id}`);
+      }
       sendPlot(plot);
     });
 
