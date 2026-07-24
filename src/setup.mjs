@@ -891,7 +891,7 @@ class Sync {
     const sendPrayers = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       const prayers = [];
-      if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) prayers.push(ap.prayer.id);
+      if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) prayers.push(ap.id);
       sync.transport.send({
         t: Msg.PLAYER_STATE, prayers,
         prayerPoints: game.combat.player.prayerPoints,
@@ -907,7 +907,9 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync.transport.send({
         t: Msg.PLAYER_STATE,
-        attackSpellId: game.combat.player.selectedAttackSpell ? game.combat.player.selectedAttackSpell.id : null,
+        attackSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.attack) ? game.combat.player.spellSelection.attack.id : null,
+        curseSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.curse) ? game.combat.player.spellSelection.curse.id : null,
+        auroraSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.aurora) ? game.combat.player.spellSelection.aurora.id : null,
       });
     };
     this.ctx.patch(Player, 'selectAttackSpell').after(function () { sendAttackSpell(); });
@@ -1898,8 +1900,8 @@ class Sync {
           if (obId === currentId) continue; // already in sync
 
           if (obId) {
-            // Build the obstacle
-            const ob = game.items.getObjectByID(obId);
+            // Build the obstacle — obstacles live in game.agility.actions
+            const ob = (ag.actions && ag.actions.getObjectByID(obId)) || game.items.getObjectByID(obId);
             if (!ob) { logger.warn(`[AGILITY] Obstacle not found: ${obId}`); continue; }
             // Remove existing obstacle at this tier first
             if (currentOb && typeof ag.destroyObstacle === 'function') {
@@ -1941,7 +1943,7 @@ class Sync {
           if (piId === currentId) continue;
 
           if (piId) {
-            const pi = game.items.getObjectByID(piId);
+            const pi = (ag.pillars && ag.pillars.getObjectByID(piId)) || game.items.getObjectByID(piId);
             if (!pi) { logger.warn(`[AGILITY] Pillar not found: ${piId}`); continue; }
             if (currentPi && typeof ag.destroyPillar === 'function') {
               try { ag.destroyPillar(course, tierNum); }
@@ -2564,6 +2566,20 @@ class Sync {
           if (spell && p.selectAttackSpell) p.selectAttackSpell(spell, false);
         }
       }
+      // Curse spell
+      if (msg.curseSpellId !== undefined) {
+        if (msg.curseSpellId) {
+          const spell = game.curseSpells.getObjectByID(msg.curseSpellId);
+          if (spell && p.toggleCurse) p.toggleCurse(spell, false);
+        }
+      }
+      // Aurora spell
+      if (msg.auroraSpellId !== undefined) {
+        if (msg.auroraSpellId) {
+          const spell = game.auroraSpells.getObjectByID(msg.auroraSpellId);
+          if (spell && p.toggleAurora) p.toggleAurora(spell, false);
+        }
+      }
 
       // Equipment set selection
       if (typeof msg.selectedEquipmentSet === 'number' && msg.selectedEquipmentSet !== p.selectedEquipmentSet) {
@@ -2597,9 +2613,9 @@ class Sync {
     for (const m of ['selectDungeon', 'selectAbyssDepth', 'selectStronghold', 'selectMonster', 'startEvent']) {
       if (typeof CombatManager.prototype[m] === 'function') this.ctx.patch(CombatManager, m).after(() => send());
     }
-    // Patch dungeon progress increase (class-level, covers all dungeons)
-    if (typeof Dungeon.prototype.increaseDungeonProgress === 'function') {
-      this.ctx.patch(Dungeon, 'increaseDungeonProgress').after(() => send());
+    // Patch progress/completion increases (all on CombatManager per DTS)
+    for (const m of ['increaseDungeonProgress', 'increaseAbyssProgress', 'increaseStrongholdProgress', 'addDungeonCompletion']) {
+      if (typeof CombatManager.prototype[m] === 'function') this.ctx.patch(CombatManager, m).after(() => send());
     }
   }
 
@@ -3698,17 +3714,25 @@ class Sync {
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const results = (fc.playerResults || []).map(r => ({
-        fishId: r.fish ? r.fish.id : null, score: r.score, timestamp: r.timestamp,
+        length: r.length || 0, weight: r.weight || 0,
+      }));
+      const leaderboard = (fc.contestantLeaderboard || []).map(e => ({
+        isPlayer: !!e.isPlayer, name: e.name || '',
+        bestResult: e.bestResult ? { length: e.bestResult.length || 0, weight: e.bestResult.weight || 0 } : null,
       }));
       this.transport.send({
         t: Msg.FISHING_CONTEST,
         isActive: fc.isActive,
         activeFishId: fc.activeFish ? fc.activeFish.id : null,
         actionsRemaining: fc.actionsRemaining,
+        currentDifficulty: fc.currentDifficulty,
+        completionTracker: fc.completionTracker ? [...fc.completionTracker] : [],
+        masteryTracker: fc.masteryTracker ? [...fc.masteryTracker] : [],
         results,
+        leaderboard,
       });
     };
-    for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'addResult']) {
+    for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'addResult', 'finalizeFishingContest', 'generateNewFishingContestLeaderboard', 'updateBestFishResultForPlayer', 'updateBestFishResultForContestant']) {
       if (typeof FishingContest.prototype[m] === 'function') {
         this.ctx.patch(FishingContest, m).after(() => send());
       }
@@ -3723,24 +3747,50 @@ class Sync {
       fc.isActive = !!msg.isActive;
       if (msg.activeFishId) fc.activeFish = game.items.getObjectByID(msg.activeFishId);
       if (typeof msg.actionsRemaining === 'number') fc.actionsRemaining = msg.actionsRemaining;
+      if (typeof msg.currentDifficulty === 'number') fc.currentDifficulty = msg.currentDifficulty;
+      if (msg.completionTracker) fc.completionTracker = [...msg.completionTracker];
+      if (msg.masteryTracker) fc.masteryTracker = [...msg.masteryTracker];
       if (msg.results) {
-        // Merge by timestamp+fish to avoid losing local results the remote
-        // doesn't know about. Take the higher score for each entry.
-        const incoming = msg.results.map(r => ({
-          fish: r.fishId ? game.items.getObjectByID(r.fishId) : null,
-          score: r.score, timestamp: r.timestamp,
-        }));
+        // FishingContestResult = { length, weight }. Merge by taking the best
+        // result (highest length, then weight) for each slot.
+        const incoming = msg.results.map(r => ({ length: r.length || 0, weight: r.weight || 0 }));
         if (!fc.playerResults) fc.playerResults = [];
-        for (const inc of incoming) {
-          const existing = fc.playerResults.find(r => r.timestamp === inc.timestamp && r.fish === inc.fish);
-          if (existing) {
-            if ((inc.score || 0) > (existing.score || 0)) existing.score = inc.score;
-          } else {
-            fc.playerResults.push(inc);
+        // Replace if remote has more results, otherwise merge best per index.
+        if (incoming.length >= fc.playerResults.length) {
+          fc.playerResults = incoming;
+        } else {
+          for (let i = 0; i < incoming.length; i++) {
+            const cur = fc.playerResults[i];
+            const inc = incoming[i];
+            if (!cur || inc.length > cur.length || (inc.length === cur.length && inc.weight > cur.weight)) {
+              fc.playerResults[i] = inc;
+            }
           }
         }
-        if (fc.render) try { fc.render(); } catch { /* noop */ }
       }
+      if (msg.leaderboard) {
+        if (!fc.contestantLeaderboard) fc.contestantLeaderboard = [];
+        for (let i = 0; i < msg.leaderboard.length; i++) {
+          const inc = msg.leaderboard[i];
+          const cur = fc.contestantLeaderboard[i];
+          const bestResult = inc.bestResult ? { length: inc.bestResult.length, weight: inc.bestResult.weight } : null;
+          if (!cur) {
+            fc.contestantLeaderboard[i] = { isPlayer: inc.isPlayer, name: inc.name, bestResult };
+          } else {
+            cur.isPlayer = inc.isPlayer; cur.name = inc.name;
+            if (bestResult && (!cur.bestResult || bestResult.length > cur.bestResult.length || (bestResult.length === cur.bestResult.length && bestResult.weight > cur.bestResult.weight))) {
+              cur.bestResult = bestResult;
+            }
+          }
+        }
+      }
+      if (fc.renderQueue) {
+        fc.renderQueue.status = true;
+        fc.renderQueue.results = true;
+        fc.renderQueue.leaderboard = true;
+        fc.renderQueue.remainingActions = true;
+      }
+      if (fc.render) try { fc.render(); } catch { /* noop */ }
     } catch (e) { logger.error('applyFishingContest failed', e); }
     finally { this._applyingRemote = false; }
   }
@@ -4220,9 +4270,15 @@ class Sync {
     if (!lore) return;
     const read = [];
     if (lore.books) for (const book of lore.books.allObjects) {
-      // Lore tracks read state internally; check for a read flag or use the
-      // bookButtons map (read books have a disabled read button).
-      if (book._read || book.isRead) read.push(book.id);
+      // LoreBook has no public read-state field in the DTS; the game tracks
+      // read state internally (likely via the bookButtons map / save data).
+      // Use any available read flag defensively, plus the button state.
+      let isRead = !!(book._read || book.isRead);
+      if (!isRead && lore.bookButtons) {
+        const btn = lore.bookButtons.get(book);
+        if (btn && btn.readButton && btn.readButton.disabled) isRead = true;
+      }
+      if (isRead) read.push(book.id);
     }
     this.transport.send({ t: Msg.LORE, read });
   }
@@ -4234,8 +4290,14 @@ class Sync {
       for (const bookId of msg.read) {
         const book = game.lore.books && game.lore.books.getObjectByID(bookId);
         if (book) {
-          if ('_read' in book) book._read = true;
-          if ('isRead' in book) book.isRead = true;
+          // Use the game's own readLore method which handles internal state,
+          // UI button disabling, and save encoding correctly.
+          if (typeof game.lore.readLore === 'function') {
+            try { game.lore.readLore(book); } catch { /* noop */ }
+          } else {
+            if ('_read' in book) book._read = true;
+            if ('isRead' in book) book.isRead = true;
+          }
         }
       }
       if (game.lore.render) try { game.lore.render(); } catch { /* noop */ }
@@ -4586,7 +4648,9 @@ class Sync {
       if (game.combat.player.attackStyles) for (let i = 0; i < game.combat.player.attackStyles.length; i++) {
         playerState.attackStyles.push({ set: i, style: game.combat.player.attackStyles[i] });
       }
-      playerState.attackSpellId = game.combat.player.selectedAttackSpell ? game.combat.player.selectedAttackSpell.id : null;
+      playerState.attackSpellId = (game.combat.player.spellSelection && game.combat.player.spellSelection.attack) ? game.combat.player.spellSelection.attack.id : null;
+      playerState.curseSpellId = (game.combat.player.spellSelection && game.combat.player.spellSelection.curse) ? game.combat.player.spellSelection.curse.id : null;
+      playerState.auroraSpellId = (game.combat.player.spellSelection && game.combat.player.spellSelection.aurora) ? game.combat.player.spellSelection.aurora.id : null;
     }
     const pets = [];
     if (game.petManager) for (const pet of game.petManager.unlocked) pets.push(pet.id);
@@ -4874,8 +4938,15 @@ class Sync {
         fishData.isActive = !!fc.isActive;
         fishData.activeFishId = fc.activeFish ? fc.activeFish.id : null;
         if (typeof fc.actionsRemaining === 'number') fishData.actionsRemaining = fc.actionsRemaining;
+        if (typeof fc.currentDifficulty === 'number') fishData.currentDifficulty = fc.currentDifficulty;
+        if (fc.completionTracker) fishData.completionTracker = [...fc.completionTracker];
+        if (fc.masteryTracker) fishData.masteryTracker = [...fc.masteryTracker];
         if (fc.playerResults) fishData.results = fc.playerResults.map(r => ({
-          fishId: r.fish ? r.fish.id : null, score: r.score, timestamp: r.timestamp,
+          length: r.length || 0, weight: r.weight || 0,
+        }));
+        if (fc.contestantLeaderboard) fishData.leaderboard = fc.contestantLeaderboard.map(e => ({
+          isPlayer: !!e.isPlayer, name: e.name || '',
+          bestResult: e.bestResult ? { length: e.bestResult.length || 0, weight: e.bestResult.weight || 0 } : null,
         }));
       } catch { /* noop */ }
       snapshot.fishContest = fishData;
@@ -4910,7 +4981,12 @@ class Sync {
     if (game.lore && game.lore.books) {
       const read = [];
       for (const book of game.lore.books.allObjects) {
-        if (book._read || book.isRead) read.push(book.id);
+        let isRead = !!(book._read || book.isRead);
+        if (!isRead && game.lore.bookButtons) {
+          const btn = game.lore.bookButtons.get(book);
+          if (btn && btn.readButton && btn.readButton.disabled) isRead = true;
+        }
+        if (isRead) read.push(book.id);
       }
       snapshot.lore = { read };
     }
@@ -5034,6 +5110,14 @@ class Sync {
         if (ps.attackSpellId) {
           const spell = game.attackSpells.getObjectByID(ps.attackSpellId);
           if (spell && p.selectAttackSpell) p.selectAttackSpell(spell, false);
+        }
+        if (ps.curseSpellId) {
+          const spell = game.curseSpells && game.curseSpells.getObjectByID(ps.curseSpellId);
+          if (spell && p.toggleCurse) p.toggleCurse(spell, false);
+        }
+        if (ps.auroraSpellId) {
+          const spell = game.auroraSpells && game.auroraSpells.getObjectByID(ps.auroraSpellId);
+          if (spell && p.toggleAurora) p.toggleAurora(spell, false);
         }
         if (p.render) p.render();
       }
@@ -5679,8 +5763,8 @@ class Sync {
       // 15. All clue hunt steps completed
       if (game.clueHunt) {
         try {
-          if (game.clueHunt.steps) {
-            for (const step of game.clueHunt.steps) {
+          if (game.clueHunt.clueProgress) {
+            for (const step of game.clueHunt.clueProgress) {
               if (step && step.complete !== undefined) step.complete = true;
             }
           }
