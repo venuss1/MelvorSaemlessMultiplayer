@@ -5233,9 +5233,14 @@ class Sync {
         }
         playerState.selectedFoodSlot = game.combat.player.food.selectedSlot;
       }
+      // attackStyles is { melee?, ranged?, magic? } of AttackStyle
       playerState.attackStyles = [];
-      if (game.combat.player.attackStyles) for (let i = 0; i < game.combat.player.attackStyles.length; i++) {
-        playerState.attackStyles.push({ set: i, style: game.combat.player.attackStyles[i] });
+      const as = game.combat.player.attackStyles;
+      if (as) {
+        for (const at of ['melee', 'ranged', 'magic']) {
+          const style = as[at];
+          playerState.attackStyles.push({ attackType: at, styleId: style ? style.id : null });
+        }
       }
       playerState.attackSpellId = (game.combat.player.spellSelection && game.combat.player.spellSelection.attack) ? game.combat.player.spellSelection.attack.id : null;
       playerState.curseSpellId = (game.combat.player.spellSelection && game.combat.player.spellSelection.curse) ? game.combat.player.spellSelection.curse.id : null;
