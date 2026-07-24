@@ -1263,53 +1263,49 @@ class Sync {
       sync._sendFarmingPlot(plot);
     };
 
-    // Patch unlockPlotOnClick — bypass level/abyssal/cost checks so both
-    // players can unlock plots. The newer Melvor version uses currencyCosts
-    // and itemCosts instead of gpCost, and may check abyssalLevel too.
-    // We use before/after patches: before boosts level/abyssal, after
-    // restores them and forces the unlock if the original failed.
-    let savedFarmingLevel = null;
-    let savedAbyssalLevel = null;
-    this.ctx.patch(Farming, 'unlockPlotOnClick').before(function (plot) {
+    // Replace unlockPlotOnClick entirely — the newer Melvor version uses
+    // currencyCosts/itemCosts instead of gpCost (which is @deprecated).
+    // The original function throws when gpCost is undefined, preventing
+    // the after hook from running. So we replace it completely.
+    const origUnlockPlot = Farming.prototype.unlockPlotOnClick;
+    Farming.prototype.unlockPlotOnClick = function (plot) {
       if (!plot) {
         logger.warn('[FARM] unlockPlotOnClick called with no plot');
         return;
       }
-      logger.info(`[FARM] unlockPlotOnClick BEFORE: plot=${plot.id}, state=${plot.state}, level=${plot.level}, abyssalLevel=${plot.abyssalLevel}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${game.gp ? game.gp.amount : 'no-gp'}`);
-      // Save current levels and temporarily boost them
-      savedFarmingLevel = this._level;
-      this._level = Math.max(this._level, plot.level || 1, 120);
-      if (this._abyssalLevel !== undefined && plot.abyssalLevel) {
-        savedAbyssalLevel = this._abyssalLevel;
-        this._abyssalLevel = Math.max(this._abyssalLevel, plot.abyssalLevel, 120);
+      const gpBefore = game.gp ? game.gp.amount : 0;
+      logger.info(`[FARM] unlockPlotOnClick: plot=${plot.id}, state=${plot.state}, level=${plot.level}, abyssalLevel=${plot.abyssalLevel}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${gpBefore}`);
+
+      // Try the original first — it handles costs properly
+      let originalSucceeded = false;
+      try {
+        origUnlockPlot.call(this, plot);
+        originalSucceeded = (plot.state === 1);
+        logger.info(`[FARM] original returned: state=${plot.state}, gp=${game.gp ? game.gp.amount : 'no-gp'}, succeeded=${originalSucceeded}`);
+      } catch (e) {
+        logger.warn(`[FARM] original threw: ${e.message}`);
+        // The original may have eaten gold before throwing — restore it
+        if (game.gp && game.gp.amount < gpBefore) {
+          const eaten = gpBefore - game.gp.amount;
+          try { game.gp.add(eaten); logger.info(`[FARM] Restored ${eaten} GP eaten by failed original`); }
+          catch (e2) { logger.warn(`[FARM] Could not restore GP: ${e2.message}`); }
+        }
       }
-      logger.info(`[FARM] Temporarily set farming level from ${savedFarmingLevel} to ${this._level}`);
-    });
-    this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
-      // Restore the original farming level
-      if (savedFarmingLevel !== null) {
-        this._level = savedFarmingLevel;
-        savedFarmingLevel = null;
-      }
-      if (savedAbyssalLevel !== null) {
-        this._abyssalLevel = savedAbyssalLevel;
-        savedAbyssalLevel = null;
-      }
-      if (plot) {
-        logger.info(`[FARM] unlockPlotOnClick AFTER: plot=${plot.id}, state=${plot.state}, gp=${game.gp ? game.gp.amount : 'no-gp'}`);
-      }
+
       // If the unlock failed (state still 0), force it without charging
-      if (plot && plot.state === 0) {
+      if (plot.state === 0) {
         plot.state = 1; // Empty
         if (this.showPlotsInCategory) {
           try { this.showPlotsInCategory(plot.category); } catch (e) { /* skip */ }
         }
-        logger.info(`[FARM] Force unlocked plot (original failed): ${plot.id}`);
-      } else if (plot && plot.state === 1) {
+        logger.info(`[FARM] Force unlocked plot: ${plot.id}`);
+      } else {
         logger.info(`[FARM] Unlocked plot SUCCESS: ${plot.id}`);
       }
+
+      // Sync to peer
       sendPlot(plot);
-    });
+    };
 
     // Planting — sync so both players plant the same seeds
     this.ctx.patch(Farming, 'plantPlot').after(function (_ret, plot) {
