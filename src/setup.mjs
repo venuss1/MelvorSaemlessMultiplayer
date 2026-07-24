@@ -934,9 +934,14 @@ class Sync {
     // --- Attack styles ---
     const sendAttackStyles = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
+      // attackStyles is { melee?: AttackStyle, ranged?: AttackStyle, magic?: AttackStyle }
       const styles = [];
-      if (game.combat.player && game.combat.player.attackStyles) for (let i = 0; i < game.combat.player.attackStyles.length; i++) {
-        styles.push({ set: i, style: game.combat.player.attackStyles[i] });
+      const as = game.combat.player.attackStyles;
+      if (as) {
+        for (const at of ['melee', 'ranged', 'magic']) {
+          const style = as[at];
+          styles.push({ attackType: at, styleId: style ? style.id : null });
+        }
       }
       sync.transport.send({ t: Msg.PLAYER_STATE, attackStyles });
     };
@@ -1020,8 +1025,10 @@ class Sync {
           try {
             eqSet.prayerSelection.clear();
             for (const pid of remoteSlots.__prayerSelection) {
-              const pr = game.prayers && game.prayers.getObjectByID(pid);
-              if (pr) eqSet.prayerSelection.add(pr);
+              // game.prayers is NamespaceRegistry<ActivePrayer>, so
+              // getObjectByID already returns an ActivePrayer instance.
+              const ap = game.prayers && game.prayers.getObjectByID(pid);
+              if (ap) eqSet.prayerSelection.add(ap);
             }
           } catch { /* skip */ }
         }
@@ -2318,13 +2325,13 @@ class Sync {
       t.extended = !!msg.extended;
       if (msg.realmId) t.realm = game.realms.getObjectByID(msg.realmId);
       if (msg.categoryId) {
-        // Slayer task categories live on the Slayer skill, not on the task instance.
-        const cat = (sl.categories && sl.categories.getObjectByID)
-          ? sl.categories.getObjectByID(msg.categoryId)
-          : (game.slayerTaskCategories && game.slayerTaskCategories.getObjectByID
-              ? game.slayerTaskCategories.getObjectByID(msg.categoryId)
-              : undefined);
-        if (cat) t.category = cat;
+        // Slayer task categories live on SlayerTask (game.combat.slayerTask.categories),
+        // not on the Slayer skill class.
+        const cats = game.combat.slayerTask.categories;
+        if (cats) {
+          const cat = cats.getObjectByID(msg.categoryId);
+          if (cat) t.category = cat;
+        }
       }
       if (t.render) t.render();
       if (t.renderTask) t.renderTask();
@@ -2697,12 +2704,11 @@ class Sync {
       if (msg.prayers && p.activePrayers) {
         p.activePrayers.clear();
         for (const pid of msg.prayers) {
-          const prayer = game.prayers.getObjectByID(pid);
-          if (prayer) {
-            try {
-              const ap = new ActivePrayer(prayer);
-              p.activePrayers.add(ap);
-            } catch { /* noop */ }
+          // game.prayers is NamespaceRegistry<ActivePrayer>, so
+          // getObjectByID already returns an ActivePrayer instance.
+          const ap = game.prayers.getObjectByID(pid);
+          if (ap) {
+            try { p.activePrayers.add(ap); } catch { /* noop */ }
           }
         }
         if (p.render) p.render();
@@ -2724,10 +2730,16 @@ class Sync {
         if (p.food.render) p.food.render();
       }
 
-      // Attack styles
+      // Attack styles — attackStyles is { melee?, ranged?, magic? } of AttackStyle
       if (msg.attackStyles && p.attackStyles) {
         for (const a of msg.attackStyles) {
-          if (a.set < p.attackStyles.length) p.attackStyles[a.set] = a.style;
+          if (!a.attackType) continue;
+          if (a.styleId) {
+            const style = game.attackStyles.getObjectByID(a.styleId);
+            if (style) p.attackStyles[a.attackType] = style;
+          } else {
+            delete p.attackStyles[a.attackType];
+          }
         }
         if (p.render) p.render();
       }
@@ -3453,19 +3465,22 @@ class Sync {
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const relics = [];
-      for (const set of game.ancientRelics.allObjects) {
-        if (set.foundRelics) {
-          for (const [relic, count] of set.foundRelics) {
-            relics.push({ setId: set.id, relicId: relic.id, count });
+      // AncientRelicSet objects are stored per-skill: skill.ancientRelicSets (Map<Realm, AncientRelicSet>)
+      for (const skill of game.skills.allObjects) {
+        if (!skill.ancientRelicSets) continue;
+        for (const [realm, set] of skill.ancientRelicSets) {
+          if (set.foundRelics) {
+            for (const [relic, count] of set.foundRelics) {
+              relics.push({ skillId: skill.id, realmId: realm.id, relicId: relic.id, count });
+            }
           }
         }
       }
       this.transport.send({ t: Msg.ANCIENT_RELIC, relics });
     };
-    for (const set of game.ancientRelics.allObjects) {
-      if (typeof set.addRelic === 'function') {
-        this.ctx.patch(AncientRelicSet, 'addRelic').after(() => send());
-      }
+    // Patch addRelic on the prototype (once, not per-instance)
+    if (typeof AncientRelicSet !== 'undefined' && typeof AncientRelicSet.prototype.addRelic === 'function') {
+      this.ctx.patch(AncientRelicSet, 'addRelic').after(() => send());
     }
   }
 
@@ -3474,10 +3489,15 @@ class Sync {
     this._applyingRemote = true;
     try {
       for (const r of msg.relics) {
-        const set = game.ancientRelics.getObjectByID(r.setId);
+        // Find the AncientRelicSet by skill + realm
+        const skill = game.skills.getObjectByID(r.skillId);
+        if (!skill || !skill.ancientRelicSets) continue;
+        const realm = game.realms.getObjectByID(r.realmId);
+        if (!realm) continue;
+        const set = skill.ancientRelicSets.get(realm);
         if (!set || !set.foundRelics) continue;
-        // Find the relic by ID in the set's registry
-        const relic = set.relics?.getObjectByID(r.relicId);
+        // Find the relic by ID in the game's ancientRelics registry
+        const relic = game.ancientRelics.getObjectByID(r.relicId);
         if (relic) set.foundRelics.set(relic, r.count);
       }
     } catch (e) { logger.error('applyAncientRelic failed', e); }
@@ -3501,14 +3521,11 @@ class Sync {
       }
       this.transport.send({ t: Msg.SKILL_TREE, trees });
     };
-    for (const skill of game.skills.allObjects) {
-      if (skill.skillTrees) {
-        for (const tree of skill.skillTrees.allObjects) {
-          for (const m of ['unlockNode', 'addPoints']) {
-            if (typeof tree[m] === 'function') {
-              this.ctx.patch(SkillTree, m).after(() => send());
-            }
-          }
+    // Patch SkillTree prototype methods once (not per-tree in a loop)
+    if (typeof SkillTree !== 'undefined' && SkillTree.prototype) {
+      for (const m of ['unlockNode', 'addPoints']) {
+        if (typeof SkillTree.prototype[m] === 'function') {
+          this.ctx.patch(SkillTree, m).after(() => send());
         }
       }
     }
@@ -4070,7 +4087,8 @@ class Sync {
     try {
       if (msg.completed && tw.tasks && tw.tasks.completedTasks) {
         for (const tid of msg.completed) {
-          const task = tw.tasks.allObjects?.getObjectByID(tid);
+          // tw.tasks is a NamespaceRegistry<TownshipTask> with getObjectByID
+          const task = tw.tasks.getObjectByID(tid);
           if (task && !tw.tasks.completedTasks.has(task)) tw.tasks.completedTasks.add(task);
         }
       }
@@ -4805,9 +4823,12 @@ class Sync {
     if (typeof msg.count !== 'number' || !game.combat || !game.combat.player) return;
     this._applyingRemote = true;
     try {
+      // numEquipSets is a getter computed from shop modifiers, not a
+      // settable property. Call updateEquipmentSets() to recompute from
+      // the (already synced) shop upgrade count.
       const current = game.combat.player.numEquipSets || 0;
-      if (msg.count > current) {
-        game.combat.player.numEquipSets = msg.count;
+      if (msg.count > current && typeof game.combat.player.updateEquipmentSets === 'function') {
+        try { game.combat.player.updateEquipmentSets(); } catch { /* skip */ }
       }
     } catch (e) { logger.error('applyEquipSetCount failed', e); }
     finally { this._applyingRemote = false; }
@@ -4850,15 +4871,19 @@ class Sync {
     try {
       const s = game.settings;
       const m = msg.settings;
-      if (typeof m.continueIfBankFull === 'boolean') s.continueIfBankFull = m.continueIfBankFull;
-      if (typeof m.continueThievingOnStun === 'boolean') s.continueThievingOnStun = m.continueThievingOnStun;
-      if (typeof m.autoRestartDungeon === 'boolean') s.autoRestartDungeon = m.autoRestartDungeon;
-      if (typeof m.enableAutoSlayer === 'boolean') s.enableAutoSlayer = m.enableAutoSlayer;
-      if (typeof m.enableAutoEquipFood === 'boolean') s.enableAutoEquipFood = m.enableAutoEquipFood;
-      if (typeof m.enableAutoSwapFood === 'boolean') s.enableAutoSwapFood = m.enableAutoSwapFood;
-      if (typeof m.enablePerfectCooking === 'boolean') s.enablePerfectCooking = m.enablePerfectCooking;
-      if (typeof m.enablePermaCorruption === 'boolean') s.enablePermaCorruption = m.enablePermaCorruption;
-      if (typeof m.enableOfflineCombat === 'boolean') s.enableOfflineCombat = m.enableOfflineCombat;
+      // Settings are getter-only properties on the Settings class.
+      // Use setTogglesChecked() to actually change them (it sets the
+      // internal backing field and updates the UI checkbox).
+      const boolKeys = [
+        'continueIfBankFull', 'continueThievingOnStun', 'autoRestartDungeon',
+        'enableAutoSlayer', 'enableAutoEquipFood', 'enableAutoSwapFood',
+        'enablePerfectCooking', 'enablePermaCorruption', 'enableOfflineCombat',
+      ];
+      for (const key of boolKeys) {
+        if (typeof m[key] === 'boolean') {
+          try { s.setTogglesChecked(key, m[key]); } catch { /* skip */ }
+        }
+      }
     } catch (e) { logger.error('applyGameSettings failed', e); }
     finally { this._applyingRemote = false; }
   }
@@ -5643,10 +5668,14 @@ class Sync {
     if (game.ancientRelics) {
       const relics = [];
       try {
-        for (const set of game.ancientRelics.allObjects) {
-          if (set.foundRelics) {
-            for (const [relic, count] of set.foundRelics) {
-              relics.push({ setId: set.id, relicId: relic.id, count });
+        // AncientRelicSet objects are stored per-skill: skill.ancientRelicSets (Map<Realm, AncientRelicSet>)
+        for (const skill of game.skills.allObjects) {
+          if (!skill.ancientRelicSets) continue;
+          for (const [realm, set] of skill.ancientRelicSets) {
+            if (set.foundRelics) {
+              for (const [relic, count] of set.foundRelics) {
+                relics.push({ skillId: skill.id, realmId: realm.id, relicId: relic.id, count });
+              }
             }
           }
         }
@@ -6403,15 +6432,17 @@ class Sync {
       if (msg.settings && game.settings) {
         try {
           const s = game.settings;
-          if (typeof msg.settings.continueIfBankFull === 'boolean') s.continueIfBankFull = msg.settings.continueIfBankFull;
-          if (typeof msg.settings.continueThievingOnStun === 'boolean') s.continueThievingOnStun = msg.settings.continueThievingOnStun;
-          if (typeof msg.settings.autoRestartDungeon === 'boolean') s.autoRestartDungeon = msg.settings.autoRestartDungeon;
-          if (typeof msg.settings.enableAutoSlayer === 'boolean') s.enableAutoSlayer = msg.settings.enableAutoSlayer;
-          if (typeof msg.settings.enableAutoEquipFood === 'boolean') s.enableAutoEquipFood = msg.settings.enableAutoEquipFood;
-          if (typeof msg.settings.enableAutoSwapFood === 'boolean') s.enableAutoSwapFood = msg.settings.enableAutoSwapFood;
-          if (typeof msg.settings.enablePerfectCooking === 'boolean') s.enablePerfectCooking = msg.settings.enablePerfectCooking;
-          if (typeof msg.settings.enablePermaCorruption === 'boolean') s.enablePermaCorruption = msg.settings.enablePermaCorruption;
-          if (typeof msg.settings.enableOfflineCombat === 'boolean') s.enableOfflineCombat = msg.settings.enableOfflineCombat;
+          // Settings are getter-only; use setTogglesChecked to change them.
+          const boolKeys = [
+            'continueIfBankFull', 'continueThievingOnStun', 'autoRestartDungeon',
+            'enableAutoSlayer', 'enableAutoEquipFood', 'enableAutoSwapFood',
+            'enablePerfectCooking', 'enablePermaCorruption', 'enableOfflineCombat',
+          ];
+          for (const key of boolKeys) {
+            if (typeof msg.settings[key] === 'boolean') {
+              try { s.setTogglesChecked(key, msg.settings[key]); } catch { /* skip */ }
+            }
+          }
         } catch { /* noop */ }
       }
       // Refresh completion log after all state applied
