@@ -46,3 +46,12 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
 - All DOM/CSS class names prefixed `rmp-`.
 - Logger via `src/util/logger.mjs` (tagged `[realMP]`).
 - Wire message types centralised in `src/net/protocol.mjs` (`Msg`).
+
+## Git revert workflow
+- **Commit after every successful change** — each commit is a known-good revert point.
+- If a change breaks something, use `git log --oneline` to find the last working commit.
+- Revert a specific commit: `git revert <hash>` (creates a new commit undoing the change).
+- Hard reset to a known-good state: `git reset --hard <hash>` (discards all changes after that point).
+- Always push after committing: `git push origin main`.
+- Commit messages should describe WHAT system was changed (e.g. "Fix equipment sync rendering").
+- Never force-push unless explicitly asked.
