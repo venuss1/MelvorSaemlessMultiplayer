@@ -742,6 +742,32 @@ class Sync {
       sync.transport.send({ t: Msg.BANK, itemId: item.id, qty });
     };
 
+    // Make Bank.render crash-proof — if updateSearchArray encounters an
+    // undefined/corrupted item, skip it instead of crashing the whole game.
+    if (typeof Bank.prototype.updateSearchArray === 'function') {
+      const origUpdateSearch = Bank.prototype.updateSearchArray;
+      Bank.prototype.updateSearchArray = function () {
+        try {
+          // Clean up any corrupted entries (undefined keys) before rendering
+          if (this.items && this.items.forEach) {
+            const toDelete = [];
+            this.items.forEach((bi, key) => {
+              if (!key || !key.name) toDelete.push(key);
+            });
+            for (const k of toDelete) {
+              try { this.items.delete(k); } catch { /* noop */ }
+            }
+            if (toDelete.length > 0) {
+              logger.warn(`[BANK] Cleaned up ${toDelete.length} corrupted bank entries`);
+            }
+          }
+          return origUpdateSearch.call(this);
+        } catch (e) {
+          logger.warn(`[BANK] updateSearchArray threw: ${e.message}`);
+        }
+      };
+    }
+
     // Adding items
     this.ctx.patch(Bank, 'addItem').after(function (_ret, item) {
       sendBankUpdate.call(this, item);
@@ -773,7 +799,7 @@ class Sync {
 
   _applyBank(msg) {
     const item = this._itemById(msg.itemId);
-    if (!item) { logger.warn('bank apply: item not found', msg.itemId); return; }
+    if (!item || !item.name) { logger.warn('bank apply: item not found or invalid', msg.itemId); return; }
     const bank = game.bank;
     const current = bank.getQty(item);
     const delta = msg.qty - current;
@@ -781,8 +807,11 @@ class Sync {
     logger.info('Bank sync apply:', msg.itemId, 'current:', current, 'target:', msg.qty, 'delta:', delta);
     this._applyingRemote = true;
     try {
-      if (delta > 0) bank.addItem(item, delta, false, false, true, false);
-      else bank.removeItemQuantity(item, -delta, false);
+      if (delta > 0) {
+        try { bank.addItem(item, delta, false, false, true, false); } catch (e) { logger.warn('bank addItem failed', msg.itemId, e); }
+      } else {
+        try { bank.removeItemQuantity(item, -delta, false); } catch (e) { logger.warn('bank removeItem failed', msg.itemId, e); }
+      }
       this._queueRender('bank');
     } catch (e) { logger.warn('bank apply failed', msg.itemId, e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -805,9 +834,12 @@ class Sync {
     if (!c) return;
     this._applyingRemote = true;
     try {
-      // Use set() which fires the amountChanged event and queues renders.
-      c.set(msg.qty);
-      // Just queue a currency render — set() already handles the event.
+      // Use max to avoid resetting currencies to 0 from stale messages.
+      // In a shared save, both players should have at least as much as
+      // the other reports. If one spent some, the other's higher amount
+      // takes precedence (they haven't spent it yet).
+      const newAmt = Math.max(c._amount || 0, msg.qty || 0);
+      c.set(newAmt);
       this._queueRender('currency');
     } catch (e) { logger.error('applyCurrency failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -1691,19 +1723,23 @@ class Sync {
             }
           }
         } else {
-          // Just update state directly for other state changes
+          // Just update state directly for other state changes (harvest,
+          // destroy, clear, etc.)
+          const oldState = plot.state;
           if (typeof p.state === 'number') plot.state = p.state;
           if (p.plantedRecipeId !== undefined) {
             // plantedRecipe is a farming recipe (seed), looked up via farming.actions.
             // Seeds are also items, so fall back to items if the actions registry misses.
             let plantedRecipe = null;
-            if (game.farming.actions) {
-              plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+            if (p.plantedRecipeId) {
+              if (game.farming.actions) {
+                plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+              }
+              if (!plantedRecipe && game.items) {
+                plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
+              }
             }
-            if (!plantedRecipe && game.items) {
-              plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
-            }
-            plot.plantedRecipe = p.plantedRecipeId ? plantedRecipe : undefined;
+            plot.plantedRecipe = plantedRecipe || undefined;
           }
           if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
           // If the plot is no longer growing (state 3 or 4), remove the timer
@@ -1719,6 +1755,16 @@ class Sync {
               farming.growthTimerMap.delete(plot);
             }
           }
+          // Queue render updates so the UI reflects the state change
+          // (harvest, destroy, clear dead, etc.) in real-time.
+          if (farming.renderQueue) {
+            if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
+            if (farming.renderQueue.growthTime) {
+              const timer = farming.growthTimerMap.get(plot);
+              if (timer) farming.renderQueue.growthTime.add(timer);
+            }
+          }
+          logger.info(`[FARM] State update: ${p.id} ${oldState}→${p.state}`);
         }
 
         // Handle compost: sync compost item and level
@@ -3296,7 +3342,18 @@ class Sync {
       lastSend = Date.now();
       this._sendTownship();
     };
-    for (const m of ['addBuildings', 'reduceBuildingEfficiency', 'changeDifficulty', 'repairAllBuildings']) {
+    // Building purchases go through TownshipBiome.addBuildings/removeBuildings,
+    // NOT Township.prototype. Patch the biome class directly.
+    if (typeof TownshipBiome !== 'undefined') {
+      for (const m of ['addBuildings', 'removeBuildings', 'setBuildingEfficiency', 'reduceBuildingEfficiency']) {
+        if (typeof TownshipBiome.prototype[m] === 'function') {
+          this.ctx.patch(TownshipBiome, m).after(() => sendImmediate());
+        }
+      }
+    }
+    // Township-level methods
+    for (const m of ['changeDifficulty', 'repairAllBuildings', 'repairAllBuildingsInCurrentBiome',
+                     'repairAllBuildingsFromStorageType', 'selectWorship', 'convertResources']) {
       if (typeof Township.prototype[m] === 'function') this.ctx.patch(Township, m).after(() => sendImmediate());
     }
     if (tw.tasks && typeof tw.tasks.completeTask === 'function') {
@@ -4072,13 +4129,26 @@ class Sync {
   _applyLevelCaps(msg) {
     this._applyingRemote = true;
     try {
-      if (typeof msg.levelCapIncreasesBought === 'number') game._levelCapIncreasesBought = msg.levelCapIncreasesBought;
-      if (typeof msg.abyssalLevelCapIncreasesBought === 'number') game._abyssalLevelCapIncreasesBought = msg.abyssalLevelCapIncreasesBought;
+      // Only increase, never decrease — preventing wiping abyssal unlocks.
+      if (typeof msg.levelCapIncreasesBought === 'number') {
+        game._levelCapIncreasesBought = Math.max(game._levelCapIncreasesBought || 0, msg.levelCapIncreasesBought);
+      }
+      if (typeof msg.abyssalLevelCapIncreasesBought === 'number') {
+        game._abyssalLevelCapIncreasesBought = Math.max(game._abyssalLevelCapIncreasesBought || 0, msg.abyssalLevelCapIncreasesBought);
+      }
+      // Only update activeLevelCapIncreases if the remote has MORE than local.
+      // This prevents wiping abyssal skill unlocks from an empty/stale snapshot.
       if (msg.active && game.skillLevelCapIncreases) {
-        game.activeLevelCapIncreases = msg.active.map(a => game.skillLevelCapIncreases.getObjectByID(a.id)).filter(Boolean);
+        const remoteCaps = msg.active.map(a => game.skillLevelCapIncreases.getObjectByID(a.id)).filter(Boolean);
+        if (remoteCaps.length >= (game.activeLevelCapIncreases || []).length) {
+          game.activeLevelCapIncreases = remoteCaps;
+        }
       }
       if (msg.beingSelected && game.skillLevelCapIncreases) {
-        game.levelCapIncreasesBeingSelected = msg.beingSelected.map(id => game.skillLevelCapIncreases.getObjectByID(id)).filter(Boolean);
+        const remoteSelected = msg.beingSelected.map(id => game.skillLevelCapIncreases.getObjectByID(id)).filter(Boolean);
+        if (remoteSelected.length >= (game.levelCapIncreasesBeingSelected || []).length) {
+          game.levelCapIncreasesBeingSelected = remoteSelected;
+        }
       }
       // Recompute skill level caps so the effect applies.
       if (typeof game.validateRandomLevelCapIncreases === 'function') {
@@ -4858,29 +4928,37 @@ class Sync {
       for (const s of (msg.skills || [])) {
         const skill = this._skillById(s.id);
         if (!skill) continue;
+        // Use max to avoid losing locally-earned XP from a stale snapshot.
         if (typeof s.xp === 'number') {
-          skill._xp = s.xp;
+          skill._xp = Math.max(skill._xp || 0, s.xp);
           const cap = skill.currentLevelCap || skill.maxLevelCap || Infinity;
-          skill._level = Math.min(cap, exp.xpToLevel(s.xp));
+          skill._level = Math.min(cap, exp.xpToLevel(skill._xp));
         }
         if (typeof s.abyssalXp === 'number' && skill.hasAbyssalLevels) {
-          skill._abyssalXP = s.abyssalXp;
+          skill._abyssalXP = Math.max(skill._abyssalXP || 0, s.abyssalXp);
           const cap = skill.currentAbyssalLevelCap || skill.maxAbyssalLevelCap || Infinity;
-          skill._abyssalLevel = Math.min(cap, abyssalExp.xpToLevel(s.abyssalXp));
+          skill._abyssalLevel = Math.min(cap, abyssalExp.xpToLevel(skill._abyssalXP));
         }
       }
       for (const b of (msg.bank || [])) {
         const item = this._itemById(b.id);
-        if (!item) continue;
+        if (!item || !item.name) continue; // skip invalid/dummy items
         const cur = game.bank.getQty(item);
         const delta = b.qty - cur;
-        if (delta > 0) game.bank.addItem(item, delta, false, false, true, false);
-        else if (delta < 0) game.bank.removeItemQuantity(item, -delta, false);
+        // Only add items, never remove from the receiver's bank during
+        // snapshot apply — the receiver may have items the sender doesn't
+        // know about (earned after the snapshot was built).
+        if (delta > 0) {
+          try { game.bank.addItem(item, delta, false, false, true, false); } catch (e) { /* skip */ }
+        }
       }
       for (const c of (msg.currencies || [])) {
         const cur = this._currencyById(c.id);
         if (!cur) continue;
-        cur._amount = c.qty;
+        // Use max to avoid resetting currencies to 0 if the snapshot has
+        // stale data or the receiver has earned more since the snapshot.
+        const newAmt = Math.max(cur._amount || 0, c.qty || 0);
+        cur._amount = newAmt;
         if (cur.renderAmount) cur.renderAmount();
         if (cur.onAmountChange) cur.onAmountChange();
       }
