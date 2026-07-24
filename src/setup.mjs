@@ -3757,9 +3757,10 @@ class Sync {
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const rows = [];
+      // CorruptionEffectTableRow has no .id — send only the effect id.
       if (co.corruptionEffects && co.corruptionEffects.unlockedRows) {
         for (const row of co.corruptionEffects.unlockedRows) {
-          rows.push({ id: row.id, effectId: row.effect ? row.effect.id : null });
+          rows.push({ effectId: row.effect ? row.effect.id : null });
         }
       }
       this.transport.send({ t: Msg.CORRUPTION, rows });
@@ -3774,14 +3775,19 @@ class Sync {
     if (!co || !co.corruptionEffects || !msg.rows) return;
     this._applyingRemote = true;
     try {
-      // Don't replace the array — just update unlocked state
+      // CorruptionEffectTableRow has no .id — match by effect.id.
+      // Unlock rows that are unlocked on the remote side.
+      const table = co.corruptionEffects;
       for (const r of msg.rows) {
-        // Find matching row in local effectTable
-        if (co.corruptionEffects.unlockedRows) {
-          const existing = co.corruptionEffects.unlockedRows.find(row => row.id === r.id);
-          if (existing && r.effectId) {
-            const effect = game.combatEffects?.getObjectByID(r.effectId);
-            if (effect) existing.effect = effect;
+        if (!r.effectId) continue;
+        const effect = game.combatEffects && game.combatEffects.getObjectByID(r.effectId);
+        if (!effect) continue;
+        // Check if already unlocked
+        const alreadyUnlocked = table.unlockedRows && table.unlockedRows.some(row => row.effect && row.effect.id === r.effectId);
+        if (!alreadyUnlocked && table.allRows) {
+          const row = table.allRows.find(row => row.effect && row.effect.id === r.effectId);
+          if (row && !row.isUnlocked && table.unlockRow) {
+            try { table.unlockRow(row); } catch { /* skip */ }
           }
         }
       }
@@ -5529,9 +5535,11 @@ class Sync {
       const co = game.corruption;
       const corruptionData = { rows: [] };
       try {
+        // CorruptionEffectTableRow has no .id property — the id is on
+        // row.effect (a CombatEffect extending NamespacedObject).
         if (co.corruptionEffects && co.corruptionEffects.unlockedRows) {
           for (const row of co.corruptionEffects.unlockedRows) {
-            corruptionData.rows.push({ id: row.id, effectId: row.effect ? row.effect.id : null });
+            corruptionData.rows.push({ effectId: row.effect ? row.effect.id : null });
           }
         }
       } catch { /* noop */ }
