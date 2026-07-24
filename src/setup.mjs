@@ -1765,40 +1765,69 @@ class Sync {
             }
           }
         } else {
-          // Just update state directly for other state changes (harvest,
-          // destroy, clear, etc.)
+          // Handle harvest, destroy, clear dead, etc.
           const oldState = plot.state;
-          if (typeof p.state === 'number') plot.state = p.state;
-          if (p.plantedRecipeId !== undefined) {
-            // plantedRecipe is a farming recipe (seed), looked up via farming.actions.
-            // Seeds are also items, so fall back to items if the actions registry misses.
-            let plantedRecipe = null;
-            if (p.plantedRecipeId) {
-              if (game.farming.actions) {
-                plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
-              }
-              if (!plantedRecipe && game.items) {
-                plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
-              }
+
+          // If the plot was Grown (3) and the remote says it's now Empty (1),
+          // the other player harvested it. Try to harvest locally too so
+          // we get the products in our bank.
+          if (oldState === 3 && p.state === 1 && plot.plantedRecipe && farming.harvestPlot) {
+            try {
+              farming.harvestPlot(plot);
+              logger.info(`[FARM] Synced harvest: ${p.id}`);
+            } catch (e) {
+              logger.warn(`[FARM] Synced harvest failed, setting state directly: ${e.message}`);
+              plot.state = 1;
+              plot.plantedRecipe = undefined;
+              plot.growthTime = 0;
             }
-            plot.plantedRecipe = plantedRecipe || undefined;
           }
-          if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
-          // If the plot is no longer growing (state 3 or 4), remove the timer
+          // If the plot was Dead (4) and the remote says it's now Empty (1),
+          // the other player cleared the dead plot.
+          else if (oldState === 4 && p.state === 1) {
+            plot.state = 1;
+            plot.plantedRecipe = undefined;
+            plot.growthTime = 0;
+            logger.info(`[FARM] Synced clear dead: ${p.id}`);
+          }
+          // If the plot was Growing (2) or Grown (3) and the remote says
+          // it's now Empty (1), the other player destroyed/cleared it.
+          else if ((oldState === 2 || oldState === 3) && p.state === 1) {
+            plot.state = 1;
+            plot.plantedRecipe = undefined;
+            plot.growthTime = 0;
+            logger.info(`[FARM] Synced destroy/clear: ${p.id}`);
+          }
+          // Otherwise just update the state directly
+          else {
+            if (typeof p.state === 'number') plot.state = p.state;
+            if (p.plantedRecipeId !== undefined) {
+              let plantedRecipe = null;
+              if (p.plantedRecipeId) {
+                if (game.farming.actions) {
+                  plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+                }
+                if (!plantedRecipe && game.items) {
+                  plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
+                }
+              }
+              plot.plantedRecipe = plantedRecipe || undefined;
+            }
+            if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
+          }
+
+          // Remove growth timer if the plot is no longer growing
           if (p.state !== 2 && farming.growthTimerMap) {
             const timer = farming.growthTimerMap.get(plot);
             if (timer) {
               try { timer.stop(); } catch { /* noop */ }
-              // growthTimerMap is the authoritative collection; also try the
-              // plural growthTimers set if it exists.
               if (farming.growthTimers && farming.growthTimers.delete) {
                 try { farming.growthTimers.delete(timer); } catch { /* noop */ }
               }
               farming.growthTimerMap.delete(plot);
             }
           }
-          // Queue render updates so the UI reflects the state change
-          // (harvest, destroy, clear dead, etc.) in real-time.
+          // Queue render updates
           if (farming.renderQueue) {
             if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
             if (farming.renderQueue.growthTime) {
