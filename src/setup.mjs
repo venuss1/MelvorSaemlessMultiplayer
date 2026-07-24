@@ -402,7 +402,6 @@ class Sync {
     this.actionLock = actionLock;
     this._applyingRemote = false;
     this._combatOwner = null;  // 'me' = I'm attacking, 'peer' = peer is attacking, null = no one
-    this._combatWasPaused = false;  // remember pause state before we forced pause
     this._watcher = null;
     this._lastActiveSkillId = null;
     this._saveTimer = null;
@@ -412,7 +411,6 @@ class Sync {
     this._onRemoteActionCb = null;
     this._onLocalActionCb = null;
     this._coopBoost = false;
-    this._coopBoostRecipeId = null;
   }
 
   onRemoteAction(cb) { this._onRemoteActionCb = cb; }
@@ -464,7 +462,7 @@ class Sync {
       ['EquipSetCount', () => this._patchEquipSetCount()],
       ['GameSettings', () => this._patchGameSettings()],
     ];
-    let ok = 0, fail = 0, skip = 0;
+    let ok = 0, fail = 0;
     for (const [name, fn] of patches) {
       try {
         fn();
@@ -3092,11 +3090,11 @@ class Sync {
     if (typeof CombatManager.prototype.dropEnemyCurrency === 'function') {
       const origDropCurrency = CombatManager.prototype.dropEnemyCurrency;
       CombatManager.prototype.dropEnemyCurrency = function (monster) {
-        const gpBefore = game.gp ? game.gp : 0;
+        const gpBefore = game.gp ? game.gp.amount : 0;
         try { origDropCurrency.call(this, monster); } catch (e) { /* skip */ }
         // If we're the attacker, sync currency gained
         if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
-          const gpAfter = game.gp ? game.gp : 0;
+          const gpAfter = game.gp ? game.gp.amount : 0;
           const gpGained = gpAfter - gpBefore;
           if (gpGained > 0) {
             sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: 'melvorD:GP', quantity: gpGained });
@@ -3425,19 +3423,14 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Received loot: ${msg.itemId} x${msg.quantity}`);
     try {
-      // Handle GP (gold coins)
+      // Handle GP (gold coins) — game.gp is a Currency object, use addGP()
       if (msg.itemId === 'melvorD:GP' && game.gp !== undefined) {
-        game.gp += msg.quantity;
         if (game.addGP) game.addGP(msg.quantity);
         return;
       }
-      // Handle other currency types
+      // Handle Slayer Coins — game.slayerCoins is a Currency object, use addSlayerCoins()
       if (msg.itemId === 'melvorD:SlayerCoins' && game.slayerCoins !== undefined) {
-        game.slayerCoins += msg.quantity;
-        return;
-      }
-      if (msg.itemId === 'melvorD:AbyssalPoints' && game.abyssalPoints !== undefined) {
-        game.abyssalPoints += msg.quantity;
+        if (game.addSlayerCoins) game.addSlayerCoins(msg.quantity);
         return;
       }
       // Handle items — add to combat loot so player can collect
@@ -4902,10 +4895,8 @@ class Sync {
       if (sync.actionLock.isRecipeClaimed(this.id, recipeId)) {
         // Both players on same resource — mark for 2x speed.
         sync._coopBoost = true;
-        sync._coopBoostRecipeId = recipeId;
       } else {
         sync._coopBoost = false;
-        sync._coopBoostRecipeId = null;
       }
     });
 
