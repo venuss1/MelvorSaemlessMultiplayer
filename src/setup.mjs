@@ -1991,35 +1991,15 @@ class Sync {
             // Build the obstacle — obstacles live in game.agility.actions
             const ob = (ag.actions && ag.actions.getObjectByID(obId)) || game.items.getObjectByID(obId);
             if (!ob) { logger.warn(`[AGILITY] Obstacle not found: ${obId}`); continue; }
-            // Remove existing obstacle at this tier first
-            if (currentOb && typeof ag.destroyObstacle === 'function') {
-              try { ag.destroyObstacle(course, tierNum); }
-              catch (e) { logger.warn(`[AGILITY] destroyObstacle failed: ${e.message}`); }
-            }
-            // Try to build (this consumes costs and updates modifiers)
-            let built = false;
-            if (typeof ag.buildObstacle === 'function') {
-              try {
-                ag.buildObstacle(course, ob, tierNum);
-                built = true;
-                logger.info(`[AGILITY] Built obstacle ${obId} at tier ${tierNum}`);
-              } catch (e) {
-                logger.warn(`[AGILITY] buildObstacle failed: ${e.message}`);
-              }
-            }
-            if (!built) {
-              // Fallback: direct set (may not update modifiers properly)
-              course.builtObstacles.set(tierNum, ob);
-              logger.info(`[AGILITY] Direct-set obstacle ${obId} at tier ${tierNum}`);
-            }
+            // Direct set the obstacle — don't call buildObstacle() because:
+            // 1. buildObstacle(obstacle) takes only 1 param (not course+tier)
+            // 2. It would consume resources (spectator shouldn't pay again)
+            // 3. We want to replicate exact state, not trigger build side-effects
+            course.builtObstacles.set(tierNum, ob);
+            logger.info(`[AGILITY] Set obstacle ${obId} at tier ${tierNum}`);
           } else {
             // Remove obstacle at this tier
-            if (currentOb && typeof ag.destroyObstacle === 'function') {
-              try { ag.destroyObstacle(course, tierNum); }
-              catch (e) { /* skip */ }
-            } else {
-              course.builtObstacles.delete(tierNum);
-            }
+            course.builtObstacles.delete(tierNum);
           }
         }
 
@@ -2033,23 +2013,10 @@ class Sync {
           if (piId) {
             const pi = (ag.pillars && ag.pillars.getObjectByID(piId)) || game.items.getObjectByID(piId);
             if (!pi) { logger.warn(`[AGILITY] Pillar not found: ${piId}`); continue; }
-            if (currentPi && typeof ag.destroyPillar === 'function') {
-              try { ag.destroyPillar(course, tierNum); }
-              catch (e) { /* skip */ }
-            }
-            let built = false;
-            if (typeof ag.buildPillar === 'function') {
-              try { ag.buildPillar(course, pi, tierNum); built = true; }
-              catch (e) { logger.warn(`[AGILITY] buildPillar failed: ${e.message}`); }
-            }
-            if (!built) course.builtPillars.set(tierNum, pi);
+            // Direct set — same reasoning as obstacles above
+            course.builtPillars.set(tierNum, pi);
           } else {
-            if (currentPi && typeof ag.destroyPillar === 'function') {
-              try { ag.destroyPillar(course, tierNum); }
-              catch (e) { /* skip */ }
-            } else {
-              course.builtPillars.delete(tierNum);
-            }
+            course.builtPillars.delete(tierNum);
           }
         }
       }
@@ -2998,10 +2965,10 @@ class Sync {
       let playerStats = null;
       try {
         playerStats = {
-          maxHit: player.maxHit || 0,
-          minHit: player.minHit || 0,
-          attackSpeed: player.attackSpeed || 3000, // ms per attack
-          accuracyRating: player.accuracyRating || 0,
+          maxHit: (player.stats && player.stats.maxHit) || 0,
+          minHit: (player.stats && player.stats.minHit) || 0,
+          attackSpeed: (player.equipmentStats && player.equipmentStats.attackSpeed) || (player.stats && player.stats.attackInterval) || 3000,
+          accuracyRating: (player.stats && player.stats.accuracy) || 0,
           attackType: player.attackType || 'melee',
           selectedAttackStyle: player.attackStyle ? player.attackStyle.id : null,
         };
@@ -3598,8 +3565,8 @@ class Sync {
       }
     }
     // Township-level methods
-    for (const m of ['changeDifficulty', 'repairAllBuildings', 'repairAllBuildingsInCurrentBiome',
-                     'repairAllBuildingsFromStorageType', 'selectWorship', 'convertResources']) {
+    for (const m of ['repairAllBuildings', 'repairAllBuildingsInCurrentBiome',
+                     'repairAllBuildingsFromStorageType', 'selectWorship', 'updateConvertType']) {
       if (typeof Township.prototype[m] === 'function') this.ctx.patch(Township, m).after(() => sendImmediate());
     }
     if (tw.tasks && typeof tw.tasks.completeTask === 'function') {
@@ -3734,7 +3701,7 @@ class Sync {
       this.transport.send({ t: Msg.CLUE_HUNT, steps, currentStep: ch.currentStep });
     };
     // Patch any method that advances clue progress
-    for (const m of ['checkClueProgress', 'advanceStep', 'startClueHunt', 'giveReward']) {
+    for (const m of ['startClueHunt', 'giveReward', 'updateClue1Progress', 'updateClue2Progress', 'updateClue3Progress', 'updateClue4Progress', 'updateClue5Progress', 'updateClue6Progress']) {
       if (typeof ClueHunt.prototype[m] === 'function') {
         this.ctx.patch(ClueHunt, m).after(() => send());
       }
@@ -3862,7 +3829,7 @@ class Sync {
         randomModifiersBeingSelected: (r.randomModifiersBeingSelected || []).map(m => ({ id: m.id, value: m.value })),
       });
     };
-    for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'endRaid', 'nextWave', 'equipItem', 'equipFood', 'selectPassive', 'pause', 'unpause']) {
+    for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'continueRaid', 'equipItemCallback', 'addFoodCallback', 'selectRandomModifier', 'rerollPassiveCallback', 'pause', 'unpause']) {
       if (typeof RaidManager.prototype[m] === 'function') {
         this.ctx.patch(RaidManager, m).after(() => send());
       }
