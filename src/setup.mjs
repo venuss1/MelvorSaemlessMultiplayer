@@ -3983,7 +3983,8 @@ class Sync {
       this.transport.send({
         t: Msg.FISHING_CONTEST,
         isActive: fc.isActive,
-        activeFishId: fc.activeFish ? fc.activeFish.id : null,
+        // FishingContestFish has no .id — send the underlying item id.
+        activeFishId: fc.activeFish ? (fc.activeFish.fish ? fc.activeFish.fish.id : null) : null,
         actionsRemaining: fc.actionsRemaining,
         currentDifficulty: fc.currentDifficulty,
         completionTracker: fc.completionTracker ? [...fc.completionTracker] : [],
@@ -3992,7 +3993,7 @@ class Sync {
         leaderboard,
       });
     };
-    for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'addResult', 'finalizeFishingContest', 'generateNewFishingContestLeaderboard', 'updateBestFishResultForPlayer', 'updateBestFishResultForContestant']) {
+    for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'onFishingAction', 'peformPlayerFishingContestAction', 'finalizeFishingContest', 'generateNewFishingContestLeaderboard', 'updateBestFishResultForPlayer', 'updateBestFishResultForContestant']) {
       if (typeof FishingContest.prototype[m] === 'function') {
         this.ctx.patch(FishingContest, m).after(() => send());
       }
@@ -4005,7 +4006,11 @@ class Sync {
     this._applyingRemote = true;
     try {
       fc.isActive = !!msg.isActive;
-      if (msg.activeFishId) fc.activeFish = game.items.getObjectByID(msg.activeFishId);
+      // activeFish is a FishingContestFish (not an Item). Find the matching
+      // one in fc.availableFish by the underlying item id.
+      if (msg.activeFishId && fc.availableFish) {
+        fc.activeFish = fc.availableFish.find(f => f.fish && f.fish.id === msg.activeFishId);
+      }
       if (typeof msg.actionsRemaining === 'number') fc.actionsRemaining = msg.actionsRemaining;
       if (typeof msg.currentDifficulty === 'number') fc.currentDifficulty = msg.currentDifficulty;
       if (msg.completionTracker) fc.completionTracker = [...msg.completionTracker];
@@ -5586,7 +5591,10 @@ class Sync {
       const fishData = {};
       try {
         fishData.isActive = !!fc.isActive;
-        fishData.activeFishId = fc.activeFish ? fc.activeFish.id : null;
+        // FishingContestFish has no .id — it has { fish, level, minLength,
+        // maxLength }. Send the underlying item id so the receiver can find
+        // the matching FishingContestFish in fc.availableFish.
+        fishData.activeFishId = fc.activeFish ? (fc.activeFish.fish ? fc.activeFish.fish.id : null) : null;
         if (typeof fc.actionsRemaining === 'number') fishData.actionsRemaining = fc.actionsRemaining;
         if (typeof fc.currentDifficulty === 'number') fishData.currentDifficulty = fc.currentDifficulty;
         if (fc.completionTracker) fishData.completionTracker = [...fc.completionTracker];
