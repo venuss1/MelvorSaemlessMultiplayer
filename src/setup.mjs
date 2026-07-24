@@ -1263,41 +1263,50 @@ class Sync {
       sync._sendFarmingPlot(plot);
     };
 
-    // Patch unlockPlotOnClick — bypass level check so both players can unlock
-    // The original checks: if (!this.game.gp.canAfford(plot.gpCost) || this.level < plot.level) return;
-    // We use a before patch to temporarily boost the farming _level so the
-    // level check passes, then restore it in the after patch.
-    // Note: level is a getter that returns _level, so we must set _level.
+    // Patch unlockPlotOnClick — bypass level/abyssal/cost checks so both
+    // players can unlock plots. The newer Melvor version uses currencyCosts
+    // and itemCosts instead of gpCost, and may check abyssalLevel too.
+    // We use before/after patches: before boosts level/abyssal, after
+    // restores them and forces the unlock if the original failed.
     let savedFarmingLevel = null;
+    let savedAbyssalLevel = null;
     this.ctx.patch(Farming, 'unlockPlotOnClick').before(function (plot) {
       if (!plot) {
         logger.warn('[FARM] unlockPlotOnClick called with no plot');
         return;
       }
-      // Log everything about the plot for debugging
-      logger.info(`[FARM] unlockPlotOnClick BEFORE: plot=${plot.id}, state=${plot.state}, level=${plot.level}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${game.gp ? game.gp.amount : 'no-gp'}`);
-      if (plot.currencyCosts) logger.info(`[FARM] plot.currencyCosts: ${JSON.stringify(plot.currencyCosts.map(c => ({id: c.currency ? c.currency.id : c.id, qty: c.quantity})))}`);
-      if (plot.itemCosts) logger.info(`[FARM] plot.itemCosts: ${JSON.stringify(plot.itemCosts.map(c => ({id: c.item ? c.item.id : c.id, qty: c.quantity})))}`);
-      // Save current level and temporarily set it high enough to pass the check
+      logger.info(`[FARM] unlockPlotOnClick BEFORE: plot=${plot.id}, state=${plot.state}, level=${plot.level}, abyssalLevel=${plot.abyssalLevel}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${game.gp ? game.gp.amount : 'no-gp'}`);
+      // Save current levels and temporarily boost them
       savedFarmingLevel = this._level;
       this._level = Math.max(this._level, plot.level || 1, 120);
+      if (this._abyssalLevel !== undefined && plot.abyssalLevel) {
+        savedAbyssalLevel = this._abyssalLevel;
+        this._abyssalLevel = Math.max(this._abyssalLevel, plot.abyssalLevel, 120);
+      }
       logger.info(`[FARM] Temporarily set farming level from ${savedFarmingLevel} to ${this._level}`);
     });
     this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
       // Restore the original farming level
       if (savedFarmingLevel !== null) {
-        logger.info(`[FARM] Restoring farming level from ${this._level} to ${savedFarmingLevel}`);
         this._level = savedFarmingLevel;
         savedFarmingLevel = null;
+      }
+      if (savedAbyssalLevel !== null) {
+        this._abyssalLevel = savedAbyssalLevel;
+        savedAbyssalLevel = null;
       }
       if (plot) {
         logger.info(`[FARM] unlockPlotOnClick AFTER: plot=${plot.id}, state=${plot.state}, gp=${game.gp ? game.gp.amount : 'no-gp'}`);
       }
-      // Check if the unlock actually succeeded (plot.state changed to 1)
-      if (plot && plot.state === 1) {
+      // If the unlock failed (state still 0), force it without charging
+      if (plot && plot.state === 0) {
+        plot.state = 1; // Empty
+        if (this.showPlotsInCategory) {
+          try { this.showPlotsInCategory(plot.category); } catch (e) { /* skip */ }
+        }
+        logger.info(`[FARM] Force unlocked plot (original failed): ${plot.id}`);
+      } else if (plot && plot.state === 1) {
         logger.info(`[FARM] Unlocked plot SUCCESS: ${plot.id}`);
-      } else if (plot) {
-        logger.warn(`[FARM] Unlocked plot FAILED: ${plot.id}, state is ${plot.state}`);
       }
       sendPlot(plot);
     });
