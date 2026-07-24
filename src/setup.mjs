@@ -2033,6 +2033,8 @@ class Sync {
     // Send full combat state (monster, HP, paused, player stats) — used for periodic sync
     const sendCombatState = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
+      // Don't send state if we're spectating — the attacker sends state
+      if (sync._combatOwner === 'peer') return;
       const cm = game.combat;
       const enemy = cm.enemy;
       const player = cm.player;
@@ -2174,24 +2176,13 @@ class Sync {
       };
     }
 
-    // Patch CombatManager.tick — skip combat ticks when spectating (peer is attacking)
-    // This prevents double-hitting: only the attacker's game runs combat
-    if (typeof CombatManager.prototype.tick === 'function') {
-      this.ctx.patch(CombatManager, 'tick').before(function () {
-        if (sync._combatOwner === 'peer') {
-          // Skip this tick entirely — return false to cancel? No, before can't cancel.
-          // Instead, we'll set paused=true temporarily so the tick does nothing.
-          this._rmpWasPaused = this.paused;
-          if (!this.paused) this.paused = true;
-        }
-      });
-      this.ctx.patch(CombatManager, 'tick').after(function () {
-        if (sync._combatOwner === 'peer' && this._rmpWasPaused === false) {
-          this.paused = false;
-          this._rmpWasPaused = undefined;
-        }
-      });
-    }
+    // Note: We don't patch CombatManager.tick to pause spectator combat because
+    // setting paused=true breaks the attack bar animation and prevents stopping
+    // combat. Instead, we accept that the spectator's local game still runs
+    // combat ticks. The spectator's damage/heal patches skip sending events
+    // (guarded by _combatOwner === 'peer'), so their local damage doesn't
+    // affect the attacker. The attacker's damage events override the
+    // spectator's HP with absolute values.
 
     // Patch pause/unpause — sync combat pause state and release claim on stop
     for (const m of ['pause', 'stop', 'start']) {
@@ -2212,7 +2203,7 @@ class Sync {
 
     // Periodic state sync every 2 seconds (catches up any missed events)
     this._combatStateInterval = setInterval(() => {
-      if (sync.transport.isConnected && !sync._applyingRemote) {
+      if (sync.transport.isConnected && !sync._applyingRemote && sync._combatOwner !== 'peer') {
         sendCombatState();
       }
     }, 2000);
