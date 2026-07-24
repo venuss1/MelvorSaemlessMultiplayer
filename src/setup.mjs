@@ -2030,12 +2030,24 @@ class Sync {
       sync.transport.send({ t: Msg.COMBAT_EVENT, ...data });
     };
 
-    // Send full combat state (monster, HP, paused) — used for periodic sync
+    // Send full combat state (monster, HP, paused, player stats) — used for periodic sync
     const sendCombatState = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       const cm = game.combat;
       const enemy = cm.enemy;
       const player = cm.player;
+      // Gather player combat stats for realistic damage calculation
+      let playerStats = null;
+      try {
+        playerStats = {
+          maxHit: player.maxHit || 0,
+          minHit: player.minHit || 0,
+          attackSpeed: player.attackSpeed || 3000, // ms per attack
+          accuracyRating: player.accuracyRating || 0,
+          attackType: player.attackType || 'melee',
+          selectedAttackStyle: player.attackStyle ? player.attackStyle.id : null,
+        };
+      } catch (e) { /* skip */ }
       sync.transport.send({
         t: Msg.COMBAT_EVENT,
         kind: 'state',
@@ -2046,6 +2058,7 @@ class Sync {
         enemyMaxHp: enemy.stats ? enemy.stats.maxHitpoints : 0,
         playerHp: player.hitpoints,
         playerMaxHp: player.stats ? player.stats.maxHitpoints : 0,
+        playerStats,
       });
     };
 
