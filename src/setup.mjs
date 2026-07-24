@@ -1623,7 +1623,9 @@ class Sync {
                 const oldTimer = farming.growthTimerMap.get(plot);
                 if (oldTimer) {
                   try { oldTimer.stop(); } catch { /* noop */ }
-                  farming.growthTimers.delete(oldTimer);
+                  if (farming.growthTimers && farming.growthTimers.delete) {
+                    try { farming.growthTimers.delete(oldTimer); } catch { /* noop */ }
+                  }
                   farming.growthTimerMap.delete(plot);
                 }
                 // Create a new growth timer with the remaining time
@@ -1683,7 +1685,8 @@ class Sync {
           // Just update state directly for other state changes
           if (typeof p.state === 'number') plot.state = p.state;
           if (p.plantedRecipeId !== undefined) {
-            // Try actions registry first, then items
+            // plantedRecipe is a farming recipe (seed), looked up via farming.actions.
+            // Seeds are also items, so fall back to items if the actions registry misses.
             let plantedRecipe = null;
             if (game.farming.actions) {
               plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
@@ -1699,7 +1702,11 @@ class Sync {
             const timer = farming.growthTimerMap.get(plot);
             if (timer) {
               try { timer.stop(); } catch { /* noop */ }
-              farming.growthTimers.delete(timer);
+              // growthTimerMap is the authoritative collection; also try the
+              // plural growthTimers set if it exists.
+              if (farming.growthTimers && farming.growthTimers.delete) {
+                try { farming.growthTimers.delete(timer); } catch { /* noop */ }
+              }
               farming.growthTimerMap.delete(plot);
             }
           }
@@ -1945,11 +1952,35 @@ class Sync {
     const as = game.astrology;
     if (!as) return;
     const upgrades = [];
-    // AstrologyModifier instances have timesBought
+    // AstrologyModifier instances have timesBought. Sync all three modifier
+    // types (standard, unique, abyssal). The skill exposes aggregated arrays
+    // (*ModifierUpgrades); fall back to iterating recipe modifiers if absent.
+    const collect = (arr, type) => {
+      if (!arr) return;
+      for (const mod of arr) {
+        if (mod && mod.recipe && mod.recipe.id) {
+          upgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought, type });
+        }
+      }
+    };
     try {
-      if (as.standardModifierUpgrades) {
-        for (const mod of as.standardModifierUpgrades) {
-          if (mod && mod.recipe && mod.recipe.id) upgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought });
+      collect(as.standardModifierUpgrades, 'standard');
+      collect(as.uniqueModifierUpgrades, 'unique');
+      collect(as.abyssalModifierUpgrades, 'abyssal');
+      // Fallback: if the aggregated arrays are missing, read from recipe modifiers.
+      if (upgrades.length === 0 && as.actions) {
+        for (const recipe of as.actions.allObjects) {
+          for (const type of ['standardModifiers', 'uniqueModifiers', 'abyssalModifiers']) {
+            const mods = recipe[type];
+            if (!mods) continue;
+            const tName = type === 'standardModifiers' ? 'standard' : (type === 'uniqueModifiers' ? 'unique' : 'abyssal');
+            for (let i = 0; i < mods.length; i++) {
+              const m = mods[i];
+              if (m && typeof m.timesBought === 'number' && m.timesBought > 0) {
+                upgrades.push({ recipeId: recipe.id, tier: i, timesBought: m.timesBought, type: tName });
+              }
+            }
+          }
         }
       }
     } catch { /* noop */ }
@@ -1964,12 +1995,27 @@ class Sync {
       for (const u of msg.upgrades) {
         const recipe = as.actions.getObjectByID(u.recipeId);
         if (!recipe) continue;
-        // Find the modifier upgrade and set timesBought
+        const type = u.type || 'standard';
+        // Resolve the modifier upgrade object. Try the aggregated array first,
+        // then fall back to the recipe's modifier array indexed by tier.
+        let mod = null;
         try {
-          const mod = as.standardModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
-          if (mod) mod.timesBought = u.timesBought;
+          if (type === 'standard') mod = as.standardModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
+          else if (type === 'unique') mod = as.uniqueModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
+          else if (type === 'abyssal') mod = as.abyssalModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
         } catch { /* noop */ }
+        if (mod) {
+          mod.timesBought = u.timesBought;
+        } else if (recipe) {
+          // Fallback: set timesBought directly on the recipe modifier.
+          const arr = type === 'standard' ? recipe.standardModifiers
+            : (type === 'unique' ? recipe.uniqueModifiers : recipe.abyssalModifiers);
+          if (arr && arr[u.tier]) arr[u.tier].timesBought = u.timesBought;
+        }
       }
+      // Recompute provided stats so modifier effects take effect.
+      if (as.computeProvidedStats) try { as.computeProvidedStats(); } catch { /* noop */ }
+      if (as.addProvidedStats) try { as.addProvidedStats(); } catch { /* noop */ }
       if (as.render) as.render();
     } catch (e) { logger.error('applyAstrology failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -2021,7 +2067,16 @@ class Sync {
         for (const m of msg.marks) {
           const recipe = su.actions.getObjectByID(m.recipeId);
           if (!recipe) continue;
-          su.marksUnlocked.set(recipe, m.count);
+          const current = su.marksUnlocked.get(recipe) || 0;
+          // Only credit new mark discoveries via the game method so that
+          // discovery side-effects (XP/rewards) fire. If the remote count is
+          // lower or equal, just set the map directly.
+          if (m.count > current && typeof su.discoverMark === 'function') {
+            try { su.discoverMark(recipe, m.count - current); }
+            catch (e) { su.marksUnlocked.set(recipe, m.count); }
+          } else {
+            su.marksUnlocked.set(recipe, m.count);
+          }
         }
       }
       if (msg.costs && su.selectedNonShardCosts) {
@@ -2078,7 +2133,15 @@ class Sync {
       t.killsLeft = msg.killsLeft || 0;
       t.extended = !!msg.extended;
       if (msg.realmId) t.realm = game.realms.getObjectByID(msg.realmId);
-      if (msg.categoryId) t.category = game.combat.slayerTask.categories.getObjectByID(msg.categoryId);
+      if (msg.categoryId) {
+        // Slayer task categories live on the Slayer skill, not on the task instance.
+        const cat = (sl.categories && sl.categories.getObjectByID)
+          ? sl.categories.getObjectByID(msg.categoryId)
+          : (game.slayerTaskCategories && game.slayerTaskCategories.getObjectByID
+              ? game.slayerTaskCategories.getObjectByID(msg.categoryId)
+              : undefined);
+        if (cat) t.category = cat;
+      }
       if (t.render) t.render();
       if (t.renderTask) t.renderTask();
     } catch (e) { logger.error('applySlayer failed', e); }
@@ -2458,10 +2521,32 @@ class Sync {
     const cm = game.combat;
     if (!cm) return;
     const completions = [];
+    // Dungeons — stored in cm.dungeonCompletion (Map<Dungeon, number>)
     if (cm.dungeonCompletion) {
-      for (const [d, count] of cm.dungeonCompletion) completions.push({ id: d.id, count });
+      for (const [d, count] of cm.dungeonCompletion) completions.push({ id: d.id, count, kind: 'dungeon' });
     }
-    this.transport.send({ t: Msg.COMBAT_AREA, completions });
+    // Abyss depths — AbyssDepth.timesCompleted is a save-state field on each depth
+    if (game.abyssDepths) {
+      for (const depth of game.abyssDepths.allObjects) {
+        if (depth && typeof depth.timesCompleted === 'number') {
+          completions.push({ id: depth.id, count: depth.timesCompleted, kind: 'abyssDepth' });
+        }
+      }
+    }
+    // Strongholds — Stronghold.timesCompleted is a save-state field on each stronghold
+    if (game.strongholds) {
+      for (const sh of game.strongholds.allObjects) {
+        if (sh && typeof sh.timesCompleted === 'number') {
+          completions.push({ id: sh.id, count: sh.timesCompleted, kind: 'stronghold' });
+        }
+      }
+    }
+    // Also sync the current stronghold tier and area progress so the peer
+    // sees the same combat location state.
+    const extra = {};
+    if (typeof cm.strongholdTier !== 'undefined') extra.strongholdTier = cm.strongholdTier;
+    if (typeof cm.areaProgress === 'number') extra.areaProgress = cm.areaProgress;
+    this.transport.send({ t: Msg.COMBAT_AREA, completions, ...extra });
   }
 
   _applyCombatArea(msg) {
@@ -2470,11 +2555,29 @@ class Sync {
     this._applyingRemote = true;
     try {
       for (const c of msg.completions) {
-        const d = game.dungeons.getObjectByID(c.id);
-        if (d && cm.dungeonCompletion) cm.dungeonCompletion.set(d, c.count);
+        const kind = c.kind || 'dungeon';
+        if (kind === 'dungeon') {
+          const d = game.dungeons.getObjectByID(c.id);
+          if (d && cm.dungeonCompletion) cm.dungeonCompletion.set(d, c.count);
+        } else if (kind === 'abyssDepth') {
+          const depth = game.abyssDepths && game.abyssDepths.getObjectByID(c.id);
+          if (depth) depth.timesCompleted = c.count;
+        } else if (kind === 'stronghold') {
+          const sh = game.strongholds && game.strongholds.getObjectByID(c.id);
+          if (sh) sh.timesCompleted = c.count;
+        }
       }
+      // Sync stronghold tier + area progress.
+      if (typeof msg.strongholdTier !== 'undefined') {
+        try { cm.strongholdTier = msg.strongholdTier; } catch { /* noop */ }
+      }
+      if (typeof msg.areaProgress === 'number') {
+        try { cm.areaProgress = msg.areaProgress; } catch { /* noop */ }
+      }
+      if (cm.render) try { cm.render(); } catch { /* noop */ }
+      if (cm.renderCompletionCount) try { cm.renderCompletionCount(); } catch { /* noop */ }
     } catch (e) { logger.error('applyCombatArea failed', e); }
-    finally { this._applyingRemote = false; }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
   // ---- Combat event sync (damage, healing, monster selection) ------------
@@ -3085,11 +3188,36 @@ class Sync {
     if (tw.biomes) for (const biome of tw.biomes.allObjects) {
       const buildings = {};
       if (biome.buildingsBuilt) for (const [b, count] of biome.buildingsBuilt) buildings[b.id] = count;
-      biomes.push({ id: biome.id, buildings });
+      const efficiency = {};
+      if (biome.buildingEfficiency) for (const [b, eff] of biome.buildingEfficiency) efficiency[b.id] = eff;
+      biomes.push({ id: biome.id, buildings, efficiency });
     }
     const resources = {};
     if (tw.resources) for (const r of tw.resources.allObjects) {
       resources[r.id] = { amount: r._amount, cap: r._cap };
+    }
+    // Town data — the live town state (population, happiness, education,
+    // worship, season, fortification, souls, health, etc.)
+    const townData = {};
+    if (tw.townData) {
+      const td = tw.townData;
+      townData.happiness = td.happiness;
+      townData.education = td.education;
+      townData.healthPercent = td.healthPercent;
+      townData.buildingStorage = td.buildingStorage;
+      townData.worshipCount = td.worshipCount;
+      townData.sectionsPurchased = td.sectionsPurchased;
+      townData.worshipId = td.worship ? td.worship.id : null;
+      townData.townCreated = td.townCreated;
+      townData.population = td.population;
+      townData.seasonTicksRemaining = td.seasonTicksRemaining;
+      townData.seasonId = td.season ? td.season.id : null;
+      townData.previousSeasonId = td.previousSeason ? td.previousSeason.id : null;
+      townData.health = td.health;
+      townData.fortification = td.fortification;
+      townData.souls = td.souls;
+      townData.soulStorage = td.soulStorage;
+      townData.abyssalWaveTicksRemaining = td.abyssalWaveTicksRemaining;
     }
     this.transport.send({
       t: Msg.TOWNSHIP,
@@ -3097,6 +3225,8 @@ class Sync {
       resources,
       totalTicks: tw.totalTicks,
       legacyTicks: tw.legacyTicks,
+      townData,
+      worshipInSelectionId: tw.worshipInSelection ? tw.worshipInSelection.id : null,
     });
   }
 
@@ -3112,6 +3242,13 @@ class Sync {
           const building = tw.buildings.getObjectByID(bid);
           if (building) biome.buildingsBuilt.set(building, count);
         }
+        // Sync building efficiency (decays over time; otherwise diverges).
+        if (b.efficiency && biome.buildingEfficiency) {
+          for (const [bid, eff] of Object.entries(b.efficiency)) {
+            const building = tw.buildings.getObjectByID(bid);
+            if (building) biome.buildingEfficiency.set(building, eff);
+          }
+        }
       }
       if (msg.resources) for (const [rid, data] of Object.entries(msg.resources)) {
         const r = tw.resources.getObjectByID(rid);
@@ -3119,6 +3256,37 @@ class Sync {
       }
       if (typeof msg.totalTicks === 'number') tw.totalTicks = msg.totalTicks;
       if (typeof msg.legacyTicks === 'number') tw.legacyTicks = msg.legacyTicks;
+      // Town data
+      if (msg.townData && tw.townData) {
+        const td = tw.townData;
+        const d = msg.townData;
+        if (typeof d.happiness === 'number') td.happiness = d.happiness;
+        if (typeof d.education === 'number') td.education = d.education;
+        if (typeof d.healthPercent === 'number') td.healthPercent = d.healthPercent;
+        if (typeof d.buildingStorage === 'number') td.buildingStorage = d.buildingStorage;
+        if (typeof d.worshipCount === 'number') td.worshipCount = d.worshipCount;
+        if (typeof d.sectionsPurchased === 'number') td.sectionsPurchased = d.sectionsPurchased;
+        if (typeof d.townCreated === 'boolean') td.townCreated = d.townCreated;
+        if (typeof d.population === 'number') td.population = d.population;
+        if (typeof d.seasonTicksRemaining === 'number') td.seasonTicksRemaining = d.seasonTicksRemaining;
+        if (typeof d.health === 'number') td.health = d.health;
+        if (typeof d.fortification === 'number') td.fortification = d.fortification;
+        if (typeof d.souls === 'number') td.souls = d.souls;
+        if (typeof d.soulStorage === 'number') td.soulStorage = d.soulStorage;
+        if (typeof d.abyssalWaveTicksRemaining === 'number') td.abyssalWaveTicksRemaining = d.abyssalWaveTicksRemaining;
+        if (d.worshipId !== undefined) {
+          td.worship = d.worshipId ? (tw.worships && tw.worships.getObjectByID(d.worshipId)) : (tw.noWorship || undefined);
+        }
+        if (d.seasonId !== undefined) {
+          td.season = d.seasonId ? (tw.seasons && tw.seasons.getObjectByID(d.seasonId)) : undefined;
+        }
+        if (d.previousSeasonId !== undefined) {
+          td.previousSeason = d.previousSeasonId ? (tw.seasons && tw.seasons.getObjectByID(d.previousSeasonId)) : undefined;
+        }
+      }
+      if (msg.worshipInSelectionId !== undefined) {
+        tw.worshipInSelection = msg.worshipInSelectionId ? (tw.worships && tw.worships.getObjectByID(msg.worshipInSelectionId)) : undefined;
+      }
       if (tw.render) tw.render();
     } catch (e) { logger.error('applyTownship failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -3215,7 +3383,9 @@ class Sync {
         t: Msg.RAID,
         wave: r.wave,
         waveProgress: r.waveProgress,
-        selectedDifficulty: r.selectedDifficulty ? r.selectedDifficulty.id : null,
+        // selectedDifficulty is a RaidDifficulty enum value (number), not an object.
+        selectedDifficulty: (typeof r.selectedDifficulty === 'number') ? r.selectedDifficulty
+          : (r.selectedDifficulty && r.selectedDifficulty.id != null ? r.selectedDifficulty.id : null),
         history,
       });
     };
@@ -3233,9 +3403,23 @@ class Sync {
       const r = game.golbinRaid;
       if (typeof msg.wave === 'number') r.wave = msg.wave;
       if (typeof msg.waveProgress === 'number') r.waveProgress = msg.waveProgress;
-      if (msg.selectedDifficulty) {
-        const diff = game.raidDifficulties?.getObjectByID(msg.selectedDifficulty);
-        if (diff) r.selectedDifficulty = diff;
+      if (msg.selectedDifficulty != null) {
+        // selectedDifficulty is a RaidDifficulty enum (number). Use
+        // changeDifficulty() if available so UI/state updates properly,
+        // otherwise set directly.
+        if (typeof msg.selectedDifficulty === 'number') {
+          if (typeof r.changeDifficulty === 'function') {
+            try { r.changeDifficulty(msg.selectedDifficulty); } catch { r._setDifficulty = msg.selectedDifficulty; }
+          } else {
+            r._setDifficulty = msg.selectedDifficulty;
+            r.selectedDifficulty = msg.selectedDifficulty;
+          }
+        } else if (typeof msg.selectedDifficulty === 'string') {
+          // Legacy: map string id back to enum value if possible.
+          const map = { Easy: 0, Medium: 1, Hard: 2 };
+          const v = map[msg.selectedDifficulty];
+          if (v != null) r._setDifficulty = v;
+        }
       }
       // History is append-only — just add new entries
       if (msg.history && r.history) {
@@ -3561,9 +3745,16 @@ class Sync {
     this._applyingRemote = true;
     try {
       for (const [key, val] of Object.entries(msg.stats)) {
+        // Stats keys may be numeric stat IDs or string keys. Try numeric first
+        // (the common case), then fall back to the raw string key.
         const numKey = Number(key);
-        if (!isNaN(numKey)) game.stats.stats.set(numKey, val);
+        if (!isNaN(numKey) && game.stats.stats.set) {
+          game.stats.stats.set(numKey, val);
+        } else if (game.stats.stats.set) {
+          game.stats.stats.set(key, val);
+        }
       }
+      if (game.stats.renderMutatedStats) try { game.stats.renderMutatedStats(); } catch { /* noop */ }
     } catch (e) { logger.error('applyStats failed', e); }
     finally { this._applyingRemote = false; }
   }
