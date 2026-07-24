@@ -1252,6 +1252,10 @@ class Sync {
   _patchFarming() {
     const farming = game.farming;
     if (!farming) return;
+    logger.info('[FARM] _patchFarming: starting, farming plots count:', farming.plots ? farming.plots.size : 'unknown');
+    logger.info('[FARM] unlockPlotOnClick type:', typeof farming.unlockPlotOnClick);
+    logger.info('[FARM] plantPlot type:', typeof farming.plantPlot);
+    logger.info('[FARM] compostPlot type:', typeof farming.compostPlot);
 
     const sendPlot = function (plot) {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
@@ -1266,29 +1270,45 @@ class Sync {
     // Note: level is a getter that returns _level, so we must set _level.
     let savedFarmingLevel = null;
     this.ctx.patch(Farming, 'unlockPlotOnClick').before(function (plot) {
-      if (!plot) return;
+      if (!plot) {
+        logger.warn('[FARM] unlockPlotOnClick called with no plot');
+        return;
+      }
+      // Log everything about the plot for debugging
+      logger.info(`[FARM] unlockPlotOnClick BEFORE: plot=${plot.id}, state=${plot.state}, level=${plot.level}, gpCost=${plot.gpCost}, myLevel=${this._level}, myGP=${game.gp ? game.gp.amount : 'no-gp'}`);
+      if (plot.currencyCosts) logger.info(`[FARM] plot.currencyCosts: ${JSON.stringify(plot.currencyCosts.map(c => ({id: c.currency ? c.currency.id : c.id, qty: c.quantity})))}`);
+      if (plot.itemCosts) logger.info(`[FARM] plot.itemCosts: ${JSON.stringify(plot.itemCosts.map(c => ({id: c.item ? c.item.id : c.id, qty: c.quantity})))}`);
       // Save current level and temporarily set it high enough to pass the check
       savedFarmingLevel = this._level;
       this._level = Math.max(this._level, plot.level || 1, 120);
+      logger.info(`[FARM] Temporarily set farming level from ${savedFarmingLevel} to ${this._level}`);
     });
     this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
       // Restore the original farming level
       if (savedFarmingLevel !== null) {
+        logger.info(`[FARM] Restoring farming level from ${this._level} to ${savedFarmingLevel}`);
         this._level = savedFarmingLevel;
         savedFarmingLevel = null;
       }
+      if (plot) {
+        logger.info(`[FARM] unlockPlotOnClick AFTER: plot=${plot.id}, state=${plot.state}, gp=${game.gp ? game.gp.amount : 'no-gp'}`);
+      }
       // Check if the unlock actually succeeded (plot.state changed to 1)
       if (plot && plot.state === 1) {
-        logger.info(`[FARM] Unlocked plot: ${plot.id}`);
+        logger.info(`[FARM] Unlocked plot SUCCESS: ${plot.id}`);
+      } else if (plot) {
+        logger.warn(`[FARM] Unlocked plot FAILED: ${plot.id}, state is ${plot.state}`);
       }
       sendPlot(plot);
     });
 
     // Planting — sync so both players plant the same seeds
     this.ctx.patch(Farming, 'plantPlot').after(function (_ret, plot) {
+      logger.info(`[FARM] plantPlot called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
     });
     this.ctx.patch(Farming, 'plantPlotOnClick').after(function (_ret, plot) {
+      logger.info(`[FARM] plantPlotOnClick called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
     });
     this.ctx.patch(Farming, 'plantAllPlots').after(function () {
@@ -1313,9 +1333,11 @@ class Sync {
 
     // Harvesting — sync so both players harvest
     this.ctx.patch(Farming, 'harvestPlot').after(function (_ret, plot) {
+      logger.info(`[FARM] harvestPlot called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
     });
     this.ctx.patch(Farming, 'harvestPlotOnClick').after(function (_ret, plot) {
+      logger.info(`[FARM] harvestPlotOnClick called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
     });
     this.ctx.patch(Farming, 'harvestAllOnClick').after(function () {
@@ -1325,6 +1347,7 @@ class Sync {
 
     // Compost — sync so both players compost (weird gloop, abyssal compost, etc.)
     this.ctx.patch(Farming, 'compostPlot').after(function (_ret, plot) {
+      logger.info(`[FARM] compostPlot called: plot=${plot ? plot.id : 'null'}, compostLevel=${plot ? plot.compostLevel : 'null'}, compostItem=${plot && plot.compostItem ? plot.compostItem.id : 'null'}`);
       sendPlot(plot);
     });
     this.ctx.patch(Farming, 'compostAllOnClick').after(function () {
@@ -1349,6 +1372,7 @@ class Sync {
     // Growth tick — send updates when plots grow
     this.ctx.patch(Farming, 'growPlots').after(function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
+      logger.info('[FARM] growPlots tick — sending all plots');
       sync._sendAllFarmingPlots();
     });
 
@@ -1361,6 +1385,7 @@ class Sync {
   _sendFarmingPlot(plot) {
     const data = this._serializePlot(plot);
     if (!data) return;
+    logger.info(`[FARM] Sending plot: ${JSON.stringify(data)}`);
     this.transport.send({ t: Msg.FARMING, plots: [data] });
   }
 
@@ -1392,6 +1417,7 @@ class Sync {
   _applyFarming(msg) {
     const farming = game.farming;
     if (!farming || !msg.plots) return;
+    logger.info(`[FARM] _applyFarming: received ${msg.plots.length} plots`);
     this._applyingRemote = true;
     try {
       for (const p of msg.plots) {
@@ -1400,6 +1426,7 @@ class Sync {
           logger.warn(`[FARM] Plot not found: ${p.id}`);
           continue;
         }
+        logger.info(`[FARM] Applying: plot=${p.id}, remoteState=${p.state}, localState=${plot.state}, plantedRecipeId=${p.plantedRecipeId}, compostItemId=${p.compostItemId}, compostLevel=${p.compostLevel}`);
 
         // Handle plot unlock: if the plot was unlocked by the other player,
         // unlock it here too (without charging)
