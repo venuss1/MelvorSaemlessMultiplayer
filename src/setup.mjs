@@ -3932,9 +3932,11 @@ class Sync {
         if (typeof lo.isFightingITMBoss === 'boolean') r.isFightingITMBoss = lo.isFightingITMBoss;
         // Equipment
         if (lo.equipment && r.player && r.player.equipment) {
-          for (const [slot, eq] of Object.entries(lo.equipment)) {
+          for (const [slotId, eq] of Object.entries(lo.equipment)) {
             const item = game.items.getObjectByID(eq.itemId);
-            if (item && typeof r.player.equipItem === 'function') {
+            // equipItem expects an EquipmentSlot object, not a string id.
+            const slot = game.equipmentSlots && game.equipmentSlots.getObjectByID(slotId);
+            if (item && slot && typeof r.player.equipItem === 'function') {
               try { r.player.equipItem(item, eq.set || 0, slot, eq.qty || 1); } catch { /* noop */ }
             }
           }
@@ -3947,17 +3949,18 @@ class Sync {
           }
         }
         // Modifiers — set directly (these are runtime-only during a raid)
+        // ModifierValue has { modifier, value }, not { id, value }.
         if (lo.randomPlayerModifiers) {
           r.randomPlayerModifiers = lo.randomPlayerModifiers.map(m => {
-            const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-            return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
-          });
+            const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
+            return modifier ? { modifier, value: m.value } : null;
+          }).filter(Boolean);
         }
         if (lo.randomEnemyModifiers) {
           r.randomEnemyModifiers = lo.randomEnemyModifiers.map(m => {
-            const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-            return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
-          });
+            const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
+            return modifier ? { modifier, value: m.value } : null;
+          }).filter(Boolean);
         }
         if (r.render) try { r.render(); } catch { /* noop */ }
       }
