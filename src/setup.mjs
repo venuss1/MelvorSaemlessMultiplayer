@@ -3419,14 +3419,14 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Received loot: ${msg.itemId} x${msg.quantity}`);
     try {
-      // Handle GP (gold coins) — game.gp is a Currency object, use addGP()
+      // Handle GP (gold coins) — game.gp is a Currency, use .add()
       if (msg.itemId === 'melvorD:GP' && game.gp !== undefined) {
-        if (game.addGP) game.addGP(msg.quantity);
+        if (typeof game.gp.add === 'function') game.gp.add(msg.quantity);
         return;
       }
-      // Handle Slayer Coins — game.slayerCoins is a Currency object, use addSlayerCoins()
+      // Handle Slayer Coins — game.slayerCoins is a Currency, use .add()
       if (msg.itemId === 'melvorD:SlayerCoins' && game.slayerCoins !== undefined) {
-        if (game.addSlayerCoins) game.addSlayerCoins(msg.quantity);
+        if (typeof game.slayerCoins.add === 'function') game.slayerCoins.add(msg.quantity);
         return;
       }
       // Handle items — add to combat loot so player can collect
