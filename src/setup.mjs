@@ -3351,39 +3351,17 @@ class Sync {
   // ---- Active-action watcher -------------------------------------------
 
   _startPeriodicStateSync() {
-    // Every 10 seconds, send a full state sync to keep both players
-    // in sync even if individual patches miss something.
+    // Every 60 seconds, send a lightweight sync of only currencies.
+    // XP, mastery, and other state are already synced in real-time via
+    // individual patches. This is just a safety net for currencies.
     this._stateSyncTimer = setInterval(() => {
       if (!this.transport.isConnected || this._applyingRemote) return;
       try {
-        // Send XP for all skills
-        for (const skill of game.skills.allObjects) {
-          const xpMsg = { t: Msg.XP, skillId: skill.id, xp: skill.xp };
-          if (skill.hasAbyssalLevels) xpMsg.abyssalXp = skill.abyssalXP;
-          this.transport.send(xpMsg);
-        }
-        // Send mastery sync for all skills with mastery
-        for (const skill of game.skills.allObjects) {
-          if (!skill.hasMastery || !skill.actionMastery) continue;
-          for (const [action, am] of skill.actionMastery) {
-            if (action && action.id && am) {
-              this.transport.send({ t: Msg.MASTERY, skillId: skill.id, actionId: action.id, xp: am.xp });
-            }
-          }
-          if (skill._masteryPoolXP) {
-            skill._masteryPoolXP.forEach((xp, realm) => {
-              if (realm && realm.id) {
-                this.transport.send({ t: Msg.MASTERY_POOL, skillId: skill.id, realmId: realm.id, xp });
-              }
-            });
-          }
-        }
-        // Send currencies
         if (game.currencies) for (const c of game.currencies.allObjects) {
           this.transport.send({ t: Msg.CURRENCY, currencyId: c.id, qty: c._amount });
         }
       } catch (e) { logger.warn('periodic state sync failed', e); }
-    }, 10000);
+    }, 60000);
   }
 
   _startWatcher() {
