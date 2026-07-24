@@ -2066,6 +2066,8 @@ class Sync {
     if (typeof Enemy !== 'undefined' && Enemy.prototype && typeof Enemy.prototype.damage === 'function') {
       this.ctx.patch(Enemy, 'damage').after(function (amount, source) {
         if (amount <= 0) return;
+        // Only send if we're the attacker (not spectating)
+        if (sync._combatOwner === 'peer') return;
         sendCombatEvent({
           kind: 'damage',
           target: 'enemy',
@@ -2082,6 +2084,8 @@ class Sync {
     if (typeof Player !== 'undefined' && Player.prototype && typeof Player.prototype.damage === 'function') {
       this.ctx.patch(Player, 'damage').after(function (amount, source) {
         if (amount <= 0) return;
+        // Only send if we're the attacker (not spectating)
+        if (sync._combatOwner === 'peer') return;
         sendCombatEvent({
           kind: 'damage',
           target: 'player',
@@ -2345,11 +2349,10 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}`);
     this._combatOwner = 'peer';
-    // Pause our combat — we're spectating, not attacking
-    this._combatWasPaused = cm.paused;
-    if (!cm.paused && cm.pause) {
-      try { cm.pause(); } catch (e) { /* skip */ }
-    }
+    // Don't pause combat — that hides the enemy visual.
+    // Instead, we just set _combatOwner='peer' which prevents our local
+    // damage patches from sending (the peer is the attacker, not us).
+    // The enemy stays visible, we just don't attack.
     // Sync the monster selection so we see the same enemy
     if (msg.monsterId) {
       this._applyingRemote = true;
