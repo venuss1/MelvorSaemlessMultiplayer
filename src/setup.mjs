@@ -2122,28 +2122,26 @@ class Sync {
         if (msg.monsterId) {
           const monster = game.monsters.getObjectByID(msg.monsterId);
           if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId)) {
-            try { cm.enemy.setNewMonster(monster); } catch (e) { /* skip */ }
+            try {
+              cm.enemy.setNewMonster(monster);
+              cm.enemy.initializeForCombat();
+              cm.enemy.setSpawning();
+            } catch (e) { logger.warn(`setNewMonster failed: ${e.message}`); }
           }
-        }
-        // Sync paused state
-        if (typeof msg.paused === 'boolean' && cm.paused !== msg.paused) {
-          // Don't force pause/unpause — just note the state
-          // (actual pause control is complex and could fight with local player)
         }
         // Sync HP values
         if (msg.enemyHp !== undefined && cm.enemy) {
           if (cm.enemy.hitpoints !== msg.enemyHp) {
             cm.enemy.hitpoints = msg.enemyHp;
-            if (cm.enemy.renderHitpoints) cm.enemy.renderHitpoints();
-            if (cm.enemy.render) cm.enemy.render();
           }
         }
         if (msg.playerHp !== undefined && cm.player) {
           if (cm.player.hitpoints !== msg.playerHp) {
             cm.player.hitpoints = msg.playerHp;
-            if (cm.player.renderHitpoints) cm.player.renderHitpoints();
           }
         }
+        // Full combat render
+        this._renderCombat();
       } else if (msg.kind === 'damage') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
         if (!target) return;
@@ -2161,12 +2159,14 @@ class Sync {
               amount: msg.amount,
               xOffset: 0,
             });
-            if (target.splashManager.render) target.splashManager.render();
           } catch (e) { /* skip splash */ }
         }
-        // Render HP bar
-        if (target.renderHitpoints) target.renderHitpoints();
-        if (target.render) target.render();
+        // Set render queue flags so the game's render loop picks it up
+        if (target.renderQueue) {
+          target.renderQueue.hitpoints = true;
+          target.renderQueue.damageSplash = true;
+        }
+        this._renderCombat();
       } else if (msg.kind === 'heal') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
         if (!target) return;
@@ -2183,13 +2183,46 @@ class Sync {
               amount: msg.amount,
               xOffset: 0,
             });
-            if (target.splashManager.render) target.splashManager.render();
           } catch (e) { /* skip splash */ }
         }
-        if (target.renderHitpoints) target.renderHitpoints();
+        if (target.renderQueue) {
+          target.renderQueue.hitpoints = true;
+          target.renderQueue.damageSplash = true;
+        }
+        this._renderCombat();
       }
     } catch (e) { logger.error('applyCombatEvent failed', e); }
     finally { this._applyingRemote = false; }
+  }
+
+  _renderCombat() {
+    const cm = game.combat;
+    if (!cm) return;
+    try {
+      // Set all relevant render queue flags
+      if (cm.enemy) {
+        if (cm.enemy.renderQueue) {
+          cm.enemy.renderQueue.hitpoints = true;
+          cm.enemy.renderQueue.damageSplash = true;
+          cm.enemy.renderQueue.image = true;
+          cm.enemy.renderQueue.levels = true;
+          cm.enemy.renderQueue.stats = true;
+          cm.enemy.renderQueue.attacks = true;
+        }
+        if (cm.enemy.renderHitpoints) cm.enemy.renderHitpoints();
+        if (cm.enemy.renderImageAndName) cm.enemy.renderImageAndName();
+        if (cm.enemy.render) cm.enemy.render();
+      }
+      if (cm.player) {
+        if (cm.player.renderQueue) {
+          cm.player.renderQueue.hitpoints = true;
+          cm.player.renderQueue.damageSplash = true;
+        }
+        if (cm.player.renderHitpoints) cm.player.renderHitpoints();
+      }
+      // Full combat manager render — updates the entire combat tab
+      if (cm.render) cm.render();
+    } catch (e) { /* skip render errors */ }
   }
 
   // ---- Ancient relics sync ----------------------------------------------
