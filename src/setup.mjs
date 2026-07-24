@@ -2584,7 +2584,9 @@ class Sync {
           const s = game.fishing;
           if (!s || !msg.areaFish) break;
           for (const af of msg.areaFish) {
-            const area = s.actions.getObjectByID(af.areaId) || s.areas?.getObjectByID(af.areaId);
+            // Fishing areas are in s.areas (NamespaceRegistry<FishingArea>),
+            // not s.actions (which contains Fish objects).
+            const area = s.areas && s.areas.getObjectByID(af.areaId);
             if (!area) continue;
             const f = af.fishId ? s.actions.getObjectByID(af.fishId) : null;
             if (f) s.selectedAreaFish.set(area, f);
@@ -2595,7 +2597,9 @@ class Sync {
         case 'melvorD:Thieving': {
           const s = game.thieving;
           if (!s) break;
-          if (msg.areaId) s.currentArea = s.actions.getObjectByID(msg.areaId) || s.areas?.getObjectByID(msg.areaId);
+          // Thieving areas are in s.areas (NamespaceRegistry<ThievingArea>),
+          // not s.actions (which contains ThievingNPC objects).
+          if (msg.areaId) s.currentArea = s.areas && s.areas.getObjectByID(msg.areaId);
           if (msg.npcId) s.currentNPC = s.actions.getObjectByID(msg.npcId);
           if (s.render) s.render();
           break;
@@ -6323,14 +6327,16 @@ class Sync {
           }
           if (ss.fishing && game.fishing) {
             for (const af of ss.fishing.areaFish || []) {
-              const area = game.fishing.actions.getObjectByID(af.areaId);
+              // Fishing areas are in game.fishing.areas, not .actions
+              const area = game.fishing.areas && game.fishing.areas.getObjectByID(af.areaId);
               if (!area) continue;
               const f = af.fishId ? game.fishing.actions.getObjectByID(af.fishId) : null;
               if (f) game.fishing.selectedAreaFish.set(area, f);
             }
           }
           if (ss.thieving && game.thieving) {
-            if (ss.thieving.areaId) game.thieving.currentArea = game.thieving.actions.getObjectByID(ss.thieving.areaId);
+            // Thieving areas are in game.thieving.areas, not .actions
+            if (ss.thieving.areaId) game.thieving.currentArea = game.thieving.areas && game.thieving.areas.getObjectByID(ss.thieving.areaId);
             if (ss.thieving.npcId) game.thieving.currentNPC = game.thieving.actions.getObjectByID(ss.thieving.npcId);
           }
           if (ss.altMagic && game.altMagic) {
