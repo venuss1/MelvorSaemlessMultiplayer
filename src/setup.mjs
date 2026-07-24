@@ -93,6 +93,11 @@ const Msg = Object.freeze({
   GAME_STATE: 'game_state',         // tickTimestamp, merchantsPermitRead, pause, etc.
   LORE: 'lore',                     // lore books read
   ASTROLOGY_SELECT: 'astro_select', // studied/explored constellation
+  REALM: 'realm',                   // current realm selection
+  SLAYER_CAT: 'slayer_cat',         // slayer task category completions
+  COOKING_STOCKPILE: 'cook_stock',  // cooking stockpile items
+  EQUIP_SET_COUNT: 'equip_set_count', // number of equipment set slots
+  SETTINGS: 'settings',             // gameplay-affecting game settings
 });
 const encode = (msg) => JSON.stringify(msg);
 const decode = (data) => {
@@ -453,6 +458,11 @@ class Sync {
       ['GameState', () => this._patchGameState()],
       ['Lore', () => this._patchLore()],
       ['Tutorial', () => this._patchTutorial()],
+      ['RealmSelection', () => this._patchRealmSelection()],
+      ['SlayerCategories', () => this._patchSlayerCategories()],
+      ['CookingStockpile', () => this._patchCookingStockpile()],
+      ['EquipSetCount', () => this._patchEquipSetCount()],
+      ['GameSettings', () => this._patchGameSettings()],
     ];
     let ok = 0, fail = 0, skip = 0;
     for (const [name, fn] of patches) {
@@ -4150,11 +4160,26 @@ class Sync {
             }
           }
         }
-        // Send POI discoveries
+        // Send POI discoveries, discovery modifiers (movesLeft), and fast travel unlock status
         if (wm.pointsOfInterest) {
           for (const poi of wm.pointsOfInterest.allObjects) {
             if (poi.isDiscovered) {
-              mapData.pois.push({ poiId: poi.id });
+              const poiData = { poiId: poi.id };
+              // Discovery modifiers with movesLeft counter
+              if (poi.discoveryModifiers) {
+                const mods = [];
+                for (const mod of poi.discoveryModifiers) {
+                  if (typeof mod.movesLeft === 'number') {
+                    mods.push({ id: mod.id, movesLeft: mod.movesLeft });
+                  }
+                }
+                if (mods.length > 0) poiData.discoveryMods = mods;
+              }
+              // Fast travel unlock status
+              if (poi.fastTravel && typeof poi.fastTravel.isUnlocked === 'boolean') {
+                poiData.fastTravelUnlocked = poi.fastTravel.isUnlocked;
+              }
+              mapData.pois.push(poiData);
             }
           }
         }
@@ -4231,7 +4256,7 @@ class Sync {
             }
           }
 
-          // Apply POI discoveries
+          // Apply POI discoveries, discovery modifiers, and fast travel unlock status
           if (mData.pois && wm.pointsOfInterest) {
             for (const p of mData.pois) {
               const poi = wm.pointsOfInterest.getObjectByID(p.poiId);
@@ -4248,6 +4273,20 @@ class Sync {
                 if (ca.renderQueue && ca.renderQueue.poiMarkers) {
                   ca.renderQueue.poiMarkers.add(poi);
                 }
+              }
+              // Apply discovery modifiers (movesLeft)
+              if (poi && p.discoveryMods && poi.discoveryModifiers) {
+                for (const dm of p.discoveryMods) {
+                  const mod = poi.discoveryModifiers.find(m => m.id === dm.id);
+                  if (mod && typeof dm.movesLeft === 'number') {
+                    // Sync movesLeft — take the max to preserve the longer-lasting bonus
+                    mod.movesLeft = Math.max(mod.movesLeft || 0, dm.movesLeft);
+                  }
+                }
+              }
+              // Apply fast travel unlock status
+              if (poi && p.fastTravelUnlocked === true && poi.fastTravel) {
+                poi.fastTravel.isUnlocked = true;
               }
             }
           }
@@ -4640,6 +4679,192 @@ class Sync {
       }
       if (game.lore.render) try { game.lore.render(); } catch { /* noop */ }
     } catch (e) { logger.error('applyLore failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Realm selection sync ----------------------------------------------
+  _patchRealmSelection() {
+    if (typeof game.selectRealm !== 'function') return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      if (!game.currentRealm) return;
+      this.transport.send({ t: Msg.REALM, realmId: game.currentRealm.id });
+    };
+    this.ctx.patch(Game, 'selectRealm').after(() => send());
+  }
+
+  _applyRealmSelection(msg) {
+    if (!msg.realmId || !game.realms) return;
+    this._applyingRemote = true;
+    try {
+      const realm = game.realms.getObjectByID(msg.realmId);
+      if (realm && game.currentRealm !== realm && typeof game.selectRealm === 'function') {
+        game.selectRealm(realm);
+      }
+    } catch (e) { logger.error('applyRealmSelection failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Slayer task category completions sync -----------------------------
+  _patchSlayerCategories() {
+    if (!game.slayer || !game.slayer.actions) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      const cats = [];
+      try {
+        for (const cat of game.slayer.actions.allObjects) {
+          cats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
+        }
+      } catch { /* noop */ }
+      this.transport.send({ t: Msg.SLAYER_CAT, cats });
+    };
+    // Patch the method that completes slayer tasks (increments tasksCompleted)
+    if (typeof SlayerTaskCategory !== 'undefined' && SlayerTaskCategory.prototype) {
+      for (const m of ['onTaskCompletion', 'completeTask', 'incrementCompletion']) {
+        if (typeof SlayerTaskCategory.prototype[m] === 'function') {
+          this.ctx.patch(SlayerTaskCategory, m).after(() => send());
+        }
+      }
+    }
+  }
+
+  _applySlayerCategories(msg) {
+    if (!msg.cats || !game.slayer || !game.slayer.actions) return;
+    this._applyingRemote = true;
+    try {
+      for (const c of msg.cats) {
+        const cat = game.slayer.actions.getObjectByID(c.catId);
+        if (cat && typeof c.tasksCompleted === 'number') {
+          cat.tasksCompleted = Math.max(cat.tasksCompleted || 0, c.tasksCompleted);
+        }
+      }
+    } catch (e) { logger.error('applySlayerCategories failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Cooking stockpile sync --------------------------------------------
+  _patchCookingStockpile() {
+    if (!game.cooking || !game.cooking.stockpileItems) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      const stockpiles = [];
+      try {
+        for (const [cat, iq] of game.cooking.stockpileItems) {
+          stockpiles.push({ catId: cat.id, itemId: iq.item ? iq.item.id : null, qty: iq.quantity || 0 });
+        }
+      } catch { /* noop */ }
+      this.transport.send({ t: Msg.COOKING_STOCKPILE, stockpiles });
+    };
+    // Patch methods that modify stockpiles
+    if (typeof Cooking !== 'undefined' && Cooking.prototype) {
+      for (const m of ['addStockpile', 'removeStockpile', 'setStockpile', 'addStockpileItem', 'removeStockpileItem']) {
+        if (typeof Cooking.prototype[m] === 'function') {
+          this.ctx.patch(Cooking, m).after(() => send());
+        }
+      }
+    }
+  }
+
+  _applyCookingStockpile(msg) {
+    if (!msg.stockpiles || !game.cooking || !game.cooking.stockpileItems) return;
+    this._applyingRemote = true;
+    try {
+      for (const sp of msg.stockpiles) {
+        const cat = game.cooking.categories.getObjectByID(sp.catId);
+        if (!cat) continue;
+        const item = sp.itemId ? game.items.getObjectByID(sp.itemId) : null;
+        if (item) {
+          const cur = game.cooking.stockpileItems.get(cat);
+          const curQty = cur ? (cur.quantity || 0) : 0;
+          // Only update if remote has more (absolute-value delta sync)
+          if (sp.qty > curQty) {
+            game.cooking.stockpileItems.set(cat, { item, quantity: sp.qty });
+          }
+        }
+      }
+    } catch (e) { logger.error('applyCookingStockpile failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Equipment set count sync ------------------------------------------
+  _patchEquipSetCount() {
+    if (!game.combat || !game.combat.player) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      const n = game.combat.player.numEquipSets;
+      if (typeof n === 'number') {
+        this.transport.send({ t: Msg.EQUIP_SET_COUNT, count: n });
+      }
+    };
+    // Patch the method that adds equipment set slots (purchased via shop)
+    if (typeof Player !== 'undefined' && Player.prototype) {
+      for (const m of ['addEquipSet', 'addEquipmentSet', 'increaseEquipSets']) {
+        if (typeof Player.prototype[m] === 'function') {
+          this.ctx.patch(Player, m).after(() => send());
+        }
+      }
+    }
+  }
+
+  _applyEquipSetCount(msg) {
+    if (typeof msg.count !== 'number' || !game.combat || !game.combat.player) return;
+    this._applyingRemote = true;
+    try {
+      const current = game.combat.player.numEquipSets || 0;
+      if (msg.count > current) {
+        game.combat.player.numEquipSets = msg.count;
+      }
+    } catch (e) { logger.error('applyEquipSetCount failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Game settings sync (gameplay-affecting only) ----------------------
+  _patchGameSettings() {
+    if (!game.settings) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      const s = game.settings;
+      this.transport.send({
+        t: Msg.SETTINGS,
+        settings: {
+          continueIfBankFull: s.continueIfBankFull,
+          continueThievingOnStun: s.continueThievingOnStun,
+          autoRestartDungeon: s.autoRestartDungeon,
+          enableAutoSlayer: s.enableAutoSlayer,
+          enableAutoEquipFood: s.enableAutoEquipFood,
+          enableAutoSwapFood: s.enableAutoSwapFood,
+          enablePerfectCooking: s.enablePerfectCooking,
+          enablePermaCorruption: s.enablePermaCorruption,
+          enableOfflineCombat: s.enableOfflineCombat,
+        },
+      });
+    };
+    // Patch the Settings class methods that change settings
+    if (typeof Settings !== 'undefined' && Settings.prototype) {
+      for (const m of ['set', 'update', 'setSetting', 'toggle']) {
+        if (typeof Settings.prototype[m] === 'function') {
+          this.ctx.patch(Settings, m).after(() => send());
+        }
+      }
+    }
+  }
+
+  _applyGameSettings(msg) {
+    if (!msg.settings || !game.settings) return;
+    this._applyingRemote = true;
+    try {
+      const s = game.settings;
+      const m = msg.settings;
+      if (typeof m.continueIfBankFull === 'boolean') s.continueIfBankFull = m.continueIfBankFull;
+      if (typeof m.continueThievingOnStun === 'boolean') s.continueThievingOnStun = m.continueThievingOnStun;
+      if (typeof m.autoRestartDungeon === 'boolean') s.autoRestartDungeon = m.autoRestartDungeon;
+      if (typeof m.enableAutoSlayer === 'boolean') s.enableAutoSlayer = m.enableAutoSlayer;
+      if (typeof m.enableAutoEquipFood === 'boolean') s.enableAutoEquipFood = m.enableAutoEquipFood;
+      if (typeof m.enableAutoSwapFood === 'boolean') s.enableAutoSwapFood = m.enableAutoSwapFood;
+      if (typeof m.enablePerfectCooking === 'boolean') s.enablePerfectCooking = m.enablePerfectCooking;
+      if (typeof m.enablePermaCorruption === 'boolean') s.enablePermaCorruption = m.enablePermaCorruption;
+      if (typeof m.enableOfflineCombat === 'boolean') s.enableOfflineCombat = m.enableOfflineCombat;
+    } catch (e) { logger.error('applyGameSettings failed', e); }
     finally { this._applyingRemote = false; }
   }
 
@@ -5216,7 +5441,20 @@ class Sync {
               }
             }
             if (wm.pointsOfInterest) for (const poi of wm.pointsOfInterest.allObjects) {
-              if (poi.isDiscovered) mapData.pois.push({ poiId: poi.id });
+              if (poi.isDiscovered) {
+                const poiData = { poiId: poi.id };
+                if (poi.discoveryModifiers) {
+                  const mods = [];
+                  for (const mod of poi.discoveryModifiers) {
+                    if (typeof mod.movesLeft === 'number') mods.push({ id: mod.id, movesLeft: mod.movesLeft });
+                  }
+                  if (mods.length > 0) poiData.discoveryMods = mods;
+                }
+                if (poi.fastTravel && typeof poi.fastTravel.isUnlocked === 'boolean') {
+                  poiData.fastTravelUnlocked = poi.fastTravel.isUnlocked;
+                }
+                mapData.pois.push(poiData);
+              }
             }
             if (wm._playerPosition) mapData.playerPos = { q: wm._playerPosition.q, r: wm._playerPosition.r };
             maps.push(mapData);
@@ -5406,6 +5644,177 @@ class Sync {
         if (isRead) read.push(book.id);
       }
       snapshot.lore = { read };
+    }
+
+    // Ancient relics (which relics have been found per set)
+    if (game.ancientRelics) {
+      const relics = [];
+      try {
+        for (const set of game.ancientRelics.allObjects) {
+          if (set.foundRelics) {
+            for (const [relic, count] of set.foundRelics) {
+              relics.push({ setId: set.id, relicId: relic.id, count });
+            }
+          }
+        }
+      } catch { /* noop */ }
+      snapshot.ancientRelics = relics;
+    }
+
+    // Skill trees (unlocked nodes + points per tree)
+    const skillTrees = [];
+    try {
+      for (const skill of game.skills.allObjects) {
+        if (skill.skillTrees) {
+          for (const tree of skill.skillTrees.allObjects) {
+            const nodes = [];
+            if (tree.unlockedNodes) for (const n of tree.unlockedNodes) nodes.push(n.id);
+            skillTrees.push({ skillId: skill.id, treeId: tree.id, points: tree._points, nodes });
+          }
+        }
+      }
+    } catch { /* noop */ }
+    if (skillTrees.length > 0) snapshot.skillTrees = skillTrees;
+
+    // Skill selections (cooking, woodcutting, firemaking, fishing, thieving, alt magic, fletching, artisan recipes, harvesting, archaeology)
+    const skillSelects = {};
+    try {
+      // Cooking
+      if (game.cooking && game.cooking.selectedRecipes) {
+        const recipes = [];
+        for (const [cat, r] of game.cooking.selectedRecipes) {
+          recipes.push({ catId: cat.id, recipeId: r ? r.id : null });
+        }
+        skillSelects.cooking = { recipes };
+      }
+      // Woodcutting
+      if (game.woodcutting && game.woodcutting.activeTrees) {
+        skillSelects.woodcutting = { trees: [...game.woodcutting.activeTrees].map(t => t.id) };
+      }
+      // Firemaking
+      if (game.firemaking) {
+        skillSelects.firemaking = {
+          recipeId: game.firemaking.selectedRecipe ? game.firemaking.selectedRecipe.id : null,
+          oilId: game.firemaking.selectedOil ? game.firemaking.selectedOil.id : null,
+          bonfireId: game.firemaking.litBonfireRecipe ? game.firemaking.litBonfireRecipe.id : null,
+        };
+      }
+      // Fishing
+      if (game.fishing && game.fishing.selectedAreaFish) {
+        const sel = [];
+        for (const [area, f] of game.fishing.selectedAreaFish) {
+          sel.push({ areaId: area.id, fishId: f ? f.id : null });
+        }
+        skillSelects.fishing = { areaFish: sel };
+      }
+      // Thieving
+      if (game.thieving) {
+        skillSelects.thieving = {
+          areaId: game.thieving.currentArea ? game.thieving.currentArea.id : null,
+          npcId: game.thieving.currentNPC ? game.thieving.currentNPC.id : null,
+        };
+      }
+      // Alt Magic
+      if (game.altMagic) {
+        skillSelects.altMagic = {
+          spellId: game.altMagic.selectedSpell ? game.altMagic.selectedSpell.id : null,
+          smithingRecipeId: game.altMagic.selectedSmithingRecipe ? game.altMagic.selectedSmithingRecipe.id : null,
+          conversionItemId: game.altMagic.selectedConversionItem ? game.altMagic.selectedConversionItem.id : null,
+        };
+      }
+      // Fletching
+      if (game.fletching && game.fletching.setAltRecipes) {
+        const alts = [];
+        for (const [recipe, idx] of game.fletching.setAltRecipes) {
+          alts.push({ recipeId: recipe.id, altIndex: idx });
+        }
+        skillSelects.fletching = { altRecipes: alts };
+      }
+      // Artisan skills (Herblore, Smithing, Crafting, Runecrafting, Fletching)
+      for (const skillName of ['herblore', 'smithing', 'crafting', 'runecrafting', 'fletching']) {
+        const sk = game[skillName];
+        if (!sk || !sk.selectedRecipeInRealm) continue;
+        const recipes = [];
+        for (const [realm, recipe] of sk.selectedRecipeInRealm) {
+          recipes.push({ realmId: realm.id, recipeId: recipe ? recipe.id : null });
+        }
+        skillSelects[skillName] = { artisanRecipes: recipes, selectedRecipeId: sk.selectedRecipe ? sk.selectedRecipe.id : null };
+      }
+      // Harvesting
+      if (game.harvesting) {
+        const veins = [];
+        for (const v of game.harvesting.actions.allObjects) {
+          if (typeof v.currentIntensity === 'number') veins.push({ id: v.id, intensity: v.currentIntensity, max: v.maxIntensity });
+        }
+        skillSelects.harvesting = {
+          veinId: game.harvesting.selectedVein ? game.harvesting.selectedVein.id : null,
+          veins,
+        };
+      }
+      // Archaeology
+      if (game.archaeology) {
+        const ar = game.archaeology;
+        const digSites = [];
+        if (ar.actions) for (const ds of ar.actions.allObjects) {
+          digSites.push({ id: ds.id, mapIndex: ds.selectedMapIndex, tools: (ds.selectedTools || []).map(t => t ? t.id : null) });
+        }
+        const donated = [];
+        if (ar.museum && ar.museum.donatedItems) for (const item of ar.museum.donatedItems) donated.push(item.id);
+        const museumRewards = [];
+        if (ar.museum && ar.museum.rewards) for (const rw of ar.museum.rewards.allObjects) {
+          if (rw.awarded) museumRewards.push(rw.id);
+        }
+        skillSelects.archaeology = { digSites, donatedItems: donated, museumRewards };
+      }
+    } catch { /* noop */ }
+    if (Object.keys(skillSelects).length > 0) snapshot.skillSelects = skillSelects;
+
+    // Current realm selection
+    if (game.currentRealm) {
+      snapshot.currentRealmId = game.currentRealm.id;
+    }
+
+    // Equipment set count (number of unlocked equipment set slots)
+    if (game.combat && game.combat.player) {
+      snapshot.numEquipSets = game.combat.player.numEquipSets;
+    }
+
+    // Cooking stockpiles
+    if (game.cooking && game.cooking.stockpileItems) {
+      const stockpiles = [];
+      try {
+        for (const [cat, iq] of game.cooking.stockpileItems) {
+          stockpiles.push({ catId: cat.id, itemId: iq.item ? iq.item.id : null, qty: iq.quantity || 0 });
+        }
+      } catch { /* noop */ }
+      snapshot.cookingStockpiles = stockpiles;
+    }
+
+    // Slayer task category completions
+    if (game.slayer) {
+      const slayerCats = [];
+      try {
+        if (game.slayer.actions) for (const cat of game.slayer.actions.allObjects) {
+          slayerCats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
+        }
+      } catch { /* noop */ }
+      snapshot.slayerCategories = slayerCats;
+    }
+
+    // Game settings (gameplay-affecting only)
+    if (game.settings) {
+      const s = game.settings;
+      snapshot.settings = {
+        continueIfBankFull: s.continueIfBankFull,
+        continueThievingOnStun: s.continueThievingOnStun,
+        autoRestartDungeon: s.autoRestartDungeon,
+        enableAutoSlayer: s.enableAutoSlayer,
+        enableAutoEquipFood: s.enableAutoEquipFood,
+        enableAutoSwapFood: s.enableAutoSwapFood,
+        enablePerfectCooking: s.enablePerfectCooking,
+        enablePermaCorruption: s.enablePermaCorruption,
+        enableOfflineCombat: s.enableOfflineCombat,
+      };
     }
 
     logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots, ${mastery.length} mastery skills, combat: ${combatState ? 'yes' : 'no'}`);
@@ -5855,6 +6264,162 @@ class Sync {
       if (msg.lore) {
         this._applyLore(msg.lore);
         this._applyingRemote = true;
+      }
+      // Ancient relics from snapshot
+      if (msg.ancientRelics) {
+        this._applyAncientRelic({ relics: msg.ancientRelics });
+      }
+      // Skill trees from snapshot
+      if (msg.skillTrees) {
+        this._applySkillTree({ trees: msg.skillTrees });
+      }
+      // Skill selections from snapshot
+      if (msg.skillSelects) {
+        const ss = msg.skillSelects;
+        try {
+          if (ss.cooking && game.cooking) {
+            for (const r of ss.cooking.recipes || []) {
+              const cat = game.cooking.categories.getObjectByID(r.catId);
+              if (!cat) continue;
+              const recipe = r.recipeId ? game.cooking.actions.getObjectByID(r.recipeId) : null;
+              if (recipe) game.cooking.selectedRecipes.set(cat, recipe);
+            }
+          }
+          if (ss.woodcutting && game.woodcutting) {
+            game.woodcutting.activeTrees.clear();
+            for (const tid of ss.woodcutting.trees || []) {
+              const tree = game.woodcutting.actions.getObjectByID(tid);
+              if (tree) game.woodcutting.activeTrees.add(tree);
+            }
+          }
+          if (ss.firemaking && game.firemaking) {
+            if (ss.firemaking.recipeId) game.firemaking.selectedRecipe = game.firemaking.actions.getObjectByID(ss.firemaking.recipeId);
+            if (ss.firemaking.oilId) game.firemaking.selectedOil = game.items.getObjectByID(ss.firemaking.oilId);
+            if (ss.firemaking.bonfireId) game.firemaking.litBonfireRecipe = game.firemaking.actions.getObjectByID(ss.firemaking.bonfireId);
+          }
+          if (ss.fishing && game.fishing) {
+            for (const af of ss.fishing.areaFish || []) {
+              const area = game.fishing.actions.getObjectByID(af.areaId);
+              if (!area) continue;
+              const f = af.fishId ? game.fishing.actions.getObjectByID(af.fishId) : null;
+              if (f) game.fishing.selectedAreaFish.set(area, f);
+            }
+          }
+          if (ss.thieving && game.thieving) {
+            if (ss.thieving.areaId) game.thieving.currentArea = game.thieving.actions.getObjectByID(ss.thieving.areaId);
+            if (ss.thieving.npcId) game.thieving.currentNPC = game.thieving.actions.getObjectByID(ss.thieving.npcId);
+          }
+          if (ss.altMagic && game.altMagic) {
+            if (ss.altMagic.spellId) game.altMagic.selectedSpell = game.altMagic.actions.getObjectByID(ss.altMagic.spellId);
+            if (ss.altMagic.smithingRecipeId) game.altMagic.selectedSmithingRecipe = game.smithing.actions.getObjectByID(ss.altMagic.smithingRecipeId);
+            if (ss.altMagic.conversionItemId) game.altMagic.selectedConversionItem = game.items.getObjectByID(ss.altMagic.conversionItemId);
+          }
+          if (ss.fletching && game.fletching && game.fletching.setAltRecipes) {
+            for (const a of ss.fletching.altRecipes || []) {
+              const recipe = game.fletching.actions.getObjectByID(a.recipeId);
+              if (recipe) game.fletching.setAltRecipes.set(recipe, a.altIndex);
+            }
+          }
+          // Artisan recipes
+          for (const skillName of ['herblore', 'smithing', 'crafting', 'runecrafting', 'fletching']) {
+            const data = ss[skillName];
+            const sk = game[skillName];
+            if (!data || !sk || !sk.selectedRecipeInRealm) continue;
+            for (const ar of data.artisanRecipes || []) {
+              const realm = game.realms.getObjectByID(ar.realmId);
+              if (!realm) continue;
+              const recipe = ar.recipeId ? sk.actions.getObjectByID(ar.recipeId) : null;
+              if (recipe) sk.selectedRecipeInRealm.set(realm, recipe);
+            }
+            if (data.selectedRecipeId) sk.selectedRecipe = sk.actions.getObjectByID(data.selectedRecipeId);
+          }
+          // Harvesting
+          if (ss.harvesting && game.harvesting) {
+            if (ss.harvesting.veinId) game.harvesting.selectedVein = game.harvesting.actions.getObjectByID(ss.harvesting.veinId);
+            for (const v of ss.harvesting.veins || []) {
+              const vein = game.harvesting.actions.getObjectByID(v.id);
+              if (vein) { vein.currentIntensity = v.intensity; vein.maxIntensity = v.max; }
+            }
+          }
+          // Archaeology
+          if (ss.archaeology && game.archaeology) {
+            const ar = game.archaeology;
+            for (const ds of ss.archaeology.digSites || []) {
+              const digSite = ar.actions.getObjectByID(ds.id);
+              if (!digSite) continue;
+              if (typeof ds.mapIndex === 'number') digSite.selectedMapIndex = ds.mapIndex;
+              if (ds.tools) digSite.selectedTools = ds.tools.map(tid => tid ? game.items.getObjectByID(tid) : null).filter(Boolean);
+            }
+            if (ar.museum && ar.museum.donatedItems) {
+              for (const itemId of ss.archaeology.donatedItems || []) {
+                const item = game.items.getObjectByID(itemId);
+                if (item) ar.museum.donatedItems.add(item);
+              }
+            }
+            if (ar.museum && ar.museum.rewards) {
+              for (const rwId of ss.archaeology.museumRewards || []) {
+                const rw = ar.museum.rewards.getObjectByID(rwId);
+                if (rw) rw.awarded = true;
+              }
+            }
+          }
+        } catch (e) { logger.warn('applySkillSelects snapshot failed', e); }
+      }
+      // Current realm from snapshot
+      if (msg.currentRealmId && game.realms) {
+        try {
+          const realm = game.realms.getObjectByID(msg.currentRealmId);
+          if (realm && game.currentRealm !== realm) {
+            game.selectRealm(realm);
+          }
+        } catch { /* noop */ }
+      }
+      // Equipment set count from snapshot
+      if (typeof msg.numEquipSets === 'number' && game.combat && game.combat.player) {
+        try {
+          // Only increase, never decrease
+          const current = game.combat.player.numEquipSets || 0;
+          if (msg.numEquipSets > current) {
+            game.combat.player.numEquipSets = msg.numEquipSets;
+          }
+        } catch { /* noop */ }
+      }
+      // Cooking stockpiles from snapshot
+      if (msg.cookingStockpiles && game.cooking && game.cooking.stockpileItems) {
+        try {
+          for (const sp of msg.cookingStockpiles) {
+            const cat = game.cooking.categories.getObjectByID(sp.catId);
+            if (!cat) continue;
+            const item = sp.itemId ? game.items.getObjectByID(sp.itemId) : null;
+            if (item) game.cooking.stockpileItems.set(cat, { item, quantity: sp.qty });
+          }
+        } catch { /* noop */ }
+      }
+      // Slayer category completions from snapshot
+      if (msg.slayerCategories && game.slayer) {
+        try {
+          for (const sc of msg.slayerCategories) {
+            const cat = game.slayer.actions.getObjectByID(sc.catId);
+            if (cat && typeof sc.tasksCompleted === 'number') {
+              cat.tasksCompleted = Math.max(cat.tasksCompleted || 0, sc.tasksCompleted);
+            }
+          }
+        } catch { /* noop */ }
+      }
+      // Game settings from snapshot
+      if (msg.settings && game.settings) {
+        try {
+          const s = game.settings;
+          if (typeof msg.settings.continueIfBankFull === 'boolean') s.continueIfBankFull = msg.settings.continueIfBankFull;
+          if (typeof msg.settings.continueThievingOnStun === 'boolean') s.continueThievingOnStun = msg.settings.continueThievingOnStun;
+          if (typeof msg.settings.autoRestartDungeon === 'boolean') s.autoRestartDungeon = msg.settings.autoRestartDungeon;
+          if (typeof msg.settings.enableAutoSlayer === 'boolean') s.enableAutoSlayer = msg.settings.enableAutoSlayer;
+          if (typeof msg.settings.enableAutoEquipFood === 'boolean') s.enableAutoEquipFood = msg.settings.enableAutoEquipFood;
+          if (typeof msg.settings.enableAutoSwapFood === 'boolean') s.enableAutoSwapFood = msg.settings.enableAutoSwapFood;
+          if (typeof msg.settings.enablePerfectCooking === 'boolean') s.enablePerfectCooking = msg.settings.enablePerfectCooking;
+          if (typeof msg.settings.enablePermaCorruption === 'boolean') s.enablePermaCorruption = msg.settings.enablePermaCorruption;
+          if (typeof msg.settings.enableOfflineCombat === 'boolean') s.enableOfflineCombat = msg.settings.enableOfflineCombat;
+        } catch { /* noop */ }
       }
       // Refresh completion log after all state applied
       if (game.completion && typeof game.completion.updateAllCompletion === 'function') {
@@ -6435,6 +7000,11 @@ class Sync {
       [Msg.LEVEL_CAP]: (m) => this._applyLevelCaps(m),
       [Msg.GAME_STATE]: (m) => this._applyGameState(m),
       [Msg.LORE]: (m) => this._applyLore(m),
+      [Msg.REALM]: (m) => this._applyRealmSelection(m),
+      [Msg.SLAYER_CAT]: (m) => this._applySlayerCategories(m),
+      [Msg.COOKING_STOCKPILE]: (m) => this._applyCookingStockpile(m),
+      [Msg.EQUIP_SET_COUNT]: (m) => this._applyEquipSetCount(m),
+      [Msg.SETTINGS]: (m) => this._applyGameSettings(m),
       [Msg.STATE_REQUEST]: () => this.transport.send(this._buildSnapshot()),
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
       [Msg.UNLOCK_ALL]: () => this._unlockAll(),
