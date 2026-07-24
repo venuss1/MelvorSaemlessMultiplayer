@@ -2121,6 +2121,7 @@ class Sync {
         // Sync monster if different — use selectMonster for proper setup
         if (msg.monsterId) {
           const monster = game.monsters.getObjectByID(msg.monsterId);
+          logger.info(`[COMBAT] State sync: monster=${msg.monsterId}, found=${!!monster}, current=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, areaId=${msg.areaId}`);
           if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId)) {
             try {
               // Find the area this monster belongs to
@@ -2132,8 +2133,9 @@ class Sync {
                     || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
                     || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
               }
+              logger.info(`[COMBAT] Area from areaId: ${area ? area.id : 'not found'}`);
               // If no area found, try to find it from the monster
-              if (!area && monster._area) area = monster._area;
+              if (!area && monster._area) { area = monster._area; logger.info(`[COMBAT] Area from monster._area: ${area.id}`); }
               if (!area) {
                 // Search all combat areas for this monster
                 if (game.combatAreas && game.combatAreas.allObjects) {
@@ -2146,16 +2148,21 @@ class Sync {
                     if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
                   }
                 }
+                if (area) logger.info(`[COMBAT] Area from search: ${area.id}`);
               }
               if (area && cm.selectMonster) {
+                logger.info(`[COMBAT] Calling selectMonster(${monster.id}, ${area.id})`);
                 cm.selectMonster(monster, area);
+                logger.info(`[COMBAT] selectMonster done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               } else {
                 // Fallback: manually set up the enemy
+                logger.info(`[COMBAT] Fallback: setNewMonster + spawnEnemy`);
                 cm.enemy.setNewMonster(monster);
                 cm.enemy.initializeForCombat();
                 if (cm.spawnEnemy) cm.spawnEnemy();
+                logger.info(`[COMBAT] Fallback done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               }
-            } catch (e) { logger.warn(`selectMonster failed: ${e.message}`); }
+            } catch (e) { logger.warn(`[COMBAT] selectMonster failed: ${e.message}`); }
           }
         }
         // Sync HP values (override after spawnEnemy sets full HP)
@@ -2190,6 +2197,13 @@ class Sync {
         if (target.renderQueue) {
           target.renderQueue.hitpoints = true;
           target.renderQueue.damageSplash = true;
+        }
+        // If enemy died from remote damage, respawn immediately to prevent
+        // the game's tick loop from processing death (which crashes on slayer rewards)
+        if (msg.target === 'enemy' && target.hitpoints <= 0) {
+          try {
+            if (cm.spawnEnemy) cm.spawnEnemy();
+          } catch (e) { /* skip */ }
         }
         this._renderCombat();
       } else if (msg.kind === 'heal') {
