@@ -4245,7 +4245,7 @@ class Sync {
             tierIndex: m.tier ? m.tier.index : 0,
             upgradeActions: m._upgradeActions || 0,
             charges: m.charges || 0,
-            refinements: (m.refinements || []).map(r => ({ id: r.id, value: r.value })),
+            refinements: (m.refinements || []).map(r => ({ id: r.modifier ? r.modifier.id : null, value: r.value })),
             artefactValues: m.artefactValues ? { tiny: m.artefactValues.tiny || 0, small: m.artefactValues.small || 0, medium: m.artefactValues.medium || 0, large: m.artefactValues.large || 0 } : null,
           });
         }
@@ -4378,11 +4378,12 @@ class Sync {
               try { local.computeTier(); } catch { /* noop */ }
             }
             // Refinements — replace if remote has more
+            // refinements is ModifierValue[] ({ modifier, value }), not { id, value }
             if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
               local.refinements = remote.refinements.map(r => {
-                const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
-                return mod ? { ...mod, value: r.value } : { id: r.id, value: r.value };
-              });
+                const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
+                return modifier ? { modifier, value: r.value } : null;
+              }).filter(Boolean);
             }
             // Artefact values — take max per size to preserve best drops
             if (remote.artefactValues && local.artefactValues) {
