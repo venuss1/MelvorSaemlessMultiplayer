@@ -1,0 +1,13 @@
+{
+  "name": "melvor-idle-real-multiplayer",
+  "version": "0.1.0",
+  "description": "A seamless co-op multiplayer mod for Melvor Idle. Two players share one profile and train different skills in parallel over a peer-to-peer connection.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "melvor-idle-mod-dts": "github:melvor-idle/melvor-idle-mod-dts"
+  }
+}

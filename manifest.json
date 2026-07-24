@@ -1,0 +1,6 @@
+{
+  "namespace": "realMultiplayer",
+  "icon": "assets/icon.svg",
+  "setup": "src/setup.mjs",
+  "load": ["src/ui/styles.css"]
+}
