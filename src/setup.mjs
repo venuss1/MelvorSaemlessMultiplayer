@@ -5979,8 +5979,10 @@ class Sync {
         if (ps.prayers && p.activePrayers) {
           p.activePrayers.clear();
           for (const pid of ps.prayers) {
+            // game.prayers is NamespaceRegistry<ActivePrayer>, so getObjectByID
+            // already returns an ActivePrayer — no wrapper needed.
             const prayer = game.prayers.getObjectByID(pid);
-            if (prayer) { try { p.activePrayers.add(new ActivePrayer(prayer)); } catch { /* noop */ } }
+            if (prayer) { try { p.activePrayers.add(prayer); } catch { /* noop */ } }
           }
         }
         if (ps.food && p.food && p.food.slots) {
@@ -5994,9 +5996,12 @@ class Sync {
           }
           if (typeof ps.selectedFoodSlot === 'number') p.food.selectedSlot = ps.selectedFoodSlot;
         }
+        // attackStyles is { melee?, ranged?, magic? } of AttackStyle
         if (ps.attackStyles && p.attackStyles) {
           for (const a of ps.attackStyles) {
-            if (a.set < p.attackStyles.length) p.attackStyles[a.set] = a.style;
+            if (!a.attackType) continue;
+            const style = a.styleId ? game.attackStyles.getObjectByID(a.styleId) : undefined;
+            if (style) p.attackStyles[a.attackType] = style;
           }
         }
         if (typeof ps.selectedSet === 'number') p.selectedEquipmentSet = ps.selectedSet;
