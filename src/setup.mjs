@@ -4072,8 +4072,17 @@ class Sync {
       }
       const casual = [];
       if (tw.casualTasks && tw.casualTasks.currentCasualTasks) {
+        // TownshipCasualTask has no .progress/.completed directly —
+        // progress is on each goal in t.goals.allGoals. Sync per-goal
+        // progress so the receiver can update each goal's _progress.
         for (const t of tw.casualTasks.currentCasualTasks) {
-          casual.push({ id: t.id, progress: t.progress, completed: t.completed });
+          const goals = [];
+          if (t.goals && t.goals.allGoals) {
+            for (const g of t.goals.allGoals) {
+              goals.push({ progress: g.progress || 0 });
+            }
+          }
+          casual.push({ id: t.id, goals });
         }
       }
       this.transport.send({
@@ -4110,9 +4119,18 @@ class Sync {
         tw.casualTasks.casualTasksCompleted = msg.casualTasksCompleted;
       }
       if (msg.casual && tw.casualTasks && tw.casualTasks.currentCasualTasks) {
+        // TownshipCasualTask has no .progress/.completed — progress is
+        // per-goal in task.goals.allGoals. Use setProgress() if available.
         for (const c of msg.casual) {
           const task = tw.casualTasks.currentCasualTasks.find(t => t.id === c.id);
-          if (task) { task.progress = c.progress; task.completed = c.completed; }
+          if (!task || !task.goals || !task.goals.allGoals) continue;
+          for (let i = 0; i < (c.goals || []).length && i < task.goals.allGoals.length; i++) {
+            const goal = task.goals.allGoals[i];
+            const progress = c.goals[i].progress;
+            if (typeof progress === 'number' && typeof goal.setProgress === 'function') {
+              try { goal.setProgress(progress); } catch { /* skip */ }
+            }
+          }
         }
       }
     } catch (e) { logger.error('applyTownshipTasks failed', e); }
