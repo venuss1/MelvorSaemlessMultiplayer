@@ -2055,7 +2055,7 @@ class Sync {
         kind: 'state',
         paused: cm.paused,
         monsterId: enemy.monster ? enemy.monster.id : null,
-        areaId: cm.selectedMonster ? (cm.selectedMonster._area ? cm.selectedMonster._area.id : null) : null,
+        areaId: cm._rmpSelectedArea ? cm._rmpSelectedArea.id : null,
         enemyHp: enemy.hitpoints,
         enemyMaxHp: enemy.stats ? enemy.stats.maxHitpoints : 0,
         playerHp: player.hitpoints,
@@ -2133,15 +2133,20 @@ class Sync {
 
     // Patch selectMonster — sync monster selection AND claim combat
     if (typeof CombatManager.prototype.selectMonster === 'function') {
+      // Capture the area from selectMonster's arguments (before patch)
+      this.ctx.patch(CombatManager, 'selectMonster').before(function (monster, area) {
+        // Store the area on the combat manager for later use
+        this._rmpSelectedArea = area || null;
+      });
       this.ctx.patch(CombatManager, 'selectMonster').after(function () {
         // Local player selected a monster — claim combat ownership
         if (!sync._applyingRemote) {
           sync._combatOwner = 'me';
           const cm = game.combat;
           const monsterId = cm.enemy.monster ? cm.enemy.monster.id : null;
-          const areaId = cm.selectedArea ? cm.selectedArea.id : null;
+          const areaId = cm._rmpSelectedArea ? cm._rmpSelectedArea.id : null;
           sync.transport.send({ t: Msg.COMBAT_CLAIM, monsterId, areaId });
-          logger.info(`[COMBAT] Claimed combat: ${monsterId}`);
+          logger.info(`[COMBAT] Claimed combat: ${monsterId}, area: ${areaId}`);
         }
         sendCombatState();
       });
