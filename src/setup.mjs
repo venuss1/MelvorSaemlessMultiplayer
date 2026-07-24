@@ -944,14 +944,12 @@ class Sync {
       sync.transport.send({ t: Msg.PLAYER_STATE, attackStyles });
     };
     // Patch Player class prototype (works even if player instance not ready yet)
-    for (const m of ['setAttackStyle', 'changeAttackStyle']) {
-      if (Player.prototype && typeof Player.prototype[m] === 'function') {
-        this.ctx.patch(Player, m).after(function () { sendAttackStyles(); });
-      }
+    if (Player.prototype && typeof Player.prototype.setAttackStyle === 'function') {
+      this.ctx.patch(Player, 'setAttackStyle').after(function () { sendAttackStyles(); });
     }
 
     // --- Prayer/soul points changes (combat) ---
-    for (const m of ['spendPrayerPoints', 'addPrayerPoints', 'spendSoulPoints', 'addSoulPoints']) {
+    for (const m of ['consumePrayerPoints', 'addPrayerPoints', 'consumeSoulPoints', 'addSoulPoints']) {
       if (Player.prototype && typeof Player.prototype[m] === 'function') {
         this.ctx.patch(Player, m).after(function () { sendPrayers(); });
       }
@@ -2258,10 +2256,10 @@ class Sync {
           if (!recipe) continue;
           const current = su.marksUnlocked.get(recipe) || 0;
           // Only credit new mark discoveries via the game method so that
-          // discovery side-effects (XP/rewards) fire. If the remote count is
-          // lower or equal, just set the map directly.
+          // discovery side-effects (XP/rewards) fire. discoverMark takes
+          // only the recipe (not a count) — call it once per new discovery.
           if (m.count > current && typeof su.discoverMark === 'function') {
-            try { su.discoverMark(recipe, m.count - current); }
+            try { su.discoverMark(recipe); su.marksUnlocked.set(recipe, m.count); }
             catch (e) { su.marksUnlocked.set(recipe, m.count); }
           } else {
             su.marksUnlocked.set(recipe, m.count);
@@ -2582,7 +2580,7 @@ class Sync {
           const s = game.fishing;
           if (!s || !msg.areaFish) break;
           for (const af of msg.areaFish) {
-            const area = s.actions.getObjectByID(af.areaId) || s.fishingAreas?.getObjectByID(af.areaId);
+            const area = s.actions.getObjectByID(af.areaId) || s.areas?.getObjectByID(af.areaId);
             if (!area) continue;
             const f = af.fishId ? s.actions.getObjectByID(af.fishId) : null;
             if (f) s.selectedAreaFish.set(area, f);
@@ -4706,34 +4704,41 @@ class Sync {
   }
 
   // ---- Slayer task category completions sync -----------------------------
+  // SlayerTaskCategory has no public method that increments tasksCompleted;
+  // it's incremented internally by SlayerTask.selectTask. We piggyback on
+  // the existing SlayerTask patches (selectTask, addKill) to broadcast
+  // category completions whenever the slayer task state changes.
   _patchSlayerCategories() {
-    if (!game.slayer || !game.slayer.actions) return;
+    if (!game.combat || !game.combat.slayerTask) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const cats = [];
       try {
-        for (const cat of game.slayer.actions.allObjects) {
+        const task = game.combat.slayerTask;
+        if (task.categories) for (const cat of task.categories.allObjects) {
           cats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
         }
       } catch { /* noop */ }
       this.transport.send({ t: Msg.SLAYER_CAT, cats });
     };
-    // Patch the method that completes slayer tasks (increments tasksCompleted)
-    if (typeof SlayerTaskCategory !== 'undefined' && SlayerTaskCategory.prototype) {
-      for (const m of ['onTaskCompletion', 'completeTask', 'incrementCompletion']) {
-        if (typeof SlayerTaskCategory.prototype[m] === 'function') {
-          this.ctx.patch(SlayerTaskCategory, m).after(() => send());
+    // Piggyback on SlayerTask methods that are called when tasks complete
+    if (typeof SlayerTask !== 'undefined' && SlayerTask.prototype) {
+      for (const m of ['selectTask', 'addKill', 'clickNewTask']) {
+        if (typeof SlayerTask.prototype[m] === 'function') {
+          this.ctx.patch(SlayerTask, m).after(() => send());
         }
       }
     }
   }
 
   _applySlayerCategories(msg) {
-    if (!msg.cats || !game.slayer || !game.slayer.actions) return;
+    if (!msg.cats || !game.combat || !game.combat.slayerTask) return;
     this._applyingRemote = true;
     try {
+      const task = game.combat.slayerTask;
+      if (!task.categories) return;
       for (const c of msg.cats) {
-        const cat = game.slayer.actions.getObjectByID(c.catId);
+        const cat = task.categories.getObjectByID(c.catId);
         if (cat && typeof c.tasksCompleted === 'number') {
           cat.tasksCompleted = Math.max(cat.tasksCompleted || 0, c.tasksCompleted);
         }
@@ -4757,7 +4762,7 @@ class Sync {
     };
     // Patch methods that modify stockpiles
     if (typeof Cooking !== 'undefined' && Cooking.prototype) {
-      for (const m of ['addStockpile', 'removeStockpile', 'setStockpile', 'addStockpileItem', 'removeStockpileItem']) {
+      for (const m of ['addItemToStockpile', 'onCollectStockpileClick']) {
         if (typeof Cooking.prototype[m] === 'function') {
           this.ctx.patch(Cooking, m).after(() => send());
         }
@@ -4796,13 +4801,9 @@ class Sync {
         this.transport.send({ t: Msg.EQUIP_SET_COUNT, count: n });
       }
     };
-    // Patch the method that adds equipment set slots (purchased via shop)
-    if (typeof Player !== 'undefined' && Player.prototype) {
-      for (const m of ['addEquipSet', 'addEquipmentSet', 'increaseEquipSets']) {
-        if (typeof Player.prototype[m] === 'function') {
-          this.ctx.patch(Player, m).after(() => send());
-        }
-      }
+    // Patch the method that updates equipment set count (via shop modifier)
+    if (typeof Player !== 'undefined' && Player.prototype && typeof Player.prototype.updateEquipmentSets === 'function') {
+      this.ctx.patch(Player, 'updateEquipmentSets').after(() => send());
     }
   }
 
@@ -4841,7 +4842,7 @@ class Sync {
     };
     // Patch the Settings class methods that change settings
     if (typeof Settings !== 'undefined' && Settings.prototype) {
-      for (const m of ['set', 'update', 'setSetting', 'toggle']) {
+      for (const m of ['toggleSetting', 'setTogglesChecked', 'changeChoiceSetting']) {
         if (typeof Settings.prototype[m] === 'function') {
           this.ctx.patch(Settings, m).after(() => send());
         }
@@ -5791,10 +5792,10 @@ class Sync {
     }
 
     // Slayer task category completions
-    if (game.slayer) {
+    if (game.combat && game.combat.slayerTask && game.combat.slayerTask.categories) {
       const slayerCats = [];
       try {
-        if (game.slayer.actions) for (const cat of game.slayer.actions.allObjects) {
+        for (const cat of game.combat.slayerTask.categories.allObjects) {
           slayerCats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
         }
       } catch { /* noop */ }
@@ -6396,10 +6397,10 @@ class Sync {
         } catch { /* noop */ }
       }
       // Slayer category completions from snapshot
-      if (msg.slayerCategories && game.slayer) {
+      if (msg.slayerCategories && game.combat && game.combat.slayerTask && game.combat.slayerTask.categories) {
         try {
           for (const sc of msg.slayerCategories) {
-            const cat = game.slayer.actions.getObjectByID(sc.catId);
+            const cat = game.combat.slayerTask.categories.getObjectByID(sc.catId);
             if (cat && typeof sc.tasksCompleted === 'number') {
               cat.tasksCompleted = Math.max(cat.tasksCompleted || 0, sc.tasksCompleted);
             }
