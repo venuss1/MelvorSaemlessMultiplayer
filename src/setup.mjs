@@ -105,7 +105,35 @@ const decode = (data) => {
 // them and relays messages. This works through any firewall that allows
 // HTTPS (which is essentially all of them).
 
-const DEFAULT_SERVER = 'wss://northwest-remarks-dial-univ.trycloudflare.com';
+const DEFAULT_SERVER = 'wss://preliminary-proprietary-positioning-simpson.trycloudflare.com';
+
+/** Get the saved server URL from localStorage, or fall back to DEFAULT_SERVER. */
+function getSavedServerUrl() {
+  try {
+    const saved = localStorage.getItem('rmp_server_url');
+    if (saved && saved.trim()) return saved.trim();
+  } catch { /* noop */ }
+  return DEFAULT_SERVER;
+}
+
+/** Save the server URL to localStorage so it persists across reloads. */
+function saveServerUrl(url) {
+  try { localStorage.setItem('rmp_server_url', url); } catch { /* noop */ }
+}
+
+/** Get the saved player name from localStorage. */
+function getSavedName() {
+  try {
+    const saved = localStorage.getItem('rmp_player_name');
+    if (saved && saved.trim()) return saved.trim();
+  } catch { /* noop */ }
+  return '';
+}
+
+/** Save the player name to localStorage. */
+function saveName(name) {
+  try { localStorage.setItem('rmp_player_name', name); } catch { /* noop */ }
+}
 
 class Transport {
   constructor() {
@@ -4739,11 +4767,11 @@ class Panel {
       </div>
       <div data-rmp="body" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
         <div style="display:flex;gap:6px;align-items:center;">
-          <input class="rmp-input" data-rmp="nameInput" placeholder="Your name" maxlength="16"
+          <input class="rmp-input" data-rmp="nameInput" placeholder="Your name" maxlength="16" value="${getSavedName()}"
             style="flex:1;background:#111827;border:1px solid #4b5563;color:#f3f4f6;border-radius:6px;padding:5px 8px;font-size:12px;outline:none;" />
         </div>
         <div style="display:flex;gap:6px;align-items:center;">
-          <input class="rmp-input" data-rmp="serverInput" value="${DEFAULT_SERVER}" title="WebSocket relay server URL"
+          <input class="rmp-input" data-rmp="serverInput" value="${getSavedServerUrl()}" title="WebSocket relay server URL"
             style="flex:1;background:#111827;border:1px solid #4b5563;color:#f3f4f6;border-radius:6px;padding:5px 8px;font-size:11px;outline:none;font-family:ui-monospace,monospace;" />
         </div>
         <button class="rmp-btn" data-rmp="connectBtn"
@@ -4890,6 +4918,9 @@ class Panel {
       const name = $('nameInput').value.trim() || 'Player';
       const serverUrl = $('serverInput').value.trim();
       if (!serverUrl) { alert('Enter the server URL.'); return; }
+      // Persist the server URL and name so they survive reloads.
+      saveServerUrl(serverUrl);
+      saveName(name);
       $('connectBtn').disabled = true;
       $('connectBtn').textContent = 'Connecting...';
       try {
