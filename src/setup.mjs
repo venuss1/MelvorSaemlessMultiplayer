@@ -1244,24 +1244,25 @@ class Sync {
 
   // ---- Farming sync -----------------------------------------------------
   // Syncs plot unlocks, planted seeds, compost, and growth state.
+  // Uses action-based sync: each action (unlock, plant, compost, harvest)
+  // is sent as a discrete event and replayed on the receiver.
 
   _patchFarming() {
     const farming = game.farming;
     if (!farming) return;
 
-    // Patch all methods that change plot state.
     const sendPlot = function (plot) {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       if (!plot || !plot.id) return;
       sync._sendFarmingPlot(plot);
     };
 
-    // Plot unlock
+    // Plot unlock — sync so both players get unlocked plots
     this.ctx.patch(Farming, 'unlockPlotOnClick').after(function (_ret, plot) {
       sendPlot(plot);
     });
 
-    // Planting seeds
+    // Planting — sync so both players plant the same seeds
     this.ctx.patch(Farming, 'plantPlot').after(function (_ret, plot) {
       sendPlot(plot);
     });
@@ -1288,7 +1289,7 @@ class Sync {
       sync._sendAllFarmingPlots();
     });
 
-    // Harvesting
+    // Harvesting — sync so both players harvest
     this.ctx.patch(Farming, 'harvestPlot').after(function (_ret, plot) {
       sendPlot(plot);
     });
@@ -1300,7 +1301,7 @@ class Sync {
       sync._sendAllFarmingPlots();
     });
 
-    // Compost
+    // Compost — sync so both players compost (weird gloop, abyssal compost, etc.)
     this.ctx.patch(Farming, 'compostPlot').after(function (_ret, plot) {
       sendPlot(plot);
     });
@@ -1374,15 +1375,89 @@ class Sync {
       for (const p of msg.plots) {
         const plot = farming.plots.getObjectByID(p.id);
         if (!plot) continue;
-        if (typeof p.state === 'number') plot.state = p.state;
-        if (p.plantedRecipeId !== undefined) {
-          plot.plantedRecipe = p.plantedRecipeId ? game.items.getObjectByID(p.plantedRecipeId) : undefined;
+
+        // Handle plot unlock: if the plot was unlocked by the other player,
+        // unlock it here too (without charging)
+        if (typeof p.state === 'number' && p.state > 0 && plot.state === 0) {
+          // Plot is unlocked on the other side but locked here — unlock it
+          plot.state = 1; // Empty
+          logger.info(`[FARM] Synced plot unlock: ${p.id}`);
         }
+
+        // Handle planting: if the other player planted, plant here too
+        if (p.plantedRecipeId && p.state >= 2 && plot.state === 1) {
+          // Other player has a crop growing, we're empty — plant it
+          // FarmingRecipe is stored in farming.actions, not game.items
+          let recipe = null;
+          if (game.farming.actions) {
+            recipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+          }
+          if (!recipe && game.farming.actions && game.farming.actions.allObjects) {
+            for (const r of game.farming.actions.allObjects) {
+              if (r.id === p.plantedRecipeId) { recipe = r; break; }
+            }
+          }
+          if (recipe && farming.plantPlot) {
+            try {
+              farming.plantPlot(plot, recipe, false);
+              logger.info(`[FARM] Synced plant: ${p.id} → ${p.plantedRecipeId}`);
+            } catch (e) {
+              // If planting fails (no seeds), just set state directly
+              plot.state = p.state;
+              plot.plantedRecipe = recipe;
+              plot.growthTime = p.growthTime || 0;
+              logger.warn(`[FARM] Plant failed, set state directly: ${p.id}`);
+            }
+          } else {
+            // Fallback: set state directly
+            plot.state = p.state;
+            plot.plantedRecipe = recipe || undefined;
+            plot.growthTime = p.growthTime || 0;
+          }
+        } else {
+          // Just update state directly for other state changes
+          if (typeof p.state === 'number') plot.state = p.state;
+          if (p.plantedRecipeId !== undefined) {
+            // Try actions registry first, then items
+            let plantedRecipe = null;
+            if (game.farming.actions) {
+              plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+            }
+            if (!plantedRecipe && game.items) {
+              plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
+            }
+            plot.plantedRecipe = p.plantedRecipeId ? plantedRecipe : undefined;
+          }
+          if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
+        }
+
+        // Handle compost: sync compost item and level
         if (p.compostItemId !== undefined) {
-          plot.compostItem = p.compostItemId ? game.items.getObjectByID(p.compostItemId) : undefined;
+          const compostItem = p.compostItemId ? game.items.getObjectByID(p.compostItemId) : undefined;
+          if (compostItem) {
+            // Try to apply compost via the game method
+            if (farming.compostPlot && plot.compostLevel < p.compostLevel) {
+              try {
+                const amount = p.compostLevel - plot.compostLevel;
+                farming.compostPlot(plot, compostItem, amount);
+                logger.info(`[FARM] Synced compost: ${p.id} → ${p.compostItemId}, level ${p.compostLevel}`);
+              } catch (e) {
+                // Fallback: set directly
+                plot.compostItem = compostItem;
+                plot.compostLevel = p.compostLevel;
+                logger.warn(`[FARM] Compost failed, set directly: ${p.id}`);
+              }
+            } else {
+              plot.compostItem = compostItem;
+              plot.compostLevel = p.compostLevel;
+            }
+          } else {
+            plot.compostItem = undefined;
+            plot.compostLevel = p.compostLevel || 0;
+          }
         }
-        if (typeof p.compostLevel === 'number') plot.compostLevel = p.compostLevel;
-        if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
+
+        // Sync selected recipe
         if (p.selectedRecipeId !== undefined) {
           plot.selectedRecipe = p.selectedRecipeId ? game.items.getObjectByID(p.selectedRecipeId) : undefined;
         }
@@ -3537,6 +3612,10 @@ class Sync {
         for (const p of msg.farming) {
           const plot = game.farming.plots.getObjectByID(p.id);
           if (!plot) continue;
+          // Unlock plots that are unlocked on the other side
+          if (typeof p.state === 'number' && p.state > 0 && plot.state === 0) {
+            plot.state = 1; // Empty
+          }
           if (typeof p.state === 'number') plot.state = p.state;
           if (p.plantedRecipeId !== undefined) {
             plot.plantedRecipe = p.plantedRecipeId ? game.items.getObjectByID(p.plantedRecipeId) : undefined;
