@@ -2972,6 +2972,7 @@ class Sync {
         areaId: cm._rmpSelectedArea ? cm._rmpSelectedArea.id : null,
         enemyHp: enemy.hitpoints,
         enemyMaxHp: enemy.stats ? enemy.stats.maxHitpoints : 0,
+        enemyBarrier: typeof enemy.barrier === 'number' ? enemy.barrier : 0,
         playerHp: player.hitpoints,
         playerMaxHp: player.stats ? player.stats.maxHitpoints : 0,
         playerStats,
@@ -3085,6 +3086,31 @@ class Sync {
           }
         }
       };
+    }
+
+    // Patch dropEnemyBones, dropBarrierDust, dropSignetHalfB, dropBirthdayPresent
+    // These add items directly to bank (not via CombatLoot), so sync them.
+    for (const m of ['dropEnemyBones', 'dropBarrierDust', 'dropSignetHalfB', 'dropBirthdayPresent']) {
+      if (typeof CombatManager.prototype[m] === 'function') {
+        const orig = CombatManager.prototype[m];
+        CombatManager.prototype[m] = function (...args) {
+          if (sync._combatOwner === 'peer') return; // skip when spectating
+          const bankBefore = new Map();
+          try { for (const [item, bi] of game.bank.items) bankBefore.set(item.id, bi.quantity); } catch { /* skip */ }
+          try { orig.apply(this, args); } catch (e) { /* skip */ }
+          // Sync any items that were added
+          if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
+            try {
+              for (const [item, bi] of game.bank.items) {
+                const before = bankBefore.get(item.id) || 0;
+                if (bi.quantity > before) {
+                  sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: item.id, quantity: bi.quantity - before });
+                }
+              }
+            } catch { /* skip */ }
+          }
+        };
+      }
     }
 
     // Note: When spectating (_combatOwner === 'peer'), the local game still
@@ -3204,6 +3230,9 @@ class Sync {
         // Monster selection is handled by COMBAT_CLAIM, not state sync
         if (msg.enemyHp !== undefined && cm.enemy) {
           cm.enemy.hitpoints = msg.enemyHp;
+        }
+        if (msg.enemyBarrier !== undefined && cm.enemy && 'barrier' in cm.enemy) {
+          cm.enemy.barrier = msg.enemyBarrier;
         }
         if (msg.playerHp !== undefined && cm.player) {
           cm.player.hitpoints = msg.playerHp;
@@ -3762,6 +3791,19 @@ class Sync {
       loadout.negModsSelected = r.negModsSelected;
       loadout.isPaused = r.isPaused;
       loadout.isFightingITMBoss = r.isFightingITMBoss;
+      // Item selection state (when choosing items during raid)
+      const itemSelection = {};
+      if (r.itemSelection) {
+        for (const [cat, items] of Object.entries(r.itemSelection)) {
+          itemSelection[cat] = items ? items.map(it => it ? it.id : null) : [];
+        }
+      }
+      const exclusiveItemSelection = {};
+      if (r.exclusiveItemSelection) {
+        for (const [cat, items] of Object.entries(r.exclusiveItemSelection)) {
+          exclusiveItemSelection[cat] = items ? items.map(it => it ? it.id : null) : [];
+        }
+      }
       this.transport.send({
         t: Msg.RAID,
         wave: r.wave,
@@ -3771,6 +3813,11 @@ class Sync {
           : (r.selectedDifficulty && r.selectedDifficulty.id != null ? r.selectedDifficulty.id : null),
         history,
         loadout,
+        itemSelection,
+        exclusiveItemSelection,
+        itemCategoryBeingSelected: r.itemCategoryBeingSelected || null,
+        isSelectingPositiveModifier: r.isSelectingPositiveModifier || false,
+        randomModifiersBeingSelected: (r.randomModifiersBeingSelected || []).map(m => ({ id: m.id, value: m.value })),
       });
     };
     for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'endRaid', 'nextWave', 'equipItem', 'equipFood', 'selectPassive', 'pause', 'unpause']) {
@@ -3861,6 +3908,25 @@ class Sync {
           });
         }
         if (r.render) try { r.render(); } catch { /* noop */ }
+      }
+      // Item selection state (for raid item choosing UI)
+      if (msg.itemSelection && r.itemSelection) {
+        for (const [cat, ids] of Object.entries(msg.itemSelection)) {
+          r.itemSelection[cat] = ids.map(id => id ? game.items.getObjectByID(id) : null).filter(Boolean);
+        }
+      }
+      if (msg.exclusiveItemSelection && r.exclusiveItemSelection) {
+        for (const [cat, ids] of Object.entries(msg.exclusiveItemSelection)) {
+          r.exclusiveItemSelection[cat] = ids.map(id => id ? game.items.getObjectByID(id) : null).filter(Boolean);
+        }
+      }
+      if (msg.itemCategoryBeingSelected !== undefined) r.itemCategoryBeingSelected = msg.itemCategoryBeingSelected;
+      if (typeof msg.isSelectingPositiveModifier === 'boolean') r.isSelectingPositiveModifier = msg.isSelectingPositiveModifier;
+      if (msg.randomModifiersBeingSelected) {
+        r.randomModifiersBeingSelected = msg.randomModifiersBeingSelected.map(m => {
+          const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+          return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
+        });
       }
     } catch (e) { logger.error('applyRaid failed', e); }
     finally { this._applyingRemote = false; }
@@ -4867,6 +4933,7 @@ class Sync {
         monsterId: game.combat.enemy.monster ? game.combat.enemy.monster.id : null,
         enemyHp: game.combat.enemy.hitpoints,
         enemyMaxHp: game.combat.enemy.stats ? game.combat.enemy.stats.maxHitpoints : 0,
+        enemyBarrier: typeof game.combat.enemy.barrier === 'number' ? game.combat.enemy.barrier : 0,
         playerHp: game.combat.player ? game.combat.player.hitpoints : 0,
         playerMaxHp: game.combat.player && game.combat.player.stats ? game.combat.player.stats.maxHitpoints : 0,
         paused: game.combat.paused,
@@ -5494,6 +5561,9 @@ class Sync {
         if (typeof cs.enemyHp === 'number' && game.combat.enemy) {
           game.combat.enemy.hitpoints = cs.enemyHp;
           if (game.combat.enemy.renderHitpoints) game.combat.enemy.renderHitpoints();
+        }
+        if (typeof cs.enemyBarrier === 'number' && game.combat.enemy && 'barrier' in game.combat.enemy) {
+          game.combat.enemy.barrier = cs.enemyBarrier;
         }
         if (typeof cs.playerHp === 'number' && game.combat.player) {
           game.combat.player.hitpoints = cs.playerHp;
