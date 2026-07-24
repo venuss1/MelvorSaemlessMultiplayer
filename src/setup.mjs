@@ -82,12 +82,17 @@ const Msg = Object.freeze({
   CARTOGRAPHY: 'cartography',
   STATS: 'stats',
   COMBAT_EVENT: 'combat_event',
+  COMBAT_EVENT_STATE: 'combat_event_state', // CombatEvent system (Into the Mist, etc.)
   COMBAT_CLAIM: 'combat_claim',     // { monsterId, areaId } — I'm fighting this
   COMBAT_RELEASE: 'combat_release', // {} — I stopped fighting
   COMBAT_LOOT: 'combat_loot',       // { drops: [{itemId, qty}], currency: {gp, sc, ...} }
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
   UNLOCK_ALL: 'unlock_all',
+  LEVEL_CAP: 'level_cap',           // skill level cap increases purchased
+  GAME_STATE: 'game_state',         // tickTimestamp, merchantsPermitRead, pause, etc.
+  LORE: 'lore',                     // lore books read
+  ASTROLOGY_SELECT: 'astro_select', // studied/explored constellation
 });
 const encode = (msg) => JSON.stringify(msg);
 const decode = (data) => {
@@ -433,6 +438,7 @@ class Sync {
       ['PlayerState', () => this._patchPlayerState()],
       ['CombatAreas', () => this._patchCombatAreas()],
       ['CombatEvents', () => this._patchCombatEvents()],
+      ['CombatEventSystem', () => this._patchCombatEventSystem()],
       ['AncientRelics', () => this._patchAncientRelics()],
       ['SkillTree', () => this._patchSkillTree()],
       ['Township', () => this._patchTownship()],
@@ -2580,6 +2586,93 @@ class Sync {
     finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
+  // ---- Combat Event system sync (Into the Mist, Spider Lair, etc.) ------
+  // These are special timed events with stages, passives, and slayer areas.
+  // The CombatManager tracks activeEvent, eventProgress, eventPassives, etc.
+  _patchCombatEventSystem() {
+    const cm = game.combat;
+    if (!cm) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      this._sendCombatEventState();
+    };
+    for (const m of ['startEvent', 'stopEvent', 'increaseEventProgress', 'onPassiveSelection', 'computeAvailableEventPassives']) {
+      if (typeof CombatManager.prototype[m] === 'function') {
+        this.ctx.patch(CombatManager, m).after(() => send());
+      }
+    }
+  }
+
+  _sendCombatEventState() {
+    const cm = game.combat;
+    if (!cm) return;
+    const data = {
+      t: Msg.COMBAT_EVENT_STATE,
+      activeEventId: cm.activeEvent ? cm.activeEvent.id : null,
+      eventProgress: cm.eventProgress,
+      eventDungeonLength: cm.eventDungeonLength,
+      eventPassives: (cm.eventPassives || []).map(p => p.id),
+      availableEventPassives: (cm.availableEventPassives || []).map(p => p.id),
+      eventPassivesBeingSelected: (cm.eventPassivesBeingSelected ? [...cm.eventPassivesBeingSelected] : []).map(p => p.id),
+      shouldResetEvent: cm.shouldResetEvent,
+      activeEventAreas: [],
+    };
+    if (cm.activeEventAreas) {
+      for (const [area, count] of cm.activeEventAreas) {
+        if (area && area.id) data.activeEventAreas.push({ areaId: area.id, count });
+      }
+    }
+    this.transport.send(data);
+  }
+
+  _applyCombatEventState(msg) {
+    const cm = game.combat;
+    if (!cm) return;
+    this._applyingRemote = true;
+    try {
+      if (msg.activeEventId !== undefined) {
+        if (msg.activeEventId === null) {
+          cm.activeEvent = undefined;
+        } else {
+          const evt = game.combatEvents && game.combatEvents.getObjectByID(msg.activeEventId);
+          if (evt) cm.activeEvent = evt;
+        }
+      }
+      if (typeof msg.eventProgress === 'number') cm.eventProgress = msg.eventProgress;
+      if (typeof msg.eventDungeonLength === 'number') cm.eventDungeonLength = msg.eventDungeonLength;
+      if (typeof msg.shouldResetEvent === 'boolean') cm.shouldResetEvent = msg.shouldResetEvent;
+      // Passives — resolve from the combat passives registry.
+      const resolvePassives = (ids) => (ids || []).map(id => {
+        const p = game.combatPassives && game.combatPassives.getObjectByID(id);
+        return p;
+      }).filter(Boolean);
+      if (msg.eventPassives) cm.eventPassives = resolvePassives(msg.eventPassives);
+      if (msg.availableEventPassives) cm.availableEventPassives = resolvePassives(msg.availableEventPassives);
+      if (msg.eventPassivesBeingSelected) {
+        if (!cm.eventPassivesBeingSelected) cm.eventPassivesBeingSelected = new Set();
+        cm.eventPassivesBeingSelected.clear();
+        for (const p of resolvePassives(msg.eventPassivesBeingSelected)) {
+          cm.eventPassivesBeingSelected.add(p);
+        }
+      }
+      if (msg.activeEventAreas) {
+        if (!cm.activeEventAreas) cm.activeEventAreas = new Map();
+        // Merge: set the count for each area; don't blindly clear in case
+        // local has progress the remote doesn't (take max).
+        for (const a of msg.activeEventAreas) {
+          const area = game.slayerAreas && game.slayerAreas.getObjectByID(a.areaId);
+          if (area) {
+            const cur = cm.activeEventAreas.get(area) || 0;
+            cm.activeEventAreas.set(area, Math.max(cur, a.count));
+          }
+        }
+      }
+      if (cm.renderEventMenu) try { cm.renderEventMenu(); } catch { /* noop */ }
+      if (cm.renderEventAreas) try { cm.renderEventAreas(); } catch { /* noop */ }
+    } catch (e) { logger.error('applyCombatEventState failed', e); }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
+  }
+
   // ---- Combat event sync (damage, healing, monster selection) ------------
   _patchCombatEvents() {
     const cm = game.combat;
@@ -4146,7 +4239,29 @@ class Sync {
         paused: game.combat.paused,
       };
     }
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState };
+    // Combat Event system state (Into the Mist, Spider Lair, etc.)
+    let combatEventState = null;
+    if (game.combat) {
+      const cm = game.combat;
+      combatEventState = {
+        activeEventId: cm.activeEvent ? cm.activeEvent.id : null,
+        eventProgress: cm.eventProgress,
+        eventDungeonLength: cm.eventDungeonLength,
+        eventPassives: (cm.eventPassives || []).map(p => p.id),
+        availableEventPassives: (cm.availableEventPassives || []).map(p => p.id),
+        eventPassivesBeingSelected: (cm.eventPassivesBeingSelected ? [...cm.eventPassivesBeingSelected] : []).map(p => p.id),
+        shouldResetEvent: cm.shouldResetEvent,
+        activeEventAreas: [],
+        strongholdTier: cm.strongholdTier,
+        areaProgress: cm.areaProgress,
+      };
+      if (cm.activeEventAreas) {
+        for (const [area, count] of cm.activeEventAreas) {
+          if (area && area.id) combatEventState.activeEventAreas.push({ areaId: area.id, count });
+        }
+      }
+    }
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, farming: farmingPlots, combat: combatState, combatEventState };
 
     // Mastery (per-action XP + mastery pool XP per realm)
     const mastery = [];
@@ -4580,6 +4695,13 @@ class Sync {
           game.combat.player.hitpoints = cs.playerHp;
           if (game.combat.player.renderHitpoints) game.combat.player.renderHitpoints();
         }
+      }
+      // Combat Event system state from snapshot
+      if (msg.combatEventState) {
+        this._applyCombatEventState(msg.combatEventState);
+        // _applyCombatEventState resets _applyingRemote in its finally;
+        // re-assert so the rest of the snapshot apply stays guarded.
+        this._applyingRemote = true;
       }
       // Mastery from snapshot
       if (msg.mastery) {
@@ -5211,6 +5333,7 @@ class Sync {
       [Msg.SKILL_SELECT]: (m) => this._applySkillSelect(m),
       [Msg.PLAYER_STATE]: (m) => this._applyPlayerState(m),
       [Msg.COMBAT_AREA]: (m) => this._applyCombatArea(m),
+      [Msg.COMBAT_EVENT_STATE]: (m) => this._applyCombatEventState(m),
       [Msg.COMBAT_EVENT]: (m) => this._applyCombatEvent(m),
       [Msg.COMBAT_CLAIM]: (m) => this._applyCombatClaim(m),
       [Msg.COMBAT_RELEASE]: () => this._applyCombatRelease(),
