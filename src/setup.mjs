@@ -38,6 +38,18 @@ const logger = {
 
 const exportLog = () => _logBuf.join('\n');
 
+// Auto-save log to localStorage so it persists across game crashes/reloads
+const _saveLogToStorage = () => {
+  try {
+    const text = _logBuf.join('\n');
+    localStorage.setItem('realMP_log', text);
+    localStorage.setItem('realMP_log_ts', new Date().toISOString());
+  } catch { /* storage full or unavailable */ }
+};
+// Save every 5 seconds and on page unload
+setInterval(_saveLogToStorage, 5000);
+window.addEventListener('beforeunload', _saveLogToStorage);
+
 // ============================================================================
 // PROTOCOL
 // ============================================================================
@@ -2152,14 +2164,20 @@ class Sync {
               }
               if (area && cm.selectMonster) {
                 logger.info(`[COMBAT] Calling selectMonster(${monster.id}, ${area.id})`);
-                cm.selectMonster(monster, area);
+                try {
+                  cm.selectMonster(monster, area);
+                } catch (e) { logger.warn(`[COMBAT] selectMonster threw: ${e.message}`); }
+                // Also set selectedMonster/selectedArea directly as safety
+                cm.selectedMonster = monster;
+                if (cm.selectedArea !== undefined) cm.selectedArea = area;
                 logger.info(`[COMBAT] selectMonster done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               } else {
                 // Fallback: manually set up the enemy
-                logger.info(`[COMBAT] Fallback: setNewMonster + spawnEnemy`);
+                logger.info(`[COMBAT] Fallback: setNewMonster + initializeForCombat`);
                 cm.enemy.setNewMonster(monster);
                 cm.enemy.initializeForCombat();
-                if (cm.spawnEnemy) cm.spawnEnemy();
+                cm.selectedMonster = monster;
+                if (cm.selectedArea !== undefined && area) cm.selectedArea = area;
                 logger.info(`[COMBAT] Fallback done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               }
             } catch (e) { logger.warn(`[COMBAT] selectMonster failed: ${e.message}`); }
@@ -2198,11 +2216,14 @@ class Sync {
           target.renderQueue.hitpoints = true;
           target.renderQueue.damageSplash = true;
         }
-        // If enemy died from remote damage, respawn immediately to prevent
-        // the game's tick loop from processing death (which crashes on slayer rewards)
+        // If enemy died from remote damage, reset HP to max directly.
+        // Don't call spawnEnemy()/loadNextEnemy() — that crashes when no
+        // area/monster is properly selected for the slayer reward system.
         if (msg.target === 'enemy' && target.hitpoints <= 0) {
           try {
-            if (cm.spawnEnemy) cm.spawnEnemy();
+            const maxHp = target.stats ? target.stats.maxHitpoints : 100;
+            target.hitpoints = maxHp;
+            if (target.renderQueue) target.renderQueue.hitpoints = true;
           } catch (e) { /* skip */ }
         }
         this._renderCombat();
