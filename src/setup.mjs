@@ -2211,31 +2211,41 @@ class Sync {
       };
     }
 
-    // Also patch rewardForEnemyDeath to catch any other death reward crashes
+    // Also patch rewardForEnemyDeath — when spectating, skip local loot
+    // generation entirely. The spectator only gets loot via COMBAT_LOOT
+    // sync messages from the attacker. This prevents double items.
     if (typeof CombatManager.prototype.rewardForEnemyDeath === 'function') {
       const orig2 = CombatManager.prototype.rewardForEnemyDeath;
       CombatManager.prototype.rewardForEnemyDeath = function (monster, area) {
+        // Skip all local rewards when spectating
+        if (sync._combatOwner === 'peer') {
+          logger.info(`[COMBAT] Spectator: skipping local rewardForEnemyDeath`);
+          return;
+        }
         try { return orig2.call(this, monster, area); }
         catch (e) { logger.warn(`rewardForEnemyDeath caught: ${e.message}`); }
       };
     }
 
     // Patch loadNextEnemy — prevent crash when area/monster not selected
+    // AND skip when spectating (attacker handles enemy spawning)
     if (typeof CombatManager.prototype.loadNextEnemy === 'function') {
       const orig3 = CombatManager.prototype.loadNextEnemy;
       CombatManager.prototype.loadNextEnemy = function () {
+        if (sync._combatOwner === 'peer') {
+          logger.info(`[COMBAT] Spectator: skipping loadNextEnemy`);
+          return;
+        }
         try { return orig3.call(this); }
         catch (e) { logger.warn(`loadNextEnemy caught: ${e.message}`); }
       };
     }
 
-    // Note: We don't patch CombatManager.tick to pause spectator combat because
-    // setting paused=true breaks the attack bar animation and prevents stopping
-    // combat. Instead, we accept that the spectator's local game still runs
-    // combat ticks. The spectator's damage/heal patches skip sending events
-    // (guarded by _combatOwner === 'peer'), so their local damage doesn't
-    // affect the attacker. The attacker's damage events override the
-    // spectator's HP with absolute values.
+    // Note: When spectating (_combatOwner === 'peer'), the spectator's combat
+    // is NOT started (we don't call selectMonster). The spectator can do other
+    // tasks (mining, fishing, etc.) while watching the attacker's combat.
+    // The attacker's damage events update the spectator's enemy HP visually.
+    // The spectator gets loot via COMBAT_LOOT sync messages, not local drops.
 
     // Patch pause/unpause — sync combat pause state and release claim on stop
     for (const m of ['pause', 'stop', 'start']) {
@@ -2400,12 +2410,11 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}, area: ${msg.areaId}`);
     this._combatOwner = 'peer';
-    // DON'T call stop() — that hides the enemy and stops bars from animating.
-    // Instead, let combat run naturally so the spectator sees the enemy,
-    // attack bars, and HP. The spectator's player attacks are neutralized
-    // by the Character.attack patch (deals 0 damage when spectating).
-    // The attacker's damage events override the enemy HP.
-    // Select the same monster so we see the same enemy
+    // DON'T call selectMonster — it auto-starts combat and forces the
+    // spectator into a fight, preventing them from doing other tasks.
+    // Instead, set up the enemy visually WITHOUT starting a fight.
+    // The spectator sees the enemy image/HP but their combat doesn't run.
+    // The attacker's damage events update the enemy HP visually.
     if (msg.monsterId) {
       this._applyingRemote = true;
       try {
@@ -2413,37 +2422,31 @@ class Sync {
         if (monster && cm.enemy) {
           const currentId = cm.enemy.monster ? cm.enemy.monster.id : null;
           if (currentId !== msg.monsterId || cm.enemy.hitpoints <= 0) {
-            let area = null;
+            // Set up enemy without starting combat
+            if (cm.enemy.setNewMonster) cm.enemy.setNewMonster(monster);
+            if (cm.enemy.setStatsFromMonster) cm.enemy.setStatsFromMonster(monster);
+            if (cm.enemy.initializeForCombat) cm.enemy.initializeForCombat();
+            // Set the enemy to full HP
+            if (cm.enemy.stats && cm.enemy.stats.maxHitpoints) {
+              cm.enemy.hitpoints = cm.enemy.stats.maxHitpoints;
+            }
+            // Store selected monster/area for reference
+            cm.selectedMonster = monster;
             if (msg.areaId) {
-              area = game.combatAreas.getObjectByID(msg.areaId)
+              const area = game.combatAreas.getObjectByID(msg.areaId)
                   || game.slayerAreas.getObjectByID(msg.areaId)
                   || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
                   || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
                   || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
+              if (area && cm.selectedArea !== undefined) cm.selectedArea = area;
             }
-            if (!area && monster._area) area = monster._area;
-            if (!area) {
-              if (game.combatAreas && game.combatAreas.allObjects) {
-                for (const a of game.combatAreas.allObjects) {
-                  if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
-                }
-              }
-              if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
-                for (const a of game.slayerAreas.allObjects) {
-                  if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
-                }
-              }
-            }
-            if (area && cm.selectMonster) {
-              cm.selectMonster(monster, area);
-              if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) cm.spawnEnemy();
-              logger.info(`[COMBAT] Spectator selected monster: ${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
-            }
+            if (cm.enemy.setRenderAll) cm.enemy.setRenderAll();
+            logger.info(`[COMBAT] Spectator set up enemy: ${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
           } else {
             logger.info(`[COMBAT] Spectator: monster already selected, hp=${cm.enemy.hitpoints}`);
           }
         }
-      } catch (e) { logger.warn(`[COMBAT] claim selectMonster failed: ${e.message}`); }
+      } catch (e) { logger.warn(`[COMBAT] claim set up enemy failed: ${e.message}`); }
       finally { this._applyingRemote = false; }
     }
     this._renderCombat();
