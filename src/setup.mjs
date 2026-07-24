@@ -2189,6 +2189,11 @@ class Sync {
                 } catch (e) { logger.warn(`[COMBAT] selectMonster threw: ${e.message}`); }
                 cm.selectedMonster = monster;
                 if (cm.selectedArea !== undefined) cm.selectedArea = area;
+                // selectMonster sets up the monster but may leave HP at 0.
+                // Call spawnEnemy to properly spawn with full HP and image.
+                if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) {
+                  try { cm.spawnEnemy(); } catch (e) { logger.warn(`[COMBAT] spawnEnemy threw: ${e.message}`); }
+                }
                 logger.info(`[COMBAT] selectMonster done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               } else {
                 logger.info(`[COMBAT] Fallback: setNewMonster + initializeForCombat`);
@@ -2196,6 +2201,9 @@ class Sync {
                 cm.enemy.initializeForCombat();
                 cm.selectedMonster = monster;
                 if (cm.selectedArea !== undefined && area) cm.selectedArea = area;
+                if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) {
+                  try { cm.spawnEnemy(); } catch (e) { logger.warn(`[COMBAT] spawnEnemy threw: ${e.message}`); }
+                }
                 logger.info(`[COMBAT] Fallback done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               }
             } catch (e) { logger.warn(`[COMBAT] selectMonster failed: ${e.message}`); }
