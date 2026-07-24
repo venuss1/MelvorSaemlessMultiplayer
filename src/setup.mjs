@@ -82,6 +82,8 @@ const Msg = Object.freeze({
   CARTOGRAPHY: 'cartography',
   STATS: 'stats',
   COMBAT_EVENT: 'combat_event',
+  COMBAT_CLAIM: 'combat_claim',     // { monsterId, areaId } — I'm fighting this
+  COMBAT_RELEASE: 'combat_release', // {} — I stopped fighting
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
   UNLOCK_ALL: 'unlock_all',
@@ -360,6 +362,8 @@ class Sync {
     this.transport = transport;
     this.actionLock = actionLock;
     this._applyingRemote = false;
+    this._combatOwner = null;  // 'me' = I'm attacking, 'peer' = peer is attacking, null = no one
+    this._combatWasPaused = false;  // remember pause state before we forced pause
     this._watcher = null;
     this._lastActiveSkillId = null;
     this._saveTimer = null;
@@ -2098,9 +2102,18 @@ class Sync {
       });
     }
 
-    // Patch selectMonster — sync monster selection
+    // Patch selectMonster — sync monster selection AND claim combat
     if (typeof CombatManager.prototype.selectMonster === 'function') {
-      this.ctx.patch(CombatManager, 'selectMonster').after(() => {
+      this.ctx.patch(CombatManager, 'selectMonster').after(function () {
+        // Local player selected a monster — claim combat ownership
+        if (!sync._applyingRemote) {
+          sync._combatOwner = 'me';
+          const cm = game.combat;
+          const monsterId = cm.enemy.monster ? cm.enemy.monster.id : null;
+          const areaId = cm.selectedArea ? cm.selectedArea.id : null;
+          sync.transport.send({ t: Msg.COMBAT_CLAIM, monsterId, areaId });
+          logger.info(`[COMBAT] Claimed combat: ${monsterId}`);
+        }
         sendCombatState();
       });
     }
@@ -2125,12 +2138,19 @@ class Sync {
       };
     }
 
-    // Patch pause/unpause — sync combat pause state
-    // CombatManager has a `paused` property, patch the methods that change it
+    // Patch pause/unpause — sync combat pause state and release claim on stop
     for (const m of ['pause', 'stop', 'start']) {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
-          this.ctx.patch(CombatManager, m).after(() => sendCombatState());
+          this.ctx.patch(CombatManager, m).after(function () {
+            // If local player stops combat, release our claim
+            if (m === 'stop' && sync._combatOwner === 'me' && !sync._applyingRemote) {
+              sync._combatOwner = null;
+              sync.transport.send({ t: Msg.COMBAT_RELEASE });
+              logger.info(`[COMBAT] Released combat (stopped)`);
+            }
+            sendCombatState();
+          });
         } catch (e) { /* skip if already patched */ }
       }
     }
@@ -2304,6 +2324,64 @@ class Sync {
       // Full combat manager render — updates the entire combat tab
       if (cm.render) cm.render();
     } catch (e) { /* skip render errors */ }
+  }
+
+  // ---- Combat claim/release (only one player attacks at a time) ----------
+  _applyCombatClaim(msg) {
+    const cm = game.combat;
+    if (!cm) return;
+    logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}`);
+    this._combatOwner = 'peer';
+    // Pause our combat — we're spectating, not attacking
+    this._combatWasPaused = cm.paused;
+    if (!cm.paused && cm.pause) {
+      try { cm.pause(); } catch (e) { /* skip */ }
+    }
+    // Sync the monster selection so we see the same enemy
+    if (msg.monsterId) {
+      this._applyingRemote = true;
+      try {
+        const monster = game.monsters.getObjectByID(msg.monsterId);
+        if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId || cm.enemy.hitpoints <= 0)) {
+          let area = null;
+          if (msg.areaId) {
+            area = game.combatAreas.getObjectByID(msg.areaId)
+                || game.slayerAreas.getObjectByID(msg.areaId)
+                || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
+                || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
+                || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
+          }
+          if (!area && monster._area) area = monster._area;
+          if (!area) {
+            if (game.combatAreas && game.combatAreas.allObjects) {
+              for (const a of game.combatAreas.allObjects) {
+                if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+              }
+            }
+            if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
+              for (const a of game.slayerAreas.allObjects) {
+                if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+              }
+            }
+          }
+          if (area && cm.selectMonster) {
+            cm.selectMonster(monster, area);
+            if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) cm.spawnEnemy();
+          }
+        }
+      } catch (e) { logger.warn(`[COMBAT] claim selectMonster failed: ${e.message}`); }
+      finally { this._applyingRemote = false; }
+    }
+    this._renderCombat();
+  }
+
+  _applyCombatRelease() {
+    const cm = game.combat;
+    if (!cm) return;
+    logger.info(`[COMBAT] Peer released combat`);
+    this._combatOwner = null;
+    // Restore our pause state — we can attack again if we want
+    // Don't auto-unpause; let the player decide
   }
 
   // ---- Ancient relics sync ----------------------------------------------
@@ -3940,6 +4018,8 @@ class Sync {
       [Msg.PLAYER_STATE]: (m) => this._applyPlayerState(m),
       [Msg.COMBAT_AREA]: (m) => this._applyCombatArea(m),
       [Msg.COMBAT_EVENT]: (m) => this._applyCombatEvent(m),
+      [Msg.COMBAT_CLAIM]: (m) => this._applyCombatClaim(m),
+      [Msg.COMBAT_RELEASE]: () => this._applyCombatRelease(),
       [Msg.ANCIENT_RELIC]: (m) => this._applyAncientRelic(m),
       [Msg.SKILL_TREE]: (m) => this._applySkillTree(m),
       [Msg.TOWNSHIP]: (m) => this._applyTownship(m),
