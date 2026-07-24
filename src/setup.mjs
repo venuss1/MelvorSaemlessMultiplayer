@@ -2118,27 +2118,52 @@ class Sync {
     try {
       if (msg.kind === 'state') {
         // Full state sync — monster selection, HP, paused
-        // Sync monster if different
+        // Sync monster if different — use selectMonster for proper setup
         if (msg.monsterId) {
           const monster = game.monsters.getObjectByID(msg.monsterId);
           if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId)) {
             try {
-              cm.enemy.setNewMonster(monster);
-              cm.enemy.initializeForCombat();
-              cm.enemy.setSpawning();
-            } catch (e) { logger.warn(`setNewMonster failed: ${e.message}`); }
+              // Find the area this monster belongs to
+              let area = null;
+              if (msg.areaId) {
+                area = game.combatAreas.getObjectByID(msg.areaId)
+                    || game.slayerAreas.getObjectByID(msg.areaId)
+                    || (game.dungeons && game.dungeons.getObjectByID(msg.areaId))
+                    || (game.strongholds && game.strongholds.getObjectByID(msg.areaId))
+                    || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
+              }
+              // If no area found, try to find it from the monster
+              if (!area && monster._area) area = monster._area;
+              if (!area) {
+                // Search all combat areas for this monster
+                if (game.combatAreas && game.combatAreas.allObjects) {
+                  for (const a of game.combatAreas.allObjects) {
+                    if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+                  }
+                }
+                if (!area && game.slayerAreas && game.slayerAreas.allObjects) {
+                  for (const a of game.slayerAreas.allObjects) {
+                    if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
+                  }
+                }
+              }
+              if (area && cm.selectMonster) {
+                cm.selectMonster(monster, area);
+              } else {
+                // Fallback: manually set up the enemy
+                cm.enemy.setNewMonster(monster);
+                cm.enemy.initializeForCombat();
+                if (cm.spawnEnemy) cm.spawnEnemy();
+              }
+            } catch (e) { logger.warn(`selectMonster failed: ${e.message}`); }
           }
         }
-        // Sync HP values
+        // Sync HP values (override after spawnEnemy sets full HP)
         if (msg.enemyHp !== undefined && cm.enemy) {
-          if (cm.enemy.hitpoints !== msg.enemyHp) {
-            cm.enemy.hitpoints = msg.enemyHp;
-          }
+          cm.enemy.hitpoints = msg.enemyHp;
         }
         if (msg.playerHp !== undefined && cm.player) {
-          if (cm.player.hitpoints !== msg.playerHp) {
-            cm.player.hitpoints = msg.playerHp;
-          }
+          cm.player.hitpoints = msg.playerHp;
         }
         // Full combat render
         this._renderCombat();
