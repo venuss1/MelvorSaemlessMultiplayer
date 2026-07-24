@@ -2101,6 +2101,8 @@ class Sync {
     if (typeof Character !== 'undefined' && Character.prototype && typeof Character.prototype.heal === 'function') {
       this.ctx.patch(Character, 'heal').after(function (amount) {
         if (amount <= 0) return;
+        // Only send if we're the attacker (not spectating)
+        if (sync._combatOwner === 'peer') return;
         const isEnemy = this === game.combat.enemy;
         sendCombatEvent({
           kind: 'heal',
@@ -2118,6 +2120,14 @@ class Sync {
         sendCombatState();
       });
     }
+
+    // Note: When spectating (_combatOwner === 'peer'), the local game still
+    // runs combat ticks and attacks. This is fine because:
+    // 1. Our damage/heal patches skip sending events (guarded by _combatOwner)
+    // 2. The attacker's damage events override our local HP (they send absolute hp)
+    // 3. Our local damage doesn't affect the attacker's game
+    // The spectator sees both their local damage and the attacker's damage,
+    // but the HP bar is always corrected by the attacker's state messages.
 
     // Patch selectMonster — sync monster selection AND claim combat
     if (typeof CombatManager.prototype.selectMonster === 'function') {
