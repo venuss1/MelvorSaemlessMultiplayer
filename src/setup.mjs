@@ -2150,11 +2150,13 @@ class Sync {
     try {
       if (msg.kind === 'state') {
         // Full state sync — monster selection, HP, paused
-        // Sync monster if different — use selectMonster for proper setup
         if (msg.monsterId) {
           const monster = game.monsters.getObjectByID(msg.monsterId);
-          logger.info(`[COMBAT] State sync: monster=${msg.monsterId}, found=${!!monster}, current=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, areaId=${msg.areaId}`);
-          if (monster && cm.enemy && (!cm.enemy.monster || cm.enemy.monster.id !== msg.monsterId)) {
+          const currentMonsterId = cm.enemy.monster ? cm.enemy.monster.id : null;
+          const enemyIsDead = cm.enemy.hitpoints <= 0;
+          logger.info(`[COMBAT] State sync: monster=${msg.monsterId}, found=${!!monster}, current=${currentMonsterId}, enemyDead=${enemyIsDead}, hp=${cm.enemy.hitpoints}, areaId=${msg.areaId}`);
+          // Re-select if monster is different OR enemy is dead (needs respawn)
+          if (monster && cm.enemy && (currentMonsterId !== msg.monsterId || enemyIsDead)) {
             try {
               // Find the area this monster belongs to
               let area = null;
@@ -2166,10 +2168,8 @@ class Sync {
                     || (game.abyssDepths && game.abyssDepths.getObjectByID(msg.areaId));
               }
               logger.info(`[COMBAT] Area from areaId: ${area ? area.id : 'not found'}`);
-              // If no area found, try to find it from the monster
               if (!area && monster._area) { area = monster._area; logger.info(`[COMBAT] Area from monster._area: ${area.id}`); }
               if (!area) {
-                // Search all combat areas for this monster
                 if (game.combatAreas && game.combatAreas.allObjects) {
                   for (const a of game.combatAreas.allObjects) {
                     if (a.monsters && a.monsters.includes(monster)) { area = a; break; }
@@ -2187,12 +2187,10 @@ class Sync {
                 try {
                   cm.selectMonster(monster, area);
                 } catch (e) { logger.warn(`[COMBAT] selectMonster threw: ${e.message}`); }
-                // Also set selectedMonster/selectedArea directly as safety
                 cm.selectedMonster = monster;
                 if (cm.selectedArea !== undefined) cm.selectedArea = area;
                 logger.info(`[COMBAT] selectMonster done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               } else {
-                // Fallback: manually set up the enemy
                 logger.info(`[COMBAT] Fallback: setNewMonster + initializeForCombat`);
                 cm.enemy.setNewMonster(monster);
                 cm.enemy.initializeForCombat();
@@ -2201,10 +2199,12 @@ class Sync {
                 logger.info(`[COMBAT] Fallback done, enemy.monster=${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
               }
             } catch (e) { logger.warn(`[COMBAT] selectMonster failed: ${e.message}`); }
+          } else {
+            logger.info(`[COMBAT] Monster already selected and alive — skipping selectMonster`);
           }
         }
-        // Sync HP values (override after spawnEnemy sets full HP)
-        if (msg.enemyHp !== undefined && cm.enemy) {
+        // Sync HP values (only if provided and enemy is alive)
+        if (msg.enemyHp !== undefined && msg.enemyHp > 0 && cm.enemy) {
           cm.enemy.hitpoints = msg.enemyHp;
         }
         if (msg.playerHp !== undefined && cm.player) {
