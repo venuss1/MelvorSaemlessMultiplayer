@@ -2105,6 +2105,26 @@ class Sync {
       });
     }
 
+    // Patch rewardSlayerTaskCurrency — prevent crash when slayer task category
+    // is undefined (happens when monster was selected remotely)
+    if (typeof CombatManager.prototype.rewardSlayerTaskCurrency === 'function') {
+      const orig = CombatManager.prototype.rewardSlayerTaskCurrency;
+      CombatManager.prototype.rewardSlayerTaskCurrency = function (category) {
+        if (!category || !category.currencyRewards) return; // skip if invalid
+        try { return orig.call(this, category); }
+        catch (e) { logger.warn(`rewardSlayerTaskCurrency caught: ${e.message}`); }
+      };
+    }
+
+    // Also patch rewardForEnemyDeath to catch any other death reward crashes
+    if (typeof CombatManager.prototype.rewardForEnemyDeath === 'function') {
+      const orig2 = CombatManager.prototype.rewardForEnemyDeath;
+      CombatManager.prototype.rewardForEnemyDeath = function (monster, area) {
+        try { return orig2.call(this, monster, area); }
+        catch (e) { logger.warn(`rewardForEnemyDeath caught: ${e.message}`); }
+      };
+    }
+
     // Patch pause/unpause — sync combat pause state
     // CombatManager has a `paused` property, patch the methods that change it
     for (const m of ['pause', 'stop', 'start']) {
@@ -2216,16 +2236,9 @@ class Sync {
           target.renderQueue.hitpoints = true;
           target.renderQueue.damageSplash = true;
         }
-        // If enemy died from remote damage, reset HP to max directly.
-        // Don't call spawnEnemy()/loadNextEnemy() — that crashes when no
-        // area/monster is properly selected for the slayer reward system.
-        if (msg.target === 'enemy' && target.hitpoints <= 0) {
-          try {
-            const maxHp = target.stats ? target.stats.maxHitpoints : 100;
-            target.hitpoints = maxHp;
-            if (target.renderQueue) target.renderQueue.hitpoints = true;
-          } catch (e) { /* skip */ }
-        }
+        // Note: Don't reset HP on death — let the game's tick loop process
+        // death normally (onEnemyDeath) so monster drops work. The crash in
+        // rewardSlayerTaskCurrency is handled by patching that method.
         this._renderCombat();
       } else if (msg.kind === 'heal') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
