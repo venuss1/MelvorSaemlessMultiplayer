@@ -6408,10 +6408,11 @@ class Sync {
       // Equipment set count from snapshot
       if (typeof msg.numEquipSets === 'number' && game.combat && game.combat.player) {
         try {
-          // Only increase, never decrease
+          // numEquipSets is a getter computed from shop modifiers, not
+          // a settable property. Call updateEquipmentSets() to recompute.
           const current = game.combat.player.numEquipSets || 0;
-          if (msg.numEquipSets > current) {
-            game.combat.player.numEquipSets = msg.numEquipSets;
+          if (msg.numEquipSets > current && typeof game.combat.player.updateEquipmentSets === 'function') {
+            game.combat.player.updateEquipmentSets();
           }
         } catch { /* noop */ }
       }
@@ -6811,14 +6812,14 @@ class Sync {
 
       // 13. All combat areas/dungeons/strongholds completed (set timesCompleted to 100)
       let dungeonCount = 0;
-      // Dungeons
-      if (game.dungeons && game.dungeons.allObjects) {
+      // Regular dungeons — completion tracked in cm.dungeonCompletion (Map<Dungeon, number>),
+      // NOT on the Dungeon object (only AbyssDepth and Stronghold have timesCompleted).
+      if (cm && cm.dungeonCompletion && game.dungeons && game.dungeons.allObjects) {
         for (const dungeon of game.dungeons.allObjects) {
           try {
-            if (dungeon.timesCompleted !== undefined) {
-              dungeon.timesCompleted = Math.max(dungeon.timesCompleted || 0, 100);
-              dungeonCount++;
-            }
+            const cur = cm.dungeonCompletion.get(dungeon) || 0;
+            if (cur < 100) cm.dungeonCompletion.set(dungeon, 100);
+            dungeonCount++;
           } catch (e) { /* skip */ }
         }
       }
@@ -6888,8 +6889,13 @@ class Sync {
       // 16. All corruption effect rows unlocked
       if (game.corruption && game.corruption.corruptionEffects) {
         try {
-          for (const row of game.corruption.corruptionEffects.rows) {
-            if (row && row.isUnlocked !== undefined) row.isUnlocked = true;
+          // CorruptionEffectTable has allRows/unlockedRows/lockedRows, not .rows.
+          // Use unlockRow() to properly unlock each row.
+          const table = game.corruption.corruptionEffects;
+          if (table.allRows) for (const row of table.allRows) {
+            if (row && !row.isUnlocked && table.unlockRow) {
+              try { table.unlockRow(row); } catch { /* skip */ }
+            }
           }
           logger.info('[UNLOCK] Corruption: all rows unlocked');
         } catch (e) { /* skip */ }
@@ -6898,13 +6904,14 @@ class Sync {
       // 17. All astrology modifiers upgraded
       if (game.astrology) {
         try {
+          // AstrologyRecipe has standardModifiers, uniqueModifiers, abyssalModifiers
+          // (each AstrologyModifier[]), not a single .modifiers array.
           for (const recipe of game.astrology.actions.allObjects) {
-            for (let tier = 0; tier < 2; tier++) {
-              try {
-                if (recipe.modifiers && recipe.modifiers[tier]) {
-                  recipe.modifiers[tier].timesBought = 10;
-                }
-              } catch (e) { /* skip */ }
+            for (const modList of [recipe.standardModifiers, recipe.uniqueModifiers, recipe.abyssalModifiers]) {
+              if (!modList) continue;
+              for (const mod of modList) {
+                try { if (mod && 'timesBought' in mod) mod.timesBought = 10; } catch { /* skip */ }
+              }
             }
           }
           logger.info('[UNLOCK] Astrology: all modifiers upgraded');
@@ -6914,8 +6921,13 @@ class Sync {
       // 18. All archaeology dig sites unlocked + museum donations
       if (game.archaeology) {
         try {
+          // ArchaeologyDigSite has no isUnlocked property — dig sites are
+          // unlocked via their associated POI being discovered. Discover the
+          // POI if it exists.
           for (const site of game.archaeology.actions.allObjects) {
-            if (site.isUnlocked !== undefined) site.isUnlocked = true;
+            if (site.poi && !site.poi.isDiscovered) {
+              try { site.poi.isDiscovered = true; } catch { /* skip */ }
+            }
           }
           logger.info('[UNLOCK] Archaeology: all dig sites unlocked');
         } catch (e) { /* skip */ }
@@ -6924,9 +6936,11 @@ class Sync {
       // 19. All cartography POIs discovered
       if (game.cartography) {
         try {
-          for (const map of game.cartography.maps.allObjects) {
-            if (map.pois) {
-              for (const poi of map.pois.allObjects) {
+          // Cartography uses worldMaps (NamespaceRegistry<WorldMap>), not .maps.
+          // WorldMap.pointsOfInterest is NamespaceRegistry<PointOfInterest>.
+          for (const map of game.cartography.worldMaps.allObjects) {
+            if (map.pointsOfInterest) {
+              for (const poi of map.pointsOfInterest.allObjects) {
                 if (poi.isDiscovered !== undefined) poi.isDiscovered = true;
               }
             }
@@ -6938,8 +6952,13 @@ class Sync {
       // 20. All harvesting veins unlocked
       if (game.harvesting) {
         try {
+          // HarvestingVein has no isUnlocked property — veins are unlocked
+          // via their associated shopItemPurchased. Purchase the shop upgrade
+          // if not already purchased.
           for (const vein of game.harvesting.actions.allObjects) {
-            if (vein.isUnlocked !== undefined) vein.isUnlocked = true;
+            if (vein.shopItemPurchased && game.shop && !game.shop.isUpgradePurchased(vein.shopItemPurchased)) {
+              try { game.shop.upgradesPurchased.set(vein.shopItemPurchased, 1); } catch { /* skip */ }
+            }
           }
           logger.info('[UNLOCK] Harvesting: all veins unlocked');
         } catch (e) { /* skip */ }
