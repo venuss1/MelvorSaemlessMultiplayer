@@ -2126,23 +2126,12 @@ class Sync {
     const as = game.astrology;
     if (!as) return;
     const upgrades = [];
-    // AstrologyModifier instances have timesBought. Sync all three modifier
-    // types (standard, unique, abyssal). The skill exposes aggregated arrays
-    // (*ModifierUpgrades); fall back to iterating recipe modifiers if absent.
-    const collect = (arr, type) => {
-      if (!arr) return;
-      for (const mod of arr) {
-        if (mod && mod.recipe && mod.recipe.id) {
-          upgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought, type });
-        }
-      }
-    };
+    // Astrology has no aggregated *ModifierUpgrades arrays — the upgrade
+    // state (timesBought) is stored directly on the AstrologyModifier
+    // objects in each recipe's standardModifiers/uniqueModifiers/
+    // abyssalModifiers arrays.
     try {
-      collect(as.standardModifierUpgrades, 'standard');
-      collect(as.uniqueModifierUpgrades, 'unique');
-      collect(as.abyssalModifierUpgrades, 'abyssal');
-      // Fallback: if the aggregated arrays are missing, read from recipe modifiers.
-      if (upgrades.length === 0 && as.actions) {
+      if (as.actions) {
         for (const recipe of as.actions.allObjects) {
           for (const type of ['standardModifiers', 'uniqueModifiers', 'abyssalModifiers']) {
             const mods = recipe[type];
@@ -2170,22 +2159,13 @@ class Sync {
         const recipe = as.actions.getObjectByID(u.recipeId);
         if (!recipe) continue;
         const type = u.type || 'standard';
-        // Resolve the modifier upgrade object. Try the aggregated array first,
-        // then fall back to the recipe's modifier array indexed by tier.
-        let mod = null;
-        try {
-          if (type === 'standard') mod = as.standardModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
-          else if (type === 'unique') mod = as.uniqueModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
-          else if (type === 'abyssal') mod = as.abyssalModifierUpgrades?.find(m => m.recipe === recipe && m.tier === u.tier);
-        } catch { /* noop */ }
-        if (mod) {
-          mod.timesBought = u.timesBought;
-        } else if (recipe) {
-          // Fallback: set timesBought directly on the recipe modifier.
-          const arr = type === 'standard' ? recipe.standardModifiers
-            : (type === 'unique' ? recipe.uniqueModifiers : recipe.abyssalModifiers);
-          if (arr && arr[u.tier]) arr[u.tier].timesBought = u.timesBought;
-        }
+        // Astrology has no standardModifierUpgrades/uniqueModifierUpgrades/
+        // abyssalModifierUpgrades arrays — the upgrade state (timesBought) is
+        // stored directly on the AstrologyModifier objects in the recipe's
+        // standardModifiers/uniqueModifiers/abyssalModifiers arrays.
+        const arr = type === 'standard' ? recipe.standardModifiers
+          : (type === 'unique' ? recipe.uniqueModifiers : recipe.abyssalModifiers);
+        if (arr && arr[u.tier]) arr[u.tier].timesBought = u.timesBought;
       }
       // Recompute provided stats so modifier effects take effect.
       if (as.computeProvidedStats) try { as.computeProvidedStats(); } catch { /* noop */ }
@@ -5381,15 +5361,25 @@ class Sync {
       const as = game.astrology;
       const astrologyUpgrades = [];
       try {
-        const collect = (arr, type) => {
-          if (!arr) return;
-          for (const mod of arr) {
-            if (mod && mod.recipe && mod.recipe.id) astrologyUpgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought, type });
+        // Astrology has no aggregated *ModifierUpgrades arrays — the upgrade
+        // state (timesBought) is stored directly on the AstrologyModifier
+        // objects in each recipe's standardModifiers/uniqueModifiers/
+        // abyssalModifiers arrays.
+        if (as.actions) {
+          for (const recipe of as.actions.allObjects) {
+            for (const type of ['standardModifiers', 'uniqueModifiers', 'abyssalModifiers']) {
+              const mods = recipe[type];
+              if (!mods) continue;
+              const tName = type === 'standardModifiers' ? 'standard' : (type === 'uniqueModifiers' ? 'unique' : 'abyssal');
+              for (let i = 0; i < mods.length; i++) {
+                const m = mods[i];
+                if (m && typeof m.timesBought === 'number' && m.timesBought > 0) {
+                  astrologyUpgrades.push({ recipeId: recipe.id, tier: i, timesBought: m.timesBought, type: tName });
+                }
+              }
+            }
           }
-        };
-        collect(as.standardModifierUpgrades, 'standard');
-        collect(as.uniqueModifierUpgrades, 'unique');
-        collect(as.abyssalModifierUpgrades, 'abyssal');
+        }
       } catch { /* noop */ }
       snapshot.astrology = {
         upgrades: astrologyUpgrades,
