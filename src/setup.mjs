@@ -1501,6 +1501,12 @@ class Sync {
 
   _serializePlot(plot) {
     if (!plot || !plot.id) return null;
+    const farming = game.farming;
+    // Get remaining growth time from the timer (what the UI displays)
+    let remainingTimeMs = 0;
+    if (farming && farming.getPlotGrowthTime && plot.state === 2) {
+      try { remainingTimeMs = farming.getPlotGrowthTime(plot); } catch { /* noop */ }
+    }
     return {
       id: plot.id,
       state: plot.state,
@@ -1508,6 +1514,7 @@ class Sync {
       compostItemId: plot.compostItem ? plot.compostItem.id : null,
       compostLevel: plot.compostLevel,
       growthTime: plot.growthTime,
+      remainingTimeMs,
       selectedRecipeId: plot.selectedRecipe ? plot.selectedRecipe.id : null,
     };
   }
@@ -1551,22 +1558,83 @@ class Sync {
               if (r.id === p.plantedRecipeId) { recipe = r; break; }
             }
           }
-          if (recipe && farming.plantPlot) {
-            try {
-              farming.plantPlot(plot, recipe, false);
-              logger.info(`[FARM] Synced plant: ${p.id} → ${p.plantedRecipeId}`);
-            } catch (e) {
-              // If planting fails (no seeds), just set state directly
-              plot.state = p.state;
-              plot.plantedRecipe = recipe;
-              plot.growthTime = p.growthTime || 0;
-              logger.warn(`[FARM] Plant failed, set state directly: ${p.id}`);
+          if (recipe) {
+            // Set plot state directly (don't consume seeds on the receiver)
+            plot.state = p.state;
+            plot.plantedRecipe = recipe;
+            plot.growthTime = p.growthTime || 0;
+            logger.info(`[FARM] Synced plant: ${p.id} → ${p.plantedRecipeId}, state=${p.state}`);
+
+            // Create a growth timer so the UI shows the remaining time
+            // and the crop eventually grows/hrows on the receiver too.
+            if (p.state === 2 && farming.createGrowthTimer) {
+              // Use the remaining time from the sender if available,
+              // otherwise compute the full interval.
+              let intervalMs = p.remainingTimeMs || 0;
+              if (intervalMs <= 0 && farming.modifyInterval && recipe.baseInterval) {
+                try { intervalMs = farming.modifyInterval(recipe.baseInterval, recipe); }
+                catch { intervalMs = recipe.baseInterval; }
+              }
+              if (intervalMs > 0) {
+                // Remove any existing timer for this plot first
+                const oldTimer = farming.growthTimerMap.get(plot);
+                if (oldTimer) {
+                  try { oldTimer.stop(); } catch { /* noop */ }
+                  farming.growthTimers.delete(oldTimer);
+                  farming.growthTimerMap.delete(plot);
+                }
+                // Create a new growth timer with the remaining time
+                try {
+                  farming.createGrowthTimer([plot], intervalMs);
+                  logger.info(`[FARM] Created growth timer for ${p.id}, interval=${intervalMs}ms`);
+                } catch (e) {
+                  logger.warn(`[FARM] Failed to create growth timer: ${e.message}`);
+                }
+              }
+            }
+            // Queue render updates
+            if (farming.renderQueue) {
+              if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
+              if (farming.renderQueue.growthTime) {
+                const timer = farming.growthTimerMap.get(plot);
+                if (timer) farming.renderQueue.growthTime.add(timer);
+              }
             }
           } else {
+            logger.warn(`[FARM] Recipe not found: ${p.plantedRecipeId}`);
             // Fallback: set state directly
             plot.state = p.state;
-            plot.plantedRecipe = recipe || undefined;
+            plot.plantedRecipe = undefined;
             plot.growthTime = p.growthTime || 0;
+          }
+        } else if (p.plantedRecipeId && p.state >= 2 && plot.state >= 2) {
+          // Both have a crop growing — just update the remaining time
+          // if the sender has a different recipe or the plot was reset
+          let recipe = null;
+          if (game.farming.actions) {
+            recipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
+          }
+          if (recipe && plot.plantedRecipe !== recipe) {
+            // Different recipe — update it
+            plot.plantedRecipe = recipe;
+            plot.growthTime = p.growthTime || 0;
+            logger.info(`[FARM] Updated planted recipe: ${p.id} → ${p.plantedRecipeId}`);
+          }
+          // If the receiver has no timer but the sender does, create one
+          if (p.state === 2 && farming.growthTimerMap && !farming.growthTimerMap.get(plot) && farming.createGrowthTimer) {
+            let intervalMs = p.remainingTimeMs || 0;
+            if (intervalMs <= 0 && farming.modifyInterval && recipe && recipe.baseInterval) {
+              try { intervalMs = farming.modifyInterval(recipe.baseInterval, recipe); }
+              catch { intervalMs = recipe.baseInterval; }
+            }
+            if (intervalMs > 0) {
+              try {
+                farming.createGrowthTimer([plot], intervalMs);
+                logger.info(`[FARM] Created missing growth timer for ${p.id}, interval=${intervalMs}ms`);
+              } catch (e) {
+                logger.warn(`[FARM] Failed to create missing growth timer: ${e.message}`);
+              }
+            }
           }
         } else {
           // Just update state directly for other state changes
@@ -1583,6 +1651,15 @@ class Sync {
             plot.plantedRecipe = p.plantedRecipeId ? plantedRecipe : undefined;
           }
           if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
+          // If the plot is no longer growing (state 3 or 4), remove the timer
+          if (p.state !== 2 && farming.growthTimerMap) {
+            const timer = farming.growthTimerMap.get(plot);
+            if (timer) {
+              try { timer.stop(); } catch { /* noop */ }
+              farming.growthTimers.delete(timer);
+              farming.growthTimerMap.delete(plot);
+            }
+          }
         }
 
         // Handle compost: sync compost item and level
