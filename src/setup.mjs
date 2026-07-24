@@ -168,7 +168,6 @@ class Transport {
     }
   }
   get isConnected() { return this._paired; }
-  get myId() { return this._myRole || ''; }
   get role() { return this._myRole; }
   get myName() { return this._myName; }
   get peerName() { return this._peerName; }
@@ -4582,10 +4581,11 @@ class Sync {
       if (this._applyingRemote || !this.transport.isConnected) return;
       this._sendGameState();
     };
-    // Pause toggle
-    if (typeof Game.prototype.pause === 'function') this.ctx.patch(Game, 'pause').after(() => send());
-    // Merchant's permit read flag
-    if (typeof Game.prototype.readMerchantsPermit === 'function') this.ctx.patch(Game, 'readMerchantsPermit').after(() => send());
+    // Pause/unpause — Game has pauseActiveSkill/unpauseActiveSkill (not pause/unpause)
+    if (typeof Game.prototype.pauseActiveSkill === 'function') this.ctx.patch(Game, 'pauseActiveSkill').after(() => send());
+    if (typeof Game.prototype.unpauseActiveSkill === 'function') this.ctx.patch(Game, 'unpauseActiveSkill').after(() => send());
+    // merchantsPermitRead is a direct boolean property — no setter method to patch.
+    // It's synced via snapshot only (one-time flag, rarely changes).
     // Periodic tickTimestamp sync (so offline progress baseline matches)
     // — send every 60s via the action tick loop instead of patching internal tick.
   }
@@ -4606,11 +4606,12 @@ class Sync {
       if (typeof msg.tickTimestamp === 'number') game.tickTimestamp = msg.tickTimestamp;
       if (typeof msg.merchantsPermitRead === 'boolean') game.merchantsPermitRead = msg.merchantsPermitRead;
       if (typeof msg.isPaused === 'boolean') {
-        // Use the game's pause/unpause methods if available to keep UI in sync.
-        if (msg.isPaused && !game._isPaused && typeof game.pause === 'function') {
-          try { game.pause(); } catch { game._isPaused = true; }
-        } else if (!msg.isPaused && game._isPaused && typeof game.unpause === 'function') {
-          try { game.unpause(); } catch { game._isPaused = false; }
+        // Use the game's pauseActiveSkill/unpauseActiveSkill methods if available
+        // to keep UI in sync. Fall back to direct boolean set.
+        if (msg.isPaused && !game._isPaused && typeof game.pauseActiveSkill === 'function') {
+          try { game.pauseActiveSkill(); } catch { game._isPaused = true; }
+        } else if (!msg.isPaused && game._isPaused && typeof game.unpauseActiveSkill === 'function') {
+          try { game.unpauseActiveSkill(); } catch { game._isPaused = false; }
         } else {
           game._isPaused = msg.isPaused;
         }
