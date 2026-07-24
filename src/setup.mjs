@@ -3354,30 +3354,87 @@ class Sync {
   _patchCartography() {
     const ca = game.cartography;
     if (!ca) return;
+    logger.info('[CARTO] _patchCartography: starting');
+
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      // Send POI discoveries and paper recipe selection
-      const pois = [];
-      if (ca.worldMaps) {
-        for (const wm of ca.worldMaps.allObjects) {
-          if (wm.pointsOfInterest) {
-            for (const poi of wm.pointsOfInterest) {
-              if (poi.isDiscovered) pois.push({ mapId: wm.id, poiId: poi.id });
-            }
-          }
-        }
-      }
-      this.transport.send({
-        t: Msg.CARTOGRAPHY,
-        pois,
-        paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
-      });
+      this._sendCartography();
     };
-    for (const m of ['discoverPOI', 'selectPaperRecipeOnClick', 'autoSurveyOnClick', 'travelOnClick']) {
+
+    // Patch survey, discovery, travel, and paper methods
+    for (const m of ['discoverPOI', 'selectPaperRecipeOnClick', 'autoSurveyOnClick',
+                     'travelOnClick', 'surveyOnClick', 'startAutoSurvey',
+                     'startSurveyQueue', 'movePlayer', 'onHexTap',
+                     'makePaperOnClick', 'startMakingPaper',
+                     'createMapOnClick', 'startMapUpgradeOnClick',
+                     'startUpgradingMap', 'selectDigSiteOnClick',
+                     'selectDigSiteMapOnClick', 'deleteDigSiteMapOnClick',
+                     'selectRefinementOnClick', 'unlockFastTravelOnClick',
+                     'goToWorldMapOnClick', 'goToPlayerOnClick']) {
       if (typeof Cartography.prototype[m] === 'function') {
         this.ctx.patch(Cartography, m).after(() => send());
       }
     }
+
+    // Also patch surveyHex and onHexFullSurvey for survey progress
+    for (const m of ['surveyHex', 'onHexFullSurvey', 'onHexMastery',
+                     'surveyAuto', 'surveyActionQueue', 'action']) {
+      if (typeof Cartography.prototype[m] === 'function') {
+        this.ctx.patch(Cartography, m).after(() => send());
+      }
+    }
+  }
+
+  _sendCartography() {
+    const ca = game.cartography;
+    if (!ca) return;
+    const maps = [];
+    if (ca.worldMaps) {
+      for (const wm of ca.worldMaps.allObjects) {
+        const mapData = {
+          id: wm.id,
+          hexes: [],
+          pois: [],
+          playerPos: null,
+          fullySurveyedHexes: wm.fullySurveyedHexes || 0,
+          masteredHexes: wm.masteredHexes || 0,
+        };
+        // Send hex survey levels — only hexes that have been surveyed
+        if (wm.hexes) {
+          for (const [q, qMap] of wm.hexes) {
+            for (const [r, hex] of qMap) {
+              if (hex._surveyLevel > 0 || hex._surveyXP > 0) {
+                mapData.hexes.push({
+                  q, r,
+                  surveyLevel: hex._surveyLevel,
+                  surveyXP: hex._surveyXP,
+                });
+              }
+            }
+          }
+        }
+        // Send POI discoveries
+        if (wm.pointsOfInterest) {
+          for (const poi of wm.pointsOfInterest.allObjects) {
+            if (poi.isDiscovered) {
+              mapData.pois.push({ poiId: poi.id });
+            }
+          }
+        }
+        // Send player position
+        if (wm._playerPosition) {
+          const pos = wm._playerPosition;
+          mapData.playerPos = { q: pos.q, r: pos.r };
+        }
+        maps.push(mapData);
+      }
+    }
+    this.transport.send({
+      t: Msg.CARTOGRAPHY,
+      maps,
+      activeMapId: ca.activeMap ? ca.activeMap.id : null,
+      paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
+    });
   }
 
   _applyCartography(msg) {
@@ -3385,20 +3442,98 @@ class Sync {
     if (!ca) return;
     this._applyingRemote = true;
     try {
-      if (msg.pois && ca.worldMaps) {
-        for (const p of msg.pois) {
-          const wm = ca.worldMaps.getObjectByID(p.mapId);
-          if (!wm || !wm.pointsOfInterest) continue;
-          const poi = wm.pointsOfInterest.find(poi => poi.id === p.poiId);
-          if (poi) poi.isDiscovered = true;
+      if (msg.maps && ca.worldMaps) {
+        for (const mData of msg.maps) {
+          const wm = ca.worldMaps.getObjectByID(mData.id);
+          if (!wm) continue;
+
+          // Apply hex survey levels
+          if (mData.hexes && wm.hexes) {
+            for (const h of mData.hexes) {
+              const qMap = wm.hexes.get(h.q);
+              if (!qMap) continue;
+              const hex = qMap.get(h.r);
+              if (!hex) continue;
+              // Only update if the remote has more progress
+              if (h.surveyLevel > hex._surveyLevel) {
+                hex._surveyLevel = h.surveyLevel;
+                hex._surveyXP = h.surveyXP;
+                // Queue render updates
+                if (ca.renderQueue) {
+                  if (ca.renderQueue.hexBackground) ca.renderQueue.hexBackground.add(hex);
+                  if (ca.renderQueue.hexProgress) ca.renderQueue.hexProgress.add(hex);
+                  if (ca.renderQueue.masteryMarkers) ca.renderQueue.masteryMarkers.add(hex);
+                }
+              }
+            }
+          }
+
+          // Apply POI discoveries
+          if (mData.pois && wm.pointsOfInterest) {
+            for (const p of mData.pois) {
+              const poi = wm.pointsOfInterest.getObjectByID(p.poiId);
+              if (poi && !poi.isDiscovered) {
+                poi.isDiscovered = true;
+                // Try to use the game's discoverPOI method for proper rewards
+                try {
+                  if (typeof ca.discoverPOI === 'function') {
+                    ca.discoverPOI(poi);
+                  }
+                } catch (e) {
+                  logger.warn(`[CARTO] discoverPOI failed for ${p.poiId}: ${e.message}`);
+                }
+                if (ca.renderQueue && ca.renderQueue.poiMarkers) {
+                  ca.renderQueue.poiMarkers.add(poi);
+                }
+              }
+            }
+          }
+
+          // Apply player position
+          if (mData.playerPos && wm.hexes) {
+            const qMap = wm.hexes.get(mData.playerPos.q);
+            const hex = qMap ? qMap.get(mData.playerPos.r) : null;
+            if (hex) {
+              wm._playerPosition = hex;
+              if (ca.renderQueue) {
+                ca.renderQueue.playerMarker = true;
+                ca.renderQueue.visionRange = true;
+              }
+            }
+          }
+
+          // Update survey counts
+          if (typeof mData.fullySurveyedHexes === 'number') {
+            wm.fullySurveyedHexes = Math.max(wm.fullySurveyedHexes || 0, mData.fullySurveyedHexes);
+          }
+          if (typeof mData.masteredHexes === 'number') {
+            wm.masteredHexes = Math.max(wm.masteredHexes || 0, mData.masteredHexes);
+          }
         }
       }
+
+      // Set active map
+      if (msg.activeMapId && ca.worldMaps) {
+        const wm = ca.worldMaps.getObjectByID(msg.activeMapId);
+        if (wm && ca.activeMap !== wm) {
+          ca.activeMap = wm;
+          if (ca.renderQueue) {
+            ca.renderQueue.hexBackground = true;
+            ca.renderQueue.visionRange = true;
+            ca.renderQueue.playerMarker = true;
+          }
+        }
+      }
+
+      // Set paper recipe
       if (msg.paperRecipeId) {
         ca.selectedPaperRecipe = game.items.getObjectByID(msg.paperRecipeId);
       }
+
+      // Render
       if (ca.render) ca.render();
     } catch (e) { logger.error('applyCartography failed', e); }
-    finally { this._applyingRemote = false; }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
   // ---- Stats sync -------------------------------------------------------
@@ -3924,19 +4059,39 @@ class Sync {
       snapshot.township = townshipData;
     }
 
-    // Cartography
+    // Cartography — use the same format as _sendCartography
     if (game.cartography) {
-      const ca = game.cartography;
-      const cartoData = { pois: [], paperRecipeId: null };
       try {
-        if (ca.worldMaps) for (const wm of ca.worldMaps.allObjects) {
-          if (wm.pointsOfInterest) for (const poi of wm.pointsOfInterest) {
-            if (poi && poi.isDiscovered) cartoData.pois.push({ mapId: wm.id, poiId: poi.id });
+        const ca = game.cartography;
+        const maps = [];
+        if (ca.worldMaps) {
+          for (const wm of ca.worldMaps.allObjects) {
+            const mapData = {
+              id: wm.id, hexes: [], pois: [],
+              playerPos: null,
+              fullySurveyedHexes: wm.fullySurveyedHexes || 0,
+              masteredHexes: wm.masteredHexes || 0,
+            };
+            if (wm.hexes) for (const [q, qMap] of wm.hexes) {
+              for (const [r, hex] of qMap) {
+                if (hex._surveyLevel > 0 || hex._surveyXP > 0) {
+                  mapData.hexes.push({ q, r, surveyLevel: hex._surveyLevel, surveyXP: hex._surveyXP });
+                }
+              }
+            }
+            if (wm.pointsOfInterest) for (const poi of wm.pointsOfInterest.allObjects) {
+              if (poi.isDiscovered) mapData.pois.push({ poiId: poi.id });
+            }
+            if (wm._playerPosition) mapData.playerPos = { q: wm._playerPosition.q, r: wm._playerPosition.r };
+            maps.push(mapData);
           }
         }
-        if (ca.selectedPaperRecipe) cartoData.paperRecipeId = ca.selectedPaperRecipe.id;
+        snapshot.cartography = {
+          maps,
+          activeMapId: ca.activeMap ? ca.activeMap.id : null,
+          paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
+        };
       } catch { /* noop */ }
-      snapshot.cartography = cartoData;
     }
 
     // Clue hunt
