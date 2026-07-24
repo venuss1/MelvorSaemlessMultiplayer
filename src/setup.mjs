@@ -1288,28 +1288,71 @@ class Sync {
     // Patch the farming custom elements to be error-resilient.
     // The game's rendering code throws "Cannot read properties of undefined
     // (reading 'item')" when rendering some plots (e.g. recipe.seedCost.item
-    // is undefined for some recipes). This crashes the entire category view.
-    // We wrap setPlot in try/catch so one broken plot doesn't break the rest.
+    // is undefined for some recipes). This crashes the entire category view
+    // AND the game's main render loop. We wrap ALL update methods in
+    // try/catch so one broken plot doesn't break the rest.
     try {
+      const wrapMethod = (proto, name) => {
+        if (!proto || !proto[name]) return false;
+        const orig = proto[name];
+        proto[name] = function (...args) {
+          try { return orig.apply(this, args); }
+          catch (e) { logger.warn(`[FARM] ${proto.constructor.name}.${name} threw: ${e.message}`); }
+        };
+        return true;
+      };
+
+      // Patch LockedFarmingPlotElement — used for locked plots
       const LockedPlotEl = customElements.get('locked-farming-plot');
-      if (LockedPlotEl && LockedPlotEl.prototype.setPlot) {
-        const origLockedSetPlot = LockedPlotEl.prototype.setPlot;
-        LockedPlotEl.prototype.setPlot = function (plot, game) {
-          try { return origLockedSetPlot.call(this, plot, game); }
-          catch (e) { logger.warn(`[FARM] LockedFarmingPlotElement.setPlot threw for ${plot?.id}: ${e.message}`); }
-        };
-        logger.info('[FARM] Patched LockedFarmingPlotElement.setPlot');
+      if (LockedPlotEl) {
+        wrapMethod(LockedPlotEl.prototype, 'setPlot');
+        logger.info('[FARM] Patched LockedFarmingPlotElement');
       }
+
+      // Patch FarmingPlotElement — used for unlocked plots.
+      // updateGrowthTime is called during renderGrowthStatus which is
+      // called from Farming.render() in the main render loop. If it
+      // throws, the entire game render crashes.
       const PlotEl = customElements.get('farming-plot');
-      if (PlotEl && PlotEl.prototype.setPlot) {
-        const origSetPlot = PlotEl.prototype.setPlot;
-        PlotEl.prototype.setPlot = function (plot, game) {
-          try { return origSetPlot.call(this, plot, game); }
-          catch (e) { logger.warn(`[FARM] FarmingPlotElement.setPlot threw for ${plot?.id}: ${e.message}`); }
-        };
-        logger.info('[FARM] Patched FarmingPlotElement.setPlot');
+      if (PlotEl) {
+        for (const m of ['setPlot', 'updateCompost', 'updatePlotState',
+                         'updateGrowthTime', 'updateSelectedSeed',
+                         'updateSeedQuantities', 'destroyTooltips']) {
+          if (wrapMethod(PlotEl.prototype, m)) {
+            logger.info(`[FARM] Patched FarmingPlotElement.${m}`);
+          }
+        }
+      }
+
+      // Also patch the category options element
+      const CatOptsEl = customElements.get('farming-category-options');
+      if (CatOptsEl) {
+        wrapMethod(CatOptsEl.prototype, 'setCategory');
+        logger.info('[FARM] Patched FarmingCategoryOptionsElement.setCategory');
       }
     } catch (e) { logger.warn('[FARM] Could not patch custom elements:', e.message); }
+
+    // Patch Farming.renderGrowthStatus — iterates over plot elements and
+    // calls updateGrowthTime. If one throws, the rest don't get rendered.
+    if (typeof Farming.prototype.renderGrowthStatus === 'function') {
+      const origRenderGrowth = Farming.prototype.renderGrowthStatus;
+      Farming.prototype.renderGrowthStatus = function () {
+        try { return origRenderGrowth.call(this); }
+        catch (e) { logger.warn(`[FARM] renderGrowthStatus threw: ${e.message}`); }
+      };
+      logger.info('[FARM] Patched Farming.renderGrowthStatus');
+    }
+
+    // Patch Farming.render — the main render method called from the game
+    // render loop. If it throws, the entire game UI breaks.
+    if (typeof Farming.prototype.render === 'function') {
+      const origRender = Farming.prototype.render;
+      Farming.prototype.render = function () {
+        try { return origRender.call(this); }
+        catch (e) { logger.warn(`[FARM] Farming.render threw: ${e.message}`); }
+      };
+      logger.info('[FARM] Patched Farming.render');
+    }
 
     // Patch showPlotsInCategory to be error-resilient. The original can
     // throw mid-render, leaving the category view half-rendered.
