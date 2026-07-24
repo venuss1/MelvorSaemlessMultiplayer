@@ -84,6 +84,7 @@ const Msg = Object.freeze({
   COMBAT_EVENT: 'combat_event',
   COMBAT_CLAIM: 'combat_claim',     // { monsterId, areaId } — I'm fighting this
   COMBAT_RELEASE: 'combat_release', // {} — I stopped fighting
+  COMBAT_LOOT: 'combat_loot',       // { drops: [{itemId, qty}], currency: {gp, sc, ...} }
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
   UNLOCK_ALL: 'unlock_all',
@@ -363,7 +364,6 @@ class Sync {
     this.actionLock = actionLock;
     this._applyingRemote = false;
     this._combatOwner = null;  // 'me' = I'm attacking, 'peer' = peer is attacking, null = no one
-    this._becomingSpectator = false;  // true while becoming spectator (prevents stop events)
     this._combatWasPaused = false;  // remember pause state before we forced pause
     this._watcher = null;
     this._lastActiveSkillId = null;
@@ -2124,13 +2124,60 @@ class Sync {
       });
     }
 
+    // Patch Character.attack — when spectating, the spectator's player
+    // attacks deal 0 damage to the enemy. This prevents double-damage
+    // while keeping the attack bar animation and enemy visible.
+    if (typeof Character !== 'undefined' && Character.prototype && typeof Character.prototype.attack === 'function') {
+      const origAttack = Character.prototype.attack;
+      Character.prototype.attack = function (target, attack) {
+        // If we're spectating and this is the player attacking the enemy
+        if (sync._combatOwner === 'peer' && this === game.combat.player && target === game.combat.enemy) {
+          // Call the original but then heal the damage back (net 0)
+          const hpBefore = target.hitpoints;
+          const result = origAttack.call(this, target, attack);
+          // Restore HP — neutralize our attack
+          target.hitpoints = hpBefore;
+          return result;
+        }
+        return origAttack.call(this, target, attack);
+      };
+    }
+
+    // Patch CombatLoot.add — when attacker gets loot, sync to spectator
+    if (typeof CombatLoot !== 'undefined' && CombatLoot.prototype && typeof CombatLoot.prototype.add === 'function') {
+      this.ctx.patch(CombatLoot, 'add').after(function (item, quantity) {
+        // Only sync if we're the attacker
+        if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
+          const itemId = item && item.id ? item.id : null;
+          if (itemId) {
+            logger.info(`[COMBAT] Loot drop: ${itemId} x${quantity}`);
+            sync.transport.send({ t: Msg.COMBAT_LOOT, itemId, quantity });
+          }
+        }
+      });
+    }
+
+    // Patch dropEnemyCurrency — sync currency drops to spectator
+    if (typeof CombatManager.prototype.dropEnemyCurrency === 'function') {
+      const origDropCurrency = CombatManager.prototype.dropEnemyCurrency;
+      CombatManager.prototype.dropEnemyCurrency = function (monster) {
+        const gpBefore = game.gp ? game.gp : 0;
+        try { origDropCurrency.call(this, monster); } catch (e) { /* skip */ }
+        // If we're the attacker, sync currency gained
+        if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
+          const gpAfter = game.gp ? game.gp : 0;
+          const gpGained = gpAfter - gpBefore;
+          if (gpGained > 0) {
+            sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: 'melvorD:GP', quantity: gpGained });
+          }
+        }
+      };
+    }
+
     // Note: When spectating (_combatOwner === 'peer'), the local game still
-    // runs combat ticks and attacks. This is fine because:
-    // 1. Our damage/heal patches skip sending events (guarded by _combatOwner)
-    // 2. The attacker's damage events override our local HP (they send absolute hp)
-    // 3. Our local damage doesn't affect the attacker's game
-    // The spectator sees both their local damage and the attacker's damage,
-    // but the HP bar is always corrected by the attacker's state messages.
+    // runs combat ticks. The spectator's player attacks are neutralized
+    // (damage healed back) by the Character.attack patch above.
+    // The attacker's damage events override the enemy HP with absolute values.
 
     // Patch selectMonster — sync monster selection AND claim combat
     if (typeof CombatManager.prototype.selectMonster === 'function') {
@@ -2195,25 +2242,19 @@ class Sync {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
           this.ctx.patch(CombatManager, m).after(function () {
-            // Skip sending events if we're applying remote (spectator becoming spectator)
+            // Skip sending events if we're applying remote
             if (sync._applyingRemote) return;
-            // If local player stops combat (and we're the attacker), release claim
-            // and send stop event so the spectator also stops
+            // If attacker stops combat, release claim and send stop to spectator
             if (m === 'stop' && sync._combatOwner === 'me') {
               sync._combatOwner = null;
               sync.transport.send({ t: Msg.COMBAT_RELEASE });
-              // Also send a combat_event stop so spectator stops too
               sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
               logger.info(`[COMBAT] Released combat (stopped)`);
             }
-            // Only send spectator stop if it was a REAL user stop, not
-            // the automatic stop from becoming a spectator.
-            // We detect this by checking if _combatOwner is still 'peer'
-            // after the stop — if it is, it was a user action.
-            // But _applyCombatClaim sets _combatOwner='peer' BEFORE calling stop,
-            // so we need a flag to distinguish.
-            if (m === 'stop' && sync._combatOwner === 'peer' && !sync._becomingSpectator) {
+            // If spectator stops, notify attacker so they stop too
+            if (m === 'stop' && sync._combatOwner === 'peer') {
               sync.transport.send({ t: Msg.COMBAT_EVENT, kind: 'stop' });
+              sync._combatOwner = null;
               logger.info(`[COMBAT] Spectator stopped combat, notifying attacker`);
             }
             sendCombatState();
@@ -2293,9 +2334,23 @@ class Sync {
         this._renderCombat();
       } else if (msg.kind === 'stop') {
         // Attacker stopped combat — stop our combat too
+        // But preserve loot! Save loot before stop, restore after
         logger.info(`[COMBAT] Peer stopped combat`);
+        let savedLoot = null;
+        if (cm.loot && cm.loot.drops) {
+          savedLoot = cm.loot.drops.slice(); // copy loot array
+        }
         if (cm.stop) {
           try { cm.stop(); } catch (e) { /* skip */ }
+        }
+        // Restore loot if it was destroyed
+        if (savedLoot && cm.loot) {
+          if (!cm.loot.drops || cm.loot.drops.length < savedLoot.length) {
+            cm.loot.drops = savedLoot;
+            if (cm.loot.renderRequired !== undefined) cm.loot.renderRequired = true;
+            if (cm.loot.render) cm.loot.render();
+            logger.info(`[COMBAT] Restored ${savedLoot.length} loot items after stop`);
+          }
         }
         this._combatOwner = null;
         this._renderCombat();
@@ -2345,19 +2400,17 @@ class Sync {
     if (!cm) return;
     logger.info(`[COMBAT] Peer claimed combat: ${msg.monsterId}, area: ${msg.areaId}`);
     this._combatOwner = 'peer';
-    this._becomingSpectator = true;  // Prevent stop patch from sending events
-    // Stop our combat — we're spectating, not attacking
-    // This prevents double-damage: only the attacker's game runs combat
-    if (cm.stop) {
-      try { cm.stop(); } catch (e) { /* skip */ }
-    }
-    // Select the same monster so we can see it — but DON'T start combat
+    // DON'T call stop() — that hides the enemy and stops bars from animating.
+    // Instead, let combat run naturally so the spectator sees the enemy,
+    // attack bars, and HP. The spectator's player attacks are neutralized
+    // by the Character.attack patch (deals 0 damage when spectating).
+    // The attacker's damage events override the enemy HP.
+    // Select the same monster so we see the same enemy
     if (msg.monsterId) {
       this._applyingRemote = true;
       try {
         const monster = game.monsters.getObjectByID(msg.monsterId);
         if (monster && cm.enemy) {
-          // Only select if different monster or dead
           const currentId = cm.enemy.monster ? cm.enemy.monster.id : null;
           if (currentId !== msg.monsterId || cm.enemy.hitpoints <= 0) {
             let area = null;
@@ -2384,18 +2437,15 @@ class Sync {
             if (area && cm.selectMonster) {
               cm.selectMonster(monster, area);
               if (cm.enemy.hitpoints <= 0 && cm.spawnEnemy) cm.spawnEnemy();
-              // Stop combat again — selectMonster auto-starts it
-              if (cm.stop) {
-                try { cm.stop(); } catch (e) { /* skip */ }
-              }
               logger.info(`[COMBAT] Spectator selected monster: ${cm.enemy.monster ? cm.enemy.monster.id : 'none'}, hp=${cm.enemy.hitpoints}`);
             }
+          } else {
+            logger.info(`[COMBAT] Spectator: monster already selected, hp=${cm.enemy.hitpoints}`);
           }
         }
       } catch (e) { logger.warn(`[COMBAT] claim selectMonster failed: ${e.message}`); }
       finally { this._applyingRemote = false; }
     }
-    this._becomingSpectator = false;  // Re-enable stop patch events
     this._renderCombat();
   }
 
@@ -2405,6 +2455,42 @@ class Sync {
     logger.info(`[COMBAT] Peer released combat`);
     this._combatOwner = null;
     // Don't auto-unpause; let the player decide
+  }
+
+  // ---- Combat loot sync (both players get drops) ------------------------
+  _applyCombatLoot(msg) {
+    const cm = game.combat;
+    if (!cm) return;
+    logger.info(`[COMBAT] Received loot: ${msg.itemId} x${msg.quantity}`);
+    try {
+      // Handle GP (gold coins)
+      if (msg.itemId === 'melvorD:GP' && game.gp !== undefined) {
+        game.gp += msg.quantity;
+        if (game.addGP) game.addGP(msg.quantity);
+        return;
+      }
+      // Handle other currency types
+      if (msg.itemId === 'melvorD:SlayerCoins' && game.slayerCoins !== undefined) {
+        game.slayerCoins += msg.quantity;
+        return;
+      }
+      if (msg.itemId === 'melvorD:AbyssalPoints' && game.abyssalPoints !== undefined) {
+        game.abyssalPoints += msg.quantity;
+        return;
+      }
+      // Handle items — add to combat loot so player can collect
+      const item = game.items.getObjectByID(msg.itemId);
+      if (item && cm.loot) {
+        cm.loot.add(item, msg.quantity);
+        if (cm.loot.renderRequired !== undefined) cm.loot.renderRequired = true;
+        if (cm.loot.render) cm.loot.render();
+        logger.info(`[COMBAT] Added loot to container: ${msg.itemId} x${msg.quantity}`);
+      } else if (item && game.bank && game.bank.addItem) {
+        // Fallback: add directly to bank
+        game.bank.addItem(item, msg.quantity, false, true, false, false, 'Co-op Combat');
+        logger.info(`[COMBAT] Added loot to bank: ${msg.itemId} x${msg.quantity}`);
+      }
+    } catch (e) { logger.warn(`[COMBAT] Loot sync failed: ${e.message}`); }
   }
 
   // ---- Ancient relics sync ----------------------------------------------
@@ -4043,6 +4129,7 @@ class Sync {
       [Msg.COMBAT_EVENT]: (m) => this._applyCombatEvent(m),
       [Msg.COMBAT_CLAIM]: (m) => this._applyCombatClaim(m),
       [Msg.COMBAT_RELEASE]: () => this._applyCombatRelease(),
+      [Msg.COMBAT_LOOT]: (m) => this._applyCombatLoot(m),
       [Msg.ANCIENT_RELIC]: (m) => this._applyAncientRelic(m),
       [Msg.SKILL_TREE]: (m) => this._applySkillTree(m),
       [Msg.TOWNSHIP]: (m) => this._applyTownship(m),
