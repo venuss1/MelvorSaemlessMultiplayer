@@ -449,6 +449,9 @@ class Sync {
       ['TownshipTasks', () => this._patchTownshipTasks()],
       ['Cartography', () => this._patchCartography()],
       ['Stats', () => this._patchStats()],
+      ['LevelCaps', () => this._patchLevelCaps()],
+      ['GameState', () => this._patchGameState()],
+      ['Lore', () => this._patchLore()],
       ['Tutorial', () => this._patchTutorial()],
     ];
     let ok = 0, fail = 0, skip = 0;
@@ -1952,6 +1955,20 @@ class Sync {
         this.ctx.patch(Astrology, m).after(() => send());
       }
     }
+    // Sync constellation selection (study/explore)
+    const sendSelect = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      this.transport.send({
+        t: Msg.ASTROLOGY_SELECT,
+        studiedId: as.studiedConstellation ? as.studiedConstellation.id : null,
+        exploredId: as.exploredConstellation ? as.exploredConstellation.id : null,
+      });
+    };
+    for (const m of ['studyConstellationOnClick', 'exploreConstellationOnClick', 'resetActionState']) {
+      if (typeof Astrology.prototype[m] === 'function') {
+        this.ctx.patch(Astrology, m).after(() => sendSelect());
+      }
+    }
   }
 
   _sendAstrology() {
@@ -2025,6 +2042,23 @@ class Sync {
       if (as.render) as.render();
     } catch (e) { logger.error('applyAstrology failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
+  }
+
+  _applyAstrologySelect(msg) {
+    const as = game.astrology;
+    if (!as) return;
+    this._applyingRemote = true;
+    try {
+      if (msg.studiedId !== undefined) {
+        as.studiedConstellation = msg.studiedId ? as.actions.getObjectByID(msg.studiedId) : undefined;
+      }
+      if (msg.exploredId !== undefined) {
+        as.exploredConstellation = msg.exploredId ? as.actions.getObjectByID(msg.exploredId) : undefined;
+      }
+      if (as.render) try { as.render(); } catch { /* noop */ }
+      if (as.renderVisibleConstellations) try { as.renderVisibleConstellations(); } catch { /* noop */ }
+    } catch (e) { logger.error('applyAstrologySelect failed', e); }
+    finally { this._applyingRemote = false; }
   }
 
   // ---- Summoning sync (marks unlocked, selected costs) -----------------
@@ -3472,6 +3506,30 @@ class Sync {
       const history = (r.history || []).map(h => ({
         wave: h.wave, coins: h.coins, timestamp: h.timestamp,
       }));
+      // Live raid loadout: equipment, food, passives, modifiers, state.
+      const loadout = {};
+      if (r.player) {
+        const p = r.player;
+        loadout.equipment = {};
+        if (p.equipment) {
+          for (const slot of p.equipment.slotArray || []) {
+            const eq = p.equipment.getItemInSlot(slot);
+            if (eq && eq.item) loadout.equipment[slot] = { itemId: eq.item.id, qty: eq.quantity, set: eq.set };
+          }
+        }
+        loadout.food = null;
+        if (p.food && p.food.currentSlot && p.food.currentSlot.item) {
+          loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
+        }
+      }
+      loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.id, value: m.value }));
+      loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.id, value: m.value }));
+      loadout.state = r.state;
+      loadout.killCount = r.killCount;
+      loadout.posModsSelected = r.posModsSelected;
+      loadout.negModsSelected = r.negModsSelected;
+      loadout.isPaused = r.isPaused;
+      loadout.isFightingITMBoss = r.isFightingITMBoss;
       this.transport.send({
         t: Msg.RAID,
         wave: r.wave,
@@ -3480,11 +3538,20 @@ class Sync {
         selectedDifficulty: (typeof r.selectedDifficulty === 'number') ? r.selectedDifficulty
           : (r.selectedDifficulty && r.selectedDifficulty.id != null ? r.selectedDifficulty.id : null),
         history,
+        loadout,
       });
     };
-    for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'endRaid', 'nextWave']) {
+    for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'endRaid', 'nextWave', 'equipItem', 'equipFood', 'selectPassive', 'pause', 'unpause']) {
       if (typeof RaidManager.prototype[m] === 'function') {
         this.ctx.patch(RaidManager, m).after(() => send());
+      }
+    }
+    // Also patch RaidPlayer equip methods
+    if (typeof RaidPlayer !== 'undefined') {
+      for (const m of ['equipItem', 'equipFood', 'setEquipmentToDefault']) {
+        if (typeof RaidPlayer.prototype[m] === 'function') {
+          this.ctx.patch(RaidPlayer, m).after(() => send());
+        }
       }
     }
   }
@@ -3523,6 +3590,46 @@ class Sync {
           }
         }
       }
+      // Live raid loadout
+      if (msg.loadout) {
+        const lo = msg.loadout;
+        if (typeof lo.state === 'number') r.state = lo.state;
+        if (typeof lo.killCount === 'number') r.killCount = lo.killCount;
+        if (typeof lo.posModsSelected === 'number') r.posModsSelected = lo.posModsSelected;
+        if (typeof lo.negModsSelected === 'number') r.negModsSelected = lo.negModsSelected;
+        if (typeof lo.isPaused === 'boolean') r.isPaused = lo.isPaused;
+        if (typeof lo.isFightingITMBoss === 'boolean') r.isFightingITMBoss = lo.isFightingITMBoss;
+        // Equipment
+        if (lo.equipment && r.player && r.player.equipment) {
+          for (const [slot, eq] of Object.entries(lo.equipment)) {
+            const item = game.items.getObjectByID(eq.itemId);
+            if (item && typeof r.player.equipItem === 'function') {
+              try { r.player.equipItem(item, eq.set || 0, slot, eq.qty || 1); } catch { /* noop */ }
+            }
+          }
+        }
+        // Food
+        if (lo.food && r.player && typeof r.player.equipFood === 'function') {
+          const foodItem = game.items.getObjectByID(lo.food.itemId);
+          if (foodItem) {
+            try { r.player.equipFood(foodItem, lo.food.qty || 1); } catch { /* noop */ }
+          }
+        }
+        // Modifiers — set directly (these are runtime-only during a raid)
+        if (lo.randomPlayerModifiers) {
+          r.randomPlayerModifiers = lo.randomPlayerModifiers.map(m => {
+            const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+            return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
+          });
+        }
+        if (lo.randomEnemyModifiers) {
+          r.randomEnemyModifiers = lo.randomEnemyModifiers.map(m => {
+            const mod = game.modifiers && game.modifiers.getObjectByID(m.id);
+            return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
+          });
+        }
+        if (r.render) try { r.render(); } catch { /* noop */ }
+      }
     } catch (e) { logger.error('applyRaid failed', e); }
     finally { this._applyingRemote = false; }
   }
@@ -3560,10 +3667,22 @@ class Sync {
       if (msg.activeFishId) fc.activeFish = game.items.getObjectByID(msg.activeFishId);
       if (typeof msg.actionsRemaining === 'number') fc.actionsRemaining = msg.actionsRemaining;
       if (msg.results) {
-        fc.playerResults = msg.results.map(r => ({
+        // Merge by timestamp+fish to avoid losing local results the remote
+        // doesn't know about. Take the higher score for each entry.
+        const incoming = msg.results.map(r => ({
           fish: r.fishId ? game.items.getObjectByID(r.fishId) : null,
           score: r.score, timestamp: r.timestamp,
         }));
+        if (!fc.playerResults) fc.playerResults = [];
+        for (const inc of incoming) {
+          const existing = fc.playerResults.find(r => r.timestamp === inc.timestamp && r.fish === inc.fish);
+          if (existing) {
+            if ((inc.score || 0) > (existing.score || 0)) existing.score = inc.score;
+          } else {
+            fc.playerResults.push(inc);
+          }
+        }
+        if (fc.render) try { fc.render(); } catch { /* noop */ }
       }
     } catch (e) { logger.error('applyFishingContest failed', e); }
     finally { this._applyingRemote = false; }
@@ -3711,7 +3830,32 @@ class Sync {
       maps,
       activeMapId: ca.activeMap ? ca.activeMap.id : null,
       paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
+      selectedMapUpgradeDigsiteId: ca.selectedMapUpgradeDigsite ? ca.selectedMapUpgradeDigsite.id : null,
+      // Dig site maps (tier, upgrade actions, charges, refinements)
+      digSiteMaps: this._serializeDigSiteMaps(),
     });
+  }
+
+  _serializeDigSiteMaps() {
+    const ca = game.cartography;
+    if (!ca) return [];
+    const out = [];
+    if (game.archaeology && game.archaeology.actions) {
+      for (const digSite of game.archaeology.actions.allObjects) {
+        if (!digSite.maps) continue;
+        const maps = [];
+        for (const m of digSite.maps) {
+          maps.push({
+            tierIndex: m.tier ? m.tier.index : 0,
+            upgradeActions: m._upgradeActions || 0,
+            charges: m.charges || 0,
+            refinements: (m.refinements || []).map(r => ({ id: r.id, value: r.value })),
+          });
+        }
+        out.push({ digSiteId: digSite.id, maps });
+      }
+    }
+    return out;
   }
 
   _applyCartography(msg) {
@@ -3807,6 +3951,42 @@ class Sync {
         ca.selectedPaperRecipe = game.items.getObjectByID(msg.paperRecipeId);
       }
 
+      // Set selected map upgrade digsite
+      if (msg.selectedMapUpgradeDigsiteId !== undefined) {
+        ca.selectedMapUpgradeDigsite = msg.selectedMapUpgradeDigsiteId
+          ? (game.archaeology && game.archaeology.actions.getObjectByID(msg.selectedMapUpgradeDigsiteId))
+          : undefined;
+      }
+
+      // Apply dig site maps (tier, upgrade actions, charges, refinements)
+      if (msg.digSiteMaps && game.archaeology && game.archaeology.actions) {
+        for (const dsm of msg.digSiteMaps) {
+          const digSite = game.archaeology.actions.getObjectByID(dsm.digSiteId);
+          if (!digSite || !digSite.maps) continue;
+          // Ensure we have the right number of maps; create missing ones.
+          while (digSite.maps.length < dsm.maps.length) {
+            try { ca.createNewMapForDigSite(digSite); } catch { break; }
+          }
+          for (let i = 0; i < dsm.maps.length && i < digSite.maps.length; i++) {
+            const remote = dsm.maps[i];
+            const local = digSite.maps[i];
+            if (typeof remote.upgradeActions === 'number') local._upgradeActions = remote.upgradeActions;
+            if (typeof remote.charges === 'number') local.charges = remote.charges;
+            // Recompute tier from upgrade actions
+            if (typeof local.computeTier === 'function') {
+              try { local.computeTier(); } catch { /* noop */ }
+            }
+            // Refinements — replace if remote has more
+            if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
+              local.refinements = remote.refinements.map(r => {
+                const mod = game.modifiers && game.modifiers.getObjectByID(r.id);
+                return mod ? { ...mod, value: r.value } : { id: r.id, value: r.value };
+              });
+            }
+          }
+        }
+      }
+
       // Render
       if (ca.render) ca.render();
     } catch (e) { logger.error('applyCartography failed', e); }
@@ -3849,6 +4029,143 @@ class Sync {
       }
       if (game.stats.renderMutatedStats) try { game.stats.renderMutatedStats(); } catch { /* noop */ }
     } catch (e) { logger.error('applyStats failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Skill level cap increases sync -----------------------------------
+  // Purchased from the shop; tracked on Game as _levelCapIncreasesBought,
+  // _abyssalLevelCapIncreasesBought, and activeLevelCapIncreases (the
+  // specific caps currently applied to skills).
+  _patchLevelCaps() {
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      this._sendLevelCaps();
+    };
+    for (const m of ['purchaseSkillLevelCaps', 'purchaseAbyssalSkillLevelCaps', 'increaseSkillLevelCaps', 'selectRandomLevelCapIncrease']) {
+      if (typeof Game.prototype[m] === 'function') {
+        this.ctx.patch(Game, m).after(() => send());
+      }
+    }
+  }
+
+  _sendLevelCaps() {
+    const data = {
+      t: Msg.LEVEL_CAP,
+      levelCapIncreasesBought: game._levelCapIncreasesBought,
+      abyssalLevelCapIncreasesBought: game._abyssalLevelCapIncreasesBought,
+      active: [],
+      beingSelected: [],
+    };
+    if (game.activeLevelCapIncreases) {
+      for (const cap of game.activeLevelCapIncreases) {
+        if (cap && cap.id) data.active.push({ id: cap.id, skillId: cap.skill ? cap.skill.id : null });
+      }
+    }
+    if (game.levelCapIncreasesBeingSelected) {
+      for (const cap of game.levelCapIncreasesBeingSelected) {
+        if (cap && cap.id) data.beingSelected.push(cap.id);
+      }
+    }
+    this.transport.send(data);
+  }
+
+  _applyLevelCaps(msg) {
+    this._applyingRemote = true;
+    try {
+      if (typeof msg.levelCapIncreasesBought === 'number') game._levelCapIncreasesBought = msg.levelCapIncreasesBought;
+      if (typeof msg.abyssalLevelCapIncreasesBought === 'number') game._abyssalLevelCapIncreasesBought = msg.abyssalLevelCapIncreasesBought;
+      if (msg.active && game.skillLevelCapIncreases) {
+        game.activeLevelCapIncreases = msg.active.map(a => game.skillLevelCapIncreases.getObjectByID(a.id)).filter(Boolean);
+      }
+      if (msg.beingSelected && game.skillLevelCapIncreases) {
+        game.levelCapIncreasesBeingSelected = msg.beingSelected.map(id => game.skillLevelCapIncreases.getObjectByID(id)).filter(Boolean);
+      }
+      // Recompute skill level caps so the effect applies.
+      if (typeof game.validateRandomLevelCapIncreases === 'function') {
+        try { game.validateRandomLevelCapIncreases(); } catch { /* noop */ }
+      }
+    } catch (e) { logger.error('applyLevelCaps failed', e); }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
+  }
+
+  // ---- Game state sync (tickTimestamp, merchantsPermitRead, pause) ------
+  _patchGameState() {
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      this._sendGameState();
+    };
+    // Pause toggle
+    if (typeof Game.prototype.pause === 'function') this.ctx.patch(Game, 'pause').after(() => send());
+    // Merchant's permit read flag
+    if (typeof Game.prototype.readMerchantsPermit === 'function') this.ctx.patch(Game, 'readMerchantsPermit').after(() => send());
+    // Periodic tickTimestamp sync (so offline progress baseline matches)
+    // — send every 60s via the action tick loop instead of patching internal tick.
+  }
+
+  _sendGameState() {
+    this.transport.send({
+      t: Msg.GAME_STATE,
+      tickTimestamp: game.tickTimestamp,
+      merchantsPermitRead: game.merchantsPermitRead,
+      isPaused: game._isPaused,
+    });
+  }
+
+  _applyGameState(msg) {
+    this._applyingRemote = true;
+    try {
+      if (typeof msg.tickTimestamp === 'number') game.tickTimestamp = msg.tickTimestamp;
+      if (typeof msg.merchantsPermitRead === 'boolean') game.merchantsPermitRead = msg.merchantsPermitRead;
+      if (typeof msg.isPaused === 'boolean') {
+        // Use the game's pause/unpause methods if available to keep UI in sync.
+        if (msg.isPaused && !game._isPaused && typeof game.pause === 'function') {
+          try { game.pause(); } catch { game._isPaused = true; }
+        } else if (!msg.isPaused && game._isPaused && typeof game.unpause === 'function') {
+          try { game.unpause(); } catch { game._isPaused = false; }
+        } else {
+          game._isPaused = msg.isPaused;
+        }
+      }
+    } catch (e) { logger.error('applyGameState failed', e); }
+    finally { this._applyingRemote = false; }
+  }
+
+  // ---- Lore books read sync ---------------------------------------------
+  _patchLore() {
+    if (!game.lore) return;
+    const send = () => {
+      if (this._applyingRemote || !this.transport.isConnected) return;
+      this._sendLore();
+    };
+    if (typeof Lore.prototype.readLore === 'function') this.ctx.patch(Lore, 'readLore').after(() => send());
+    if (typeof Lore.prototype.updateLoreBookUnlocks === 'function') this.ctx.patch(Lore, 'updateLoreBookUnlocks').after(() => send());
+  }
+
+  _sendLore() {
+    const lore = game.lore;
+    if (!lore) return;
+    const read = [];
+    if (lore.books) for (const book of lore.books.allObjects) {
+      // Lore tracks read state internally; check for a read flag or use the
+      // bookButtons map (read books have a disabled read button).
+      if (book._read || book.isRead) read.push(book.id);
+    }
+    this.transport.send({ t: Msg.LORE, read });
+  }
+
+  _applyLore(msg) {
+    if (!game.lore || !msg.read) return;
+    this._applyingRemote = true;
+    try {
+      for (const bookId of msg.read) {
+        const book = game.lore.books && game.lore.books.getObjectByID(bookId);
+        if (book) {
+          if ('_read' in book) book._read = true;
+          if ('isRead' in book) book.isRead = true;
+        }
+      }
+      if (game.lore.render) try { game.lore.render(); } catch { /* noop */ }
+    } catch (e) { logger.error('applyLore failed', e); }
     finally { this._applyingRemote = false; }
   }
 
@@ -4300,13 +4617,21 @@ class Sync {
       const as = game.astrology;
       const astrologyUpgrades = [];
       try {
-        if (as.standardModifierUpgrades) {
-          for (const mod of as.standardModifierUpgrades) {
-            if (mod && mod.recipe && mod.recipe.id) astrologyUpgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought });
+        const collect = (arr, type) => {
+          if (!arr) return;
+          for (const mod of arr) {
+            if (mod && mod.recipe && mod.recipe.id) astrologyUpgrades.push({ recipeId: mod.recipe.id, tier: mod.tier, timesBought: mod.timesBought, type });
           }
-        }
+        };
+        collect(as.standardModifierUpgrades, 'standard');
+        collect(as.uniqueModifierUpgrades, 'unique');
+        collect(as.abyssalModifierUpgrades, 'abyssal');
       } catch { /* noop */ }
-      snapshot.astrology = { upgrades: astrologyUpgrades };
+      snapshot.astrology = {
+        upgrades: astrologyUpgrades,
+        studiedId: as.studiedConstellation ? as.studiedConstellation.id : null,
+        exploredId: as.exploredConstellation ? as.exploredConstellation.id : null,
+      };
     }
 
     // Summoning (marks + selected non-shard costs)
@@ -4396,6 +4721,8 @@ class Sync {
           maps,
           activeMapId: ca.activeMap ? ca.activeMap.id : null,
           paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
+          selectedMapUpgradeDigsiteId: ca.selectedMapUpgradeDigsite ? ca.selectedMapUpgradeDigsite.id : null,
+          digSiteMaps: this._serializeDigSiteMaps(),
         };
       } catch { /* noop */ }
     }
@@ -4434,8 +4761,33 @@ class Sync {
       try {
         if (typeof r.wave === 'number') raidData.wave = r.wave;
         if (typeof r.waveProgress === 'number') raidData.waveProgress = r.waveProgress;
-        if (r.selectedDifficulty) raidData.selectedDifficulty = r.selectedDifficulty.id;
+        if (r.selectedDifficulty) raidData.selectedDifficulty = (typeof r.selectedDifficulty === 'number') ? r.selectedDifficulty : r.selectedDifficulty.id;
         if (r.history) raidData.history = r.history.slice(-20); // last 20 entries
+        // Live raid loadout
+        const loadout = {};
+        if (r.player) {
+          const p = r.player;
+          loadout.equipment = {};
+          if (p.equipment) {
+            for (const slot of p.equipment.slotArray || []) {
+              const eq = p.equipment.getItemInSlot(slot);
+              if (eq && eq.item) loadout.equipment[slot] = { itemId: eq.item.id, qty: eq.quantity, set: eq.set };
+            }
+          }
+          loadout.food = null;
+          if (p.food && p.food.currentSlot && p.food.currentSlot.item) {
+            loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
+          }
+        }
+        loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.id, value: m.value }));
+        loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.id, value: m.value }));
+        loadout.state = r.state;
+        loadout.killCount = r.killCount;
+        loadout.posModsSelected = r.posModsSelected;
+        loadout.negModsSelected = r.negModsSelected;
+        loadout.isPaused = r.isPaused;
+        loadout.isFightingITMBoss = r.isFightingITMBoss;
+        raidData.loadout = loadout;
       } catch { /* noop */ }
       snapshot.raid = raidData;
     }
@@ -4462,6 +4814,30 @@ class Sync {
         for (const [key, val] of game.stats.stats) statsData[key] = val;
       } catch { /* noop */ }
       snapshot.stats = statsData;
+    }
+
+    // Skill level cap increases
+    snapshot.levelCaps = {
+      levelCapIncreasesBought: game._levelCapIncreasesBought,
+      abyssalLevelCapIncreasesBought: game._abyssalLevelCapIncreasesBought,
+      active: (game.activeLevelCapIncreases || []).map(c => ({ id: c.id, skillId: c.skill ? c.skill.id : null })),
+      beingSelected: (game.levelCapIncreasesBeingSelected || []).map(c => c.id),
+    };
+
+    // Game state (tickTimestamp, merchantsPermitRead, pause)
+    snapshot.gameState = {
+      tickTimestamp: game.tickTimestamp,
+      merchantsPermitRead: game.merchantsPermitRead,
+      isPaused: game._isPaused,
+    };
+
+    // Lore books read
+    if (game.lore && game.lore.books) {
+      const read = [];
+      for (const book of game.lore.books.allObjects) {
+        if (book._read || book.isRead) read.push(book.id);
+      }
+      snapshot.lore = { read };
     }
 
     logger.info(`[SNAPSHOT] Built: ${skills.length} skills, ${bank.length} bank items, ${currencies.length} currencies, ${equipSets.length} equip sets, ${pets.length} pets, ${charges.length} charges, ${rockHP?.length || 0} rocks, ${farmingPlots?.length || 0} farming plots, ${mastery.length} mastery skills, combat: ${combatState ? 'yes' : 'no'}`);
@@ -4740,6 +5116,11 @@ class Sync {
       // Astrology from snapshot
       if (msg.astrology && game.astrology) {
         this._applyAstrology({ upgrades: msg.astrology.upgrades });
+        this._applyingRemote = true;
+        if (msg.astrology.studiedId !== undefined || msg.astrology.exploredId !== undefined) {
+          this._applyAstrologySelect(msg.astrology);
+          this._applyingRemote = true;
+        }
       }
       // Summoning from snapshot
       if (msg.summoning && game.summoning) {
@@ -4776,6 +5157,26 @@ class Sync {
       // Stats from snapshot
       if (msg.stats && game.stats) {
         this._applyStats({ stats: msg.stats });
+        this._applyingRemote = true;
+      }
+      // Level cap increases from snapshot
+      if (msg.levelCaps) {
+        this._applyLevelCaps(msg.levelCaps);
+        this._applyingRemote = true;
+      }
+      // Game state from snapshot
+      if (msg.gameState) {
+        this._applyGameState(msg.gameState);
+        this._applyingRemote = true;
+      }
+      // Lore from snapshot
+      if (msg.lore) {
+        this._applyLore(msg.lore);
+        this._applyingRemote = true;
+      }
+      // Refresh completion log after all state applied
+      if (game.completion && typeof game.completion.updateAllCompletion === 'function') {
+        try { game.completion.updateAllCompletion(); } catch { /* noop */ }
       }
       this._forceRender();
     } catch (e) { logger.error('snapshot apply failed', e); }
@@ -5328,6 +5729,7 @@ class Sync {
       [Msg.FARMING]: (m) => this._applyFarming(m),
       [Msg.AGILITY]: (m) => this._applyAgility(m),
       [Msg.ASTROLOGY]: (m) => this._applyAstrology(m),
+      [Msg.ASTROLOGY_SELECT]: (m) => this._applyAstrologySelect(m),
       [Msg.SUMMONING]: (m) => this._applySummoning(m),
       [Msg.SLAYER]: (m) => this._applySlayer(m),
       [Msg.SKILL_SELECT]: (m) => this._applySkillSelect(m),
@@ -5348,6 +5750,9 @@ class Sync {
       [Msg.TOWNSHIP_TASKS]: (m) => this._applyTownshipTasks(m),
       [Msg.CARTOGRAPHY]: (m) => this._applyCartography(m),
       [Msg.STATS]: (m) => this._applyStats(m),
+      [Msg.LEVEL_CAP]: (m) => this._applyLevelCaps(m),
+      [Msg.GAME_STATE]: (m) => this._applyGameState(m),
+      [Msg.LORE]: (m) => this._applyLore(m),
       [Msg.STATE_REQUEST]: () => this.transport.send(this._buildSnapshot()),
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
       [Msg.UNLOCK_ALL]: () => this._unlockAll(),
