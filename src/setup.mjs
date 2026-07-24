@@ -1285,6 +1285,50 @@ class Sync {
     logger.info('[FARM] plantPlot type:', typeof farming.plantPlot);
     logger.info('[FARM] compostPlot type:', typeof farming.compostPlot);
 
+    // Patch the farming custom elements to be error-resilient.
+    // The game's rendering code throws "Cannot read properties of undefined
+    // (reading 'item')" when rendering some plots (e.g. recipe.seedCost.item
+    // is undefined for some recipes). This crashes the entire category view.
+    // We wrap setPlot in try/catch so one broken plot doesn't break the rest.
+    try {
+      const LockedPlotEl = customElements.get('locked-farming-plot');
+      if (LockedPlotEl && LockedPlotEl.prototype.setPlot) {
+        const origLockedSetPlot = LockedPlotEl.prototype.setPlot;
+        LockedPlotEl.prototype.setPlot = function (plot, game) {
+          try { return origLockedSetPlot.call(this, plot, game); }
+          catch (e) { logger.warn(`[FARM] LockedFarmingPlotElement.setPlot threw for ${plot?.id}: ${e.message}`); }
+        };
+        logger.info('[FARM] Patched LockedFarmingPlotElement.setPlot');
+      }
+      const PlotEl = customElements.get('farming-plot');
+      if (PlotEl && PlotEl.prototype.setPlot) {
+        const origSetPlot = PlotEl.prototype.setPlot;
+        PlotEl.prototype.setPlot = function (plot, game) {
+          try { return origSetPlot.call(this, plot, game); }
+          catch (e) { logger.warn(`[FARM] FarmingPlotElement.setPlot threw for ${plot?.id}: ${e.message}`); }
+        };
+        logger.info('[FARM] Patched FarmingPlotElement.setPlot');
+      }
+    } catch (e) { logger.warn('[FARM] Could not patch custom elements:', e.message); }
+
+    // Patch showPlotsInCategory to be error-resilient. The original can
+    // throw mid-render, leaving the category view half-rendered.
+    if (typeof Farming.prototype.showPlotsInCategory === 'function') {
+      const origShowPlots = Farming.prototype.showPlotsInCategory;
+      Farming.prototype.showPlotsInCategory = function (category) {
+        try {
+          return origShowPlots.call(this, category);
+        } catch (e) {
+          logger.warn(`[FARM] showPlotsInCategory threw for ${category?.id}: ${e.message}`);
+          // Try a second time — sometimes the first call partially succeeds
+          // and the second call can complete the render.
+          try { return origShowPlots.call(this, category); }
+          catch (e2) { logger.warn(`[FARM] showPlotsInCategory second try also threw: ${e2.message}`); }
+        }
+      };
+      logger.info('[FARM] Patched showPlotsInCategory');
+    }
+
     const sendPlot = function (plot) {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       if (!plot || !plot.id) return;
