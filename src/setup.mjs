@@ -4157,9 +4157,12 @@ class Sync {
       }
     }
 
-    // Also patch surveyHex and onHexFullSurvey for survey progress
+    // Also patch surveyHex and onHexFullSurvey for survey progress.
+    // NOTE: 'action' is called every tick during surveying — don't patch
+    // it directly as that would send cartography data every tick (huge
+    // payload). Instead, throttle via the periodic state sync.
     for (const m of ['surveyHex', 'onHexFullSurvey', 'onHexMastery',
-                     'surveyAuto', 'surveyActionQueue', 'action']) {
+                     'surveyAuto', 'surveyActionQueue']) {
       if (typeof Cartography.prototype[m] === 'function') {
         this.ctx.patch(Cartography, m).after(() => send());
       }
@@ -4280,20 +4283,15 @@ class Sync {
             }
           }
 
-          // Apply POI discoveries, discovery modifiers, and fast travel unlock status
+          // Apply POI discoveries and fast travel unlock status.
+          // Do NOT call ca.discoverPOI() — it triggers rewards, UI cascading,
+          // and potentially recursive rendering that freezes the game.
+          // Just set the fields directly.
           if (mData.pois && wm.pointsOfInterest) {
             for (const p of mData.pois) {
               const poi = wm.pointsOfInterest.getObjectByID(p.poiId);
               if (poi && !poi.isDiscovered) {
                 poi.isDiscovered = true;
-                // Try to use the game's discoverPOI method for proper rewards
-                try {
-                  if (typeof ca.discoverPOI === 'function') {
-                    ca.discoverPOI(poi);
-                  }
-                } catch (e) {
-                  logger.warn(`[CARTO] discoverPOI failed for ${p.poiId}: ${e.message}`);
-                }
                 if (ca.renderQueue && ca.renderQueue.poiMarkers) {
                   ca.renderQueue.poiMarkers.add(poi);
                 }
@@ -4328,18 +4326,16 @@ class Sync {
         }
       }
 
-      // Set active map
+      // Set active map — only if the local player is not currently
+      // viewing cartography (to avoid disrupting their view). Don't
+      // add all hexes to the render queue — that can be thousands of
+      // hexes and freeze the game.
       if (msg.activeMapId && ca.worldMaps) {
         const wm = ca.worldMaps.getObjectByID(msg.activeMapId);
         if (wm && ca.activeMap !== wm) {
           ca.activeMap = wm;
+          // Just set flags, let the game's render loop handle it.
           if (ca.renderQueue) {
-            // hexBackground is Set<Hex>, not boolean — add all hexes.
-            if (ca.renderQueue.hexBackground && wm.hexes) {
-              for (const qMap of wm.hexes.values()) {
-                for (const hex of qMap.values()) ca.renderQueue.hexBackground.add(hex);
-              }
-            }
             ca.renderQueue.visionRange = true;
             ca.renderQueue.playerMarker = true;
           }
@@ -4396,8 +4392,10 @@ class Sync {
         }
       }
 
-      // Render
-      if (ca.render) ca.render();
+      // Don't call ca.render() — it's extremely expensive for cartography
+      // (re-renders the entire hex map) and can freeze the game. The render
+      // queue entries we set above will be processed by the game's normal
+      // render loop on the next tick.
     } catch (e) { logger.error('applyCartography failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
   }
