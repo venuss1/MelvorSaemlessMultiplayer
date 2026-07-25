@@ -35,11 +35,6 @@ peer-to-peer connection.
    re-renders, bypassing the modifier pipeline so progress is never counted
    twice. Both clients converge on identical state.
 
-### Co-op boost
-
-When both players gather the **same resource** at the same time, a **co-op
-boost** kicks in and halves the action interval (2x speed) for both clients.
-
 ### Action lock
 
 A "current action" watcher reports which skill each player is training and
