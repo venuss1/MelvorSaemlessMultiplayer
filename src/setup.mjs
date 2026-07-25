@@ -4982,18 +4982,18 @@ class Sync {
     // on the skill page — but ONLY if the user is already viewing that skill,
     // and ONLY the specific progress bar for the resource being gathered.
     // We do NOT auto-navigate, so the user can freely switch tabs.
+    //
+    // IMPORTANT: We must NOT set timer.active = true or modify the skill's
+    // internal action state. Doing so makes the game's tick loop think the
+    // LOCAL player is doing this action, which calls startActionTimer() with
+    // the local player's selected resources — if none are selected, the
+    // interval computes to -Infinity and crashes the game.
     try {
       const skill = game.skills.getObjectByID(msg.skillId || msg.actionId);
       if (!skill || !skill.actionTimer) return;
-      const timer = skill.actionTimer;
 
       this._applyingRemote = true;
       try {
-        // Set up the timer to match the remote action.
-        timer._ticksLeft = msg.ticksLeft || 0;
-        timer._maxTicks = msg.maxTicks || 1;
-        timer.active = true;
-
         // Calculate elapsed and total time for animateProgress.
         const maxTicks = msg.maxTicks || 1;
         const ticksLeft = msg.ticksLeft || 0;
@@ -5015,7 +5015,9 @@ class Sync {
                 // Use animateProgressFromTimer first (most reliable),
                 // then fall back to animateProgress.
                 if (bar.animateProgressFromTimer) {
-                  try { bar.animateProgressFromTimer(timer); } catch { /* noop */ }
+                  // Create a lightweight fake timer object for animation only.
+                  const fakeTimer = { _ticksLeft: ticksLeft, _maxTicks: maxTicks, active: true };
+                  try { bar.animateProgressFromTimer(fakeTimer); } catch { /* noop */ }
                 } else if (bar.animateProgress) {
                   try { bar.animateProgress(elapsedMs, totalMs); } catch { /* noop */ }
                 }
@@ -5094,10 +5096,8 @@ class Sync {
 
           if (!localIsSameAction) {
             // Local player is not doing this skill — safe to stop the bar.
-            if (skill.actionTimer) {
-              try { skill.actionTimer.stop(); } catch { /* noop */ }
-              try { skill.actionTimer.active = false; } catch { /* noop */ }
-            }
+            // Only stop UI animation, do NOT touch the timer's active state
+            // to avoid interfering with the game's tick loop.
             if (skill.stopActiveProgressBar) {
               try { skill.stopActiveProgressBar(); } catch { /* noop */ }
             }
@@ -6334,10 +6334,15 @@ class Sync {
             }
           }
           if (ss.woodcutting && game.woodcutting) {
-            game.woodcutting.activeTrees.clear();
-            for (const tid of ss.woodcutting.trees || []) {
-              const tree = game.woodcutting.actions.getObjectByID(tid);
-              if (tree) game.woodcutting.activeTrees.add(tree);
+            // Don't clear activeTrees if the local player is actively
+            // woodcutting — clearing trees while the action is running
+            // causes -Infinity tick errors.
+            if (!game.woodcutting.isActive) {
+              game.woodcutting.activeTrees.clear();
+              for (const tid of ss.woodcutting.trees || []) {
+                const tree = game.woodcutting.actions.getObjectByID(tid);
+                if (tree) game.woodcutting.activeTrees.add(tree);
+              }
             }
           }
           if (ss.firemaking && game.firemaking) {
