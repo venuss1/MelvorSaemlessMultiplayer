@@ -6663,18 +6663,9 @@ class Sync {
       }
       logger.info(`[UNLOCK] Bank items: ${itemCount} added`);
 
-      // 3. All currencies — use set(max) instead of add to avoid
-      // going negative if add() triggers spending side-effects.
-      let curCount = 0;
-      if (game.currencies && game.currencies.allObjects) {
-        for (const cur of game.currencies.allObjects) {
-          try {
-            cur.set(Math.max(cur._amount || 0, 1000000000));
-            curCount++;
-          } catch (e) { /* skip */ }
-        }
-      }
-      logger.info(`[UNLOCK] Currencies: ${curCount} maxed`);
+      // 3. Currencies are set LAST (after all spending operations like
+      // agility buildObstacle/buildPillar) to prevent going negative.
+      // See step 23b at the end.
 
       // 4. All pets — use isPetUnlocked + unlockPet, with fallback to unlockPetByID and direct set add
       let petCount = 0;
@@ -7048,6 +7039,20 @@ class Sync {
         }
         logger.info('[UNLOCK] Level cap increases: 50 purchased, per-skill caps maxed');
       } catch (e) { /* skip */ }
+
+      // 23b. Max all currencies LAST — after all spending operations
+      // (agility buildObstacle/buildPillar, shop purchases, etc.) are done.
+      // Use set(max) so we never decrease, and never go negative.
+      let curCount = 0;
+      if (game.currencies && game.currencies.allObjects) {
+        for (const cur of game.currencies.allObjects) {
+          try {
+            cur.set(Math.max(cur._amount || 0, 1000000000));
+            curCount++;
+          } catch (e) { /* skip */ }
+        }
+      }
+      logger.info(`[UNLOCK] Currencies: ${curCount} maxed (set last to avoid negative)`);
 
       logger.info('========== [MP] UNLOCK COMPLETE — forcing render & save ==========');
       this._forceRender();
