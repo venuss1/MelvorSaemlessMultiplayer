@@ -2655,18 +2655,30 @@ class Sync {
               const item = game.items.getObjectByID(itemId);
               if (!item) continue;
               s.museum.donatedItems.add(item);
-              // Mark the item as "found" so the museum shows its picture
-              // instead of a question mark. The peer never had the artifact
-              // in their bank (it was donated on the host side), so we need
-              // to fire the found event manually. Add+remove from bank with
-              // found=true fires the itemFound event on the bank, which the
-              // completion log listens to.
-              if (!game.bank.hasItem(item)) {
-                try {
+              // The museum checks game.stats.itemFindCount(item) > 0 to
+              // decide whether to show the artifact's picture or a question
+              // mark. If the peer never "found" the artifact (it was donated
+              // on the host side, or bank-synced with found=false before the
+              // fix), itemFindCount is 0 and the museum shows a question mark.
+              // Fix: add+remove from bank with found=true to increment the
+              // TimesFound stat. Check itemFindCount instead of hasItem
+              // because the item may already be in the bank but not "found".
+              try {
+                if (game.stats && game.stats.itemFindCount(item) === 0) {
                   game.bank.addItem(item, 1, false, true, true, false);
                   game.bank.removeItemQuantity(item, 1, false);
-                } catch { /* noop */ }
-              }
+                }
+              } catch { /* noop */ }
+            }
+            // Queue museum renders so the DOM updates (donation count +
+            // artifact pictures). Setting render queue flags is safe —
+            // the game's render loop processes them on the next animation
+            // frame when the archaeology tab is visible. Do NOT call
+            // museum.render() directly — it freezes the game from sync
+            // handlers.
+            if (s.museum.renderQueue) {
+              s.museum.renderQueue.donationProgress = true;
+              s.museum.renderQueue.allArtefacts = true;
             }
           }
           if (msg.museumRewards && s.museum && s.museum.rewards) {
@@ -2675,10 +2687,6 @@ class Sync {
               if (rw) rw.awarded = true;
             }
           }
-          // NOTE: Do NOT call s.render() or museum.render() here — they
-          // rebuild the archaeology/museum DOM and freeze the game when
-          // called from a sync handler. The donatedItems set is updated
-          // above; the game will render naturally when the tab is opened.
           break;
         }
       }
@@ -6209,12 +6217,16 @@ class Sync {
               if (!item) continue;
               ar.museum.donatedItems.add(item);
               // Mark as found so museum shows picture (see _applySkillSelect)
-              if (!game.bank.hasItem(item)) {
-                try {
+              try {
+                if (game.stats && game.stats.itemFindCount(item) === 0) {
                   game.bank.addItem(item, 1, false, true, true, false);
                   game.bank.removeItemQuantity(item, 1, false);
-                } catch { /* noop */ }
-              }
+                }
+              } catch { /* noop */ }
+            }
+            if (ar.museum.renderQueue) {
+              ar.museum.renderQueue.donationProgress = true;
+              ar.museum.renderQueue.allArtefacts = true;
             }
           }
           if (ad.museumRewards && ar.museum && ar.museum.rewards) {
@@ -6357,12 +6369,16 @@ class Sync {
                 if (!item) continue;
                 ar.museum.donatedItems.add(item);
                 // Mark as found so museum shows picture (see _applySkillSelect)
-                if (!game.bank.hasItem(item)) {
-                  try {
+                try {
+                  if (game.stats && game.stats.itemFindCount(item) === 0) {
                     game.bank.addItem(item, 1, false, true, true, false);
                     game.bank.removeItemQuantity(item, 1, false);
-                  } catch { /* noop */ }
-                }
+                  }
+                } catch { /* noop */ }
+              }
+              if (ar.museum.renderQueue) {
+                ar.museum.renderQueue.donationProgress = true;
+                ar.museum.renderQueue.allArtefacts = true;
               }
             }
             if (ar.museum && ar.museum.rewards) {
