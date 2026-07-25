@@ -2653,7 +2653,20 @@ class Sync {
           if (msg.donatedItems && s.museum && s.museum.donatedItems) {
             for (const itemId of msg.donatedItems) {
               const item = game.items.getObjectByID(itemId);
-              if (item) s.museum.donatedItems.add(item);
+              if (!item) continue;
+              s.museum.donatedItems.add(item);
+              // Mark the item as "found" so the museum shows its picture
+              // instead of a question mark. The peer never had the artifact
+              // in their bank (it was donated on the host side), so we need
+              // to fire the found event manually. Add+remove from bank with
+              // found=true fires the itemFound event on the bank, which the
+              // completion log listens to.
+              if (!game.bank.hasItem(item)) {
+                try {
+                  game.bank.addItem(item, 1, false, true, true, false);
+                  game.bank.removeItemQuantity(item, 1, false);
+                } catch { /* noop */ }
+              }
             }
           }
           if (msg.museumRewards && s.museum && s.museum.rewards) {
@@ -6193,7 +6206,15 @@ class Sync {
           if (ad.donatedItems && ar.museum && ar.museum.donatedItems) {
             for (const itemId of ad.donatedItems) {
               const item = game.items.getObjectByID(itemId);
-              if (item) ar.museum.donatedItems.add(item);
+              if (!item) continue;
+              ar.museum.donatedItems.add(item);
+              // Mark as found so museum shows picture (see _applySkillSelect)
+              if (!game.bank.hasItem(item)) {
+                try {
+                  game.bank.addItem(item, 1, false, true, true, false);
+                  game.bank.removeItemQuantity(item, 1, false);
+                } catch { /* noop */ }
+              }
             }
           }
           if (ad.museumRewards && ar.museum && ar.museum.rewards) {
@@ -6333,7 +6354,15 @@ class Sync {
             if (ar.museum && ar.museum.donatedItems) {
               for (const itemId of ss.archaeology.donatedItems || []) {
                 const item = game.items.getObjectByID(itemId);
-                if (item) ar.museum.donatedItems.add(item);
+                if (!item) continue;
+                ar.museum.donatedItems.add(item);
+                // Mark as found so museum shows picture (see _applySkillSelect)
+                if (!game.bank.hasItem(item)) {
+                  try {
+                    game.bank.addItem(item, 1, false, true, true, false);
+                    game.bank.removeItemQuantity(item, 1, false);
+                  } catch { /* noop */ }
+                }
               }
             }
             if (ar.museum && ar.museum.rewards) {
