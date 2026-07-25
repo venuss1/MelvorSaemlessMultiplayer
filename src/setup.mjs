@@ -4696,16 +4696,17 @@ class Sync {
     if (!game.lore || !msg.read) return;
     this._applyingRemote = true;
     try {
+      // LoreBook has no public read-state field. readLore() opens the book
+      // viewer modal, which spams the UI if called for every book. Instead,
+      // just disable the read button visually (matching what readLore does
+      // internally) without opening the modal.
       for (const bookId of msg.read) {
         const book = game.lore.books && game.lore.books.getObjectByID(bookId);
-        if (book) {
-          // Use the game's own readLore method which handles internal state,
-          // UI button disabling, and save encoding correctly.
-          if (typeof game.lore.readLore === 'function') {
-            try { game.lore.readLore(book); } catch { /* noop */ }
-          } else {
-            if ('_read' in book) book._read = true;
-            if ('isRead' in book) book.isRead = true;
+        if (!book) continue;
+        if (game.lore.bookButtons) {
+          const btn = game.lore.bookButtons.get(book);
+          if (btn && btn.readButton) {
+            try { btn.readButton.disabled = true; } catch { /* noop */ }
           }
         }
       }
@@ -5215,7 +5216,7 @@ class Sync {
     logger.info('========== [MP] BUILDING SNAPSHOT ==========');
     const skills = [];
     for (const skill of game.skills.allObjects) {
-      const e = { id: skill.id, xp: skill.xp };
+      const e = { id: skill.id, xp: skill.xp, unlocked: !!skill.isUnlocked };
       if (skill.hasAbyssalLevels) e.abyssalXp = skill.abyssalXP;
       skills.push(e);
     }
@@ -5890,13 +5891,28 @@ class Sync {
       for (const s of (msg.skills || [])) {
         const skill = this._skillById(s.id);
         if (!skill) continue;
+        // Unlock the skill if it's unlocked on the sender's side
+        if (s.unlocked && !skill.isUnlocked && skill.setUnlock) {
+          try { skill.setUnlock(true); } catch { /* skip */ }
+        }
+        // Set level caps to max before setting XP so levels aren't capped
+        if (skill._currentLevelCap !== undefined && skill.maxLevelCap) {
+          skill._currentLevelCap = skill.maxLevelCap;
+        }
         // Use max to avoid losing locally-earned XP from a stale snapshot.
         if (typeof s.xp === 'number') {
           skill._xp = Math.max(skill._xp || 0, s.xp);
           const cap = skill.currentLevelCap || skill.maxLevelCap || Infinity;
           skill._level = Math.min(cap, exp.xpToLevel(skill._xp));
         }
-        if (typeof s.abyssalXp === 'number' && skill.hasAbyssalLevels) {
+        // Abyssal XP — enable abyssal levels if the sender has them.
+        // Don't check skill.hasAbyssalLevels — the receiver may not have
+        // unlocked abyssal yet, so we force-enable it.
+        if (typeof s.abyssalXp === 'number' && s.abyssalXp > 0) {
+          if (skill._hasAbyssalLevels === false) skill._hasAbyssalLevels = true;
+          if (skill._currentAbyssalLevelCap !== undefined && skill.maxAbyssalLevelCap) {
+            skill._currentAbyssalLevelCap = skill.maxAbyssalLevelCap;
+          }
           skill._abyssalXP = Math.max(skill._abyssalXP || 0, s.abyssalXp);
           const cap = skill.currentAbyssalLevelCap || skill.maxAbyssalLevelCap || Infinity;
           skill._abyssalLevel = Math.min(cap, abyssalExp.xpToLevel(skill._abyssalXP));
