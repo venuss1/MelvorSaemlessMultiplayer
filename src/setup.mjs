@@ -703,18 +703,17 @@ class Sync {
     if (!am) return;
     this._applyingRemote = true;
     try {
-      // Calculate the delta between current and remote mastery XP.
+      // Mastery should only ever go UP, never down. Both players share the
+      // same character, so we take the max of local and remote XP. This
+      // prevents a player with lower mastery from resetting the other
+      // player's mastery down.
       const currentXp = am.xp;
-      const deltaXp = msg.xp - currentXp;
-      if (deltaXp > 0) {
+      if (msg.xp > currentXp) {
         // Use the game's own addMasteryXP method — it handles level-ups,
         // mastery unlocks, mastery bonuses, and rendering properly.
-        skill.addMasteryXP(action, deltaXp);
-      } else if (deltaXp < 0) {
-        // If remote has less XP (e.g. after save sync), set directly.
-        am.xp = msg.xp;
-        am.level = exp.xpToLevel(msg.xp);
+        skill.addMasteryXP(action, msg.xp - currentXp);
       }
+      // If msg.xp <= currentXp, do nothing — don't decrease mastery.
       // Queue render for the action's mastery display.
       if (skill.renderQueue && skill.renderQueue.actionMastery) skill.renderQueue.actionMastery.add(action);
       this._queueRender('mastery');
@@ -729,9 +728,13 @@ class Sync {
     if (!realm) return;
     this._applyingRemote = true;
     try {
-      skill._masteryPoolXP.set(realm, msg.xp);
-      if (skill.renderQueue && skill.renderQueue.masteryPool) skill.renderQueue.masteryPool.add(realm);
-      if (skill.renderMasteryPool) skill.renderMasteryPool();
+      // Mastery pool should only ever go UP, never down — same as mastery XP.
+      const current = skill._masteryPoolXP.get(realm) || 0;
+      if (msg.xp > current) {
+        skill._masteryPoolXP.set(realm, msg.xp);
+        if (skill.renderQueue && skill.renderQueue.masteryPool) skill.renderQueue.masteryPool.add(realm);
+        if (skill.renderMasteryPool) skill.renderMasteryPool();
+      }
     } catch (e) { logger.error('applyMasteryPool failed', e); }
     finally { this._applyingRemote = false; }
   }
