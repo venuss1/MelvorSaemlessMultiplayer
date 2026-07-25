@@ -2517,6 +2517,16 @@ class Sync {
   _applySkillSelect(msg) {
     this._applyingRemote = true;
     try {
+      // Guard: don't modify any skill's selection while it's actively
+      // running. Changing selectedRecipe/selectedAreaFish/etc. while the
+      // action is active can cause actionInterval to compute to -Infinity
+      // and crash the game. This mirrors the woodcutting fix.
+      const skillKey = msg.skillId ? msg.skillId.slice('melvorD:'.length).toLowerCase() : '';
+      const skillObj = game[skillKey];
+      if (skillObj && skillObj.isActive) {
+        // Skill is active — skip selection sync to avoid crash.
+        return;
+      }
       switch (msg.skillId) {
         case 'melvorD:Cooking': {
           const s = game.cooking;
@@ -6236,7 +6246,14 @@ class Sync {
       if (msg.skillSelects) {
         const ss = msg.skillSelects;
         try {
-          if (ss.cooking && game.cooking) {
+          // Helper: skip syncing a skill's selection if it's actively running.
+          // Changing selectedRecipe/selectedAreaFish/etc. while the action is
+          // active can cause actionInterval to compute to -Infinity and crash.
+          const canSync = (skillName) => {
+            const sk = game[skillName];
+            return !sk || !sk.isActive;
+          };
+          if (ss.cooking && game.cooking && canSync('cooking')) {
             for (const r of ss.cooking.recipes || []) {
               const cat = game.cooking.categories.getObjectByID(r.catId);
               if (!cat) continue;
@@ -6245,12 +6262,12 @@ class Sync {
             }
           }
           // Woodcutting: active trees NOT synced (per-player UI choice).
-          if (ss.firemaking && game.firemaking) {
+          if (ss.firemaking && game.firemaking && canSync('firemaking')) {
             if (ss.firemaking.recipeId) game.firemaking.selectedRecipe = game.firemaking.actions.getObjectByID(ss.firemaking.recipeId);
             if (ss.firemaking.oilId) game.firemaking.selectedOil = game.items.getObjectByID(ss.firemaking.oilId);
             if (ss.firemaking.bonfireId) game.firemaking.litBonfireRecipe = game.firemaking.actions.getObjectByID(ss.firemaking.bonfireId);
           }
-          if (ss.fishing && game.fishing) {
+          if (ss.fishing && game.fishing && canSync('fishing')) {
             for (const af of ss.fishing.areaFish || []) {
               // Fishing areas are in game.fishing.areas, not .actions
               const area = game.fishing.areas && game.fishing.areas.getObjectByID(af.areaId);
@@ -6259,17 +6276,17 @@ class Sync {
               if (f) game.fishing.selectedAreaFish.set(area, f);
             }
           }
-          if (ss.thieving && game.thieving) {
+          if (ss.thieving && game.thieving && canSync('thieving')) {
             // Thieving areas are in game.thieving.areas, not .actions
             if (ss.thieving.areaId) game.thieving.currentArea = game.thieving.areas && game.thieving.areas.getObjectByID(ss.thieving.areaId);
             if (ss.thieving.npcId) game.thieving.currentNPC = game.thieving.actions.getObjectByID(ss.thieving.npcId);
           }
-          if (ss.altMagic && game.altMagic) {
+          if (ss.altMagic && game.altMagic && canSync('altMagic')) {
             if (ss.altMagic.spellId) game.altMagic.selectedSpell = game.altMagic.actions.getObjectByID(ss.altMagic.spellId);
             if (ss.altMagic.smithingRecipeId) game.altMagic.selectedSmithingRecipe = game.smithing.actions.getObjectByID(ss.altMagic.smithingRecipeId);
             if (ss.altMagic.conversionItemId) game.altMagic.selectedConversionItem = game.items.getObjectByID(ss.altMagic.conversionItemId);
           }
-          if (ss.fletching && game.fletching && game.fletching.setAltRecipes) {
+          if (ss.fletching && game.fletching && game.fletching.setAltRecipes && canSync('fletching')) {
             for (const a of ss.fletching.altRecipes || []) {
               const recipe = game.fletching.actions.getObjectByID(a.recipeId);
               if (recipe) game.fletching.setAltRecipes.set(recipe, a.altIndex);
@@ -6279,7 +6296,7 @@ class Sync {
           for (const skillName of ['herblore', 'smithing', 'crafting', 'runecrafting', 'fletching']) {
             const data = ss[skillName];
             const sk = game[skillName];
-            if (!data || !sk || !sk.selectedRecipeInRealm) continue;
+            if (!data || !sk || !sk.selectedRecipeInRealm || !canSync(skillName)) continue;
             for (const ar of data.artisanRecipes || []) {
               const realm = game.realms.getObjectByID(ar.realmId);
               if (!realm) continue;
@@ -6289,7 +6306,7 @@ class Sync {
             if (data.selectedRecipeId) sk.selectedRecipe = sk.actions.getObjectByID(data.selectedRecipeId);
           }
           // Harvesting
-          if (ss.harvesting && game.harvesting) {
+          if (ss.harvesting && game.harvesting && canSync('harvesting')) {
             if (ss.harvesting.veinId) game.harvesting.selectedVein = game.harvesting.actions.getObjectByID(ss.harvesting.veinId);
             for (const v of ss.harvesting.veins || []) {
               const vein = game.harvesting.actions.getObjectByID(v.id);
