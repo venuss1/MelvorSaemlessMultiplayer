@@ -4112,8 +4112,9 @@ class Sync {
     try {
       if (msg.completed && tw.tasks && tw.tasks.completedTasks) {
         for (const tid of msg.completed) {
-          // tw.tasks is a NamespaceRegistry<TownshipTask> with getObjectByID
-          const task = tw.tasks.getObjectByID(tid);
+          // tw.tasks is TownshipTasks; the task registry is tw.tasks.tasks
+          // (NamespaceRegistry<TownshipTask>), not tw.tasks itself.
+          const task = tw.tasks.tasks.getObjectByID(tid);
           if (task && !tw.tasks.completedTasks.has(task)) tw.tasks.completedTasks.add(task);
         }
       }
