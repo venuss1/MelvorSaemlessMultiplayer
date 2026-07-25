@@ -2659,13 +2659,10 @@ class Sync {
               if (rw) rw.awarded = true;
             }
           }
-          // Museum has its own render pipeline separate from Archaeology.render
-          if (s.museum) {
-            try { s.museum.render(); } catch { /* noop */ }
-            try { s.museum.renderDonationProgress(); } catch { /* noop */ }
-            try { s.museum.renderAllArtefacts(); } catch { /* noop */ }
-          }
-          if (s.render) s.render();
+          // NOTE: Do NOT call s.render() or museum.render() here — they
+          // rebuild the archaeology/museum DOM and freeze the game when
+          // called from a sync handler. The donatedItems set is updated
+          // above; the game will render naturally when the tab is opened.
           break;
         }
       }
@@ -6202,7 +6199,7 @@ class Sync {
               if (rw) rw.awarded = true;
             }
           }
-          if (ar.museum && ar.museum.render) try { ar.museum.render(); } catch { /* noop */ }
+          // NOTE: Do NOT call museum.render() — freezes game from sync handlers.
         } catch { /* noop */ }
       }
       // Clue hunt from snapshot
@@ -6342,11 +6339,9 @@ class Sync {
                 if (rw) rw.awarded = true;
               }
             }
-            if (ar.museum) {
-              try { ar.museum.render(); } catch { /* noop */ }
-              try { ar.museum.renderDonationProgress(); } catch { /* noop */ }
-              try { ar.museum.renderAllArtefacts(); } catch { /* noop */ }
-            }
+            // NOTE: Do NOT call museum.render() — it freezes the game from
+            // sync handlers. The donatedItems set is updated; the game will
+            // render the museum naturally when the tab is opened.
           }
         } catch (e) { logger.warn('applySkillSelects snapshot failed', e); }
       }
