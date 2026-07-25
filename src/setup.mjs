@@ -2510,7 +2510,10 @@ class Sync {
         if (typeof Archaeology.prototype[m] === 'function') this.ctx.patch(Archaeology, m).after(() => send());
       }
       if (ar.museum) {
-        const MuseumClass = ar.museum.constructor;
+        // ArchaeologyMuseum is a global class in the game. Use it directly
+        // for patching — ar.museum.constructor doesn't always work with the
+        // ctx.patch system.
+        const MuseumClass = (typeof ArchaeologyMuseum !== 'undefined') ? ArchaeologyMuseum : ar.museum.constructor;
         for (const m of ['donateItem', 'donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
           if (typeof MuseumClass.prototype[m] === 'function') {
             try { this.ctx.patch(MuseumClass, m).after(() => send()); } catch { /* skip */ }
@@ -2654,28 +2657,35 @@ class Sync {
             for (const itemId of msg.donatedItems) {
               const item = game.items.getObjectByID(itemId);
               if (!item) continue;
+              const wasAlreadyDonated = s.museum.donatedItems.has(item);
               s.museum.donatedItems.add(item);
               // The museum checks game.stats.itemFindCount(item) > 0 to
               // decide whether to show the artifact's picture or a question
-              // mark. If the peer never "found" the artifact (it was donated
-              // on the host side, or bank-synced with found=false before the
-              // fix), itemFindCount is 0 and the museum shows a question mark.
-              // Fix: add+remove from bank with found=true to increment the
-              // TimesFound stat. Check itemFindCount instead of hasItem
-              // because the item may already be in the bank but not "found".
+              // mark. If the peer never "found" the artifact, itemFindCount
+              // is 0 and the museum shows a question mark. Fix: add+remove
+              // from bank with found=true to increment the TimesFound stat.
               try {
                 if (game.stats && game.stats.itemFindCount(item) === 0) {
                   game.bank.addItem(item, 1, false, true, true, false);
                   game.bank.removeItemQuantity(item, 1, false);
                 }
               } catch { /* noop */ }
+              // When the other player donates an artifact, also remove it
+              // from this player's bank so only 1 person needs to donate.
+              // Only remove if not already donated (avoid removing twice).
+              if (!wasAlreadyDonated) {
+                try {
+                  const bankQty = game.bank.getQty(item);
+                  if (bankQty > 0) {
+                    game.bank.removeItemQuantity(item, 1, false);
+                  }
+                } catch { /* noop */ }
+              }
             }
             // Queue museum renders so the DOM updates (donation count +
             // artifact pictures). Setting render queue flags is safe —
             // the game's render loop processes them on the next animation
-            // frame when the archaeology tab is visible. Do NOT call
-            // museum.render() directly — it freezes the game from sync
-            // handlers.
+            // frame when the archaeology tab is visible.
             if (s.museum.renderQueue) {
               s.museum.renderQueue.donationProgress = true;
               s.museum.renderQueue.allArtefacts = true;
@@ -6215,6 +6225,7 @@ class Sync {
             for (const itemId of ad.donatedItems) {
               const item = game.items.getObjectByID(itemId);
               if (!item) continue;
+              const wasAlreadyDonated = ar.museum.donatedItems.has(item);
               ar.museum.donatedItems.add(item);
               // Mark as found so museum shows picture (see _applySkillSelect)
               try {
@@ -6223,6 +6234,13 @@ class Sync {
                   game.bank.removeItemQuantity(item, 1, false);
                 }
               } catch { /* noop */ }
+              // Remove from peer's bank so only 1 person needs to donate
+              if (!wasAlreadyDonated) {
+                try {
+                  const bankQty = game.bank.getQty(item);
+                  if (bankQty > 0) game.bank.removeItemQuantity(item, 1, false);
+                } catch { /* noop */ }
+              }
             }
             if (ar.museum.renderQueue) {
               ar.museum.renderQueue.donationProgress = true;
@@ -6367,6 +6385,7 @@ class Sync {
               for (const itemId of ss.archaeology.donatedItems || []) {
                 const item = game.items.getObjectByID(itemId);
                 if (!item) continue;
+                const wasAlreadyDonated = ar.museum.donatedItems.has(item);
                 ar.museum.donatedItems.add(item);
                 // Mark as found so museum shows picture (see _applySkillSelect)
                 try {
@@ -6375,6 +6394,13 @@ class Sync {
                     game.bank.removeItemQuantity(item, 1, false);
                   }
                 } catch { /* noop */ }
+                // Remove from peer's bank so only 1 person needs to donate
+                if (!wasAlreadyDonated) {
+                  try {
+                    const bankQty = game.bank.getQty(item);
+                    if (bankQty > 0) game.bank.removeItemQuantity(item, 1, false);
+                  } catch { /* noop */ }
+                }
               }
               if (ar.museum.renderQueue) {
                 ar.museum.renderQueue.donationProgress = true;
