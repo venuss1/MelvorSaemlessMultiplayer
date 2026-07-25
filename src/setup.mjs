@@ -814,7 +814,10 @@ class Sync {
     this._applyingRemote = true;
     try {
       if (delta > 0) {
-        try { bank.addItem(item, delta, false, false, true, false); } catch (e) { logger.warn('bank addItem failed', msg.itemId, e); }
+        // found=true marks the item as discovered in the completion log,
+        // which reveals its picture in the museum and item log. notify=false
+        // suppresses the "new item" popup so syncs are silent.
+        try { bank.addItem(item, delta, false, true, true, false); } catch (e) { logger.warn('bank addItem failed', msg.itemId, e); }
       } else {
         try { bank.removeItemQuantity(item, -delta, false); } catch (e) { logger.warn('bank removeItem failed', msg.itemId, e); }
       }
@@ -991,7 +994,7 @@ class Sync {
           }
           // Ensure item is in bank (add if missing, since UNLOCK_ALL may have equipped it already)
           if (!game.bank.hasItem(item)) {
-            try { game.bank.addItem(item, remote.qty, false, false, true, false); } catch (e) { /* skip */ }
+            try { game.bank.addItem(item, remote.qty, false, true, true, false); } catch (e) { /* skip */ }
           }
           // Equip — equipItem removes from bank internally
           try {
@@ -5816,7 +5819,7 @@ class Sync {
         // snapshot apply — the receiver may have items the sender doesn't
         // know about (earned after the snapshot was built).
         if (delta > 0) {
-          try { game.bank.addItem(item, delta, false, false, true, false); } catch (e) { /* skip */ }
+          try { game.bank.addItem(item, delta, false, true, true, false); } catch (e) { /* skip */ }
         }
       }
       for (const c of (msg.currencies || [])) {
@@ -5858,7 +5861,7 @@ class Sync {
               try { eq.unequipItem(slot); } catch (e) { /* skip */ }
             }
             if (!game.bank.hasItem(item)) {
-              try { game.bank.addItem(item, remote.qty, false, false, true, false); } catch (e) { /* skip */ }
+              try { game.bank.addItem(item, remote.qty, false, true, true, false); } catch (e) { /* skip */ }
             }
             try { eq.equipItem(item, slot, remote.qty); } catch (e) { /* skip */ }
           }
