@@ -7,6 +7,8 @@ equipment, pets, shop upgrades, farming plots, agility courses, and much more)
 is mirrored onto the other player's game in real time over a direct
 peer-to-peer connection.
 
+> **Repo:** <https://github.com/venuss1/MelvorSaemlessMultiplayer>
+
 > **Status:** experimental. There is no official multiplayer in Melvor Idle and
 > the game engine assumes a single active action per client. This mod works
 > around that by having each client run only its own action and synchronising
