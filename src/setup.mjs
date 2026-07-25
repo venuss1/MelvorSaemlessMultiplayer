@@ -2613,7 +2613,9 @@ class Sync {
         case 'melvorD:Smithing':
         case 'melvorD:Crafting':
         case 'melvorD:Runecrafting': {
-          const s = game[msg.skillId.charAt('melvorD:'.length).toLowerCase()];
+          // slice('melvorD:'.length) gives 'Herblore' etc., then lowercased
+          // to match the game property name (game.herblore, game.smithing, ...).
+          const s = game[msg.skillId.slice('melvorD:'.length).toLowerCase()];
           if (!s) break;
           if (msg.artisanRecipes && s.selectedRecipeInRealm) {
             for (const ar of msg.artisanRecipes) {
