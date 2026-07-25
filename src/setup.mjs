@@ -4355,6 +4355,9 @@ class Sync {
   _applyCartography(msg) {
     const ca = game.cartography;
     if (!ca) return;
+    const msgSize = JSON.stringify(msg).length;
+    const t0 = Date.now();
+    logger.info('[CARTO] _applyCartography start, msg size:', msgSize, 'digSiteMaps:', msg.digSiteMaps ? msg.digSiteMaps.length : 0);
     this._applyingRemote = true;
     try {
       if (msg.maps && ca.worldMaps) {
@@ -4457,49 +4460,56 @@ class Sync {
       // Apply dig site maps (tier, upgrade actions, charges, refinements)
       if (msg.digSiteMaps && game.archaeology && game.archaeology.actions) {
         for (const dsm of msg.digSiteMaps) {
-          const digSite = game.archaeology.actions.getObjectByID(dsm.digSiteId);
-          if (!digSite || !digSite.maps) continue;
-          // Ensure we have the right number of maps; create missing ones.
-          // Do NOT call ca.createNewMapForDigSite() — it consumes costs from
-          // the bank and triggers render queue flags that call expensive DOM
-          // operations (setDigSite, setDigSiteMap) which freeze the game.
-          // Instead, create the DigSiteMap object directly and push it.
-          while (digSite.maps.length < dsm.maps.length) {
-            logger.info('[CARTO] Creating new DigSiteMap for', dsm.digSiteId, 'current:', digSite.maps.length, 'target:', dsm.maps.length);
-            try {
-              if (typeof DigSiteMap !== 'undefined') {
-                const newMap = new DigSiteMap(digSite, game, ca);
-                digSite.maps.push(newMap);
-                logger.info('[CARTO] DigSiteMap created successfully');
-              } else { break; }
-            } catch (e) { logger.warn('[CARTO] failed to create DigSiteMap', e); break; }
-          }
-          for (let i = 0; i < dsm.maps.length && i < digSite.maps.length; i++) {
-            const remote = dsm.maps[i];
-            const local = digSite.maps[i];
-            if (typeof remote.upgradeActions === 'number') local._upgradeActions = remote.upgradeActions;
-            if (typeof remote.charges === 'number') local.charges = remote.charges;
-            // Recompute tier from upgrade actions
-            if (typeof local.computeTier === 'function') {
-              try { local.computeTier(); } catch { /* noop */ }
-            }
-            // Refinements — replace if remote has more
-            // refinements is ModifierValue[] ({ modifier, value }), not { id, value }
-            if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
-              local.refinements = remote.refinements.map(r => {
-                const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
-                return modifier ? { modifier, value: r.value } : null;
-              }).filter(Boolean);
-            }
-            // Artefact values — take max per size to preserve best drops
-            if (remote.artefactValues && local.artefactValues) {
-              for (const sz of ['tiny', 'small', 'medium', 'large']) {
-                if (typeof remote.artefactValues[sz] === 'number') {
-                  local.artefactValues[sz] = Math.max(local.artefactValues[sz] || 0, remote.artefactValues[sz]);
+          try {
+            const digSite = game.archaeology.actions.getObjectByID(dsm.digSiteId);
+            if (!digSite || !digSite.maps) continue;
+            // Ensure we have the right number of maps; create missing ones.
+            // Do NOT call ca.createNewMapForDigSite() — it consumes costs from
+            // the bank and triggers render queue flags that call expensive DOM
+            // operations (setDigSite, setDigSiteMap) which freeze the game.
+            // Instead, create the DigSiteMap object directly and push it.
+            while (digSite.maps.length < dsm.maps.length) {
+              logger.info('[CARTO] Creating new DigSiteMap for', dsm.digSiteId, 'current:', digSite.maps.length, 'target:', dsm.maps.length);
+              try {
+                if (typeof DigSiteMap !== 'undefined') {
+                  const newMap = new DigSiteMap(digSite, game, ca);
+                  digSite.maps.push(newMap);
+                  logger.info('[CARTO] DigSiteMap created successfully');
+                } else {
+                  logger.warn('[CARTO] DigSiteMap class not found globally');
+                  break;
                 }
-              }
+              } catch (e) { logger.warn('[CARTO] failed to create DigSiteMap', e); break; }
             }
-          }
+            for (let i = 0; i < dsm.maps.length && i < digSite.maps.length; i++) {
+              try {
+                const remote = dsm.maps[i];
+                const local = digSite.maps[i];
+                if (!local) continue;
+                if (typeof remote.upgradeActions === 'number') local._upgradeActions = remote.upgradeActions;
+                if (typeof remote.charges === 'number') local.charges = remote.charges;
+                // Recompute tier from upgrade actions
+                if (typeof local.computeTier === 'function') {
+                  try { local.computeTier(); } catch { /* noop */ }
+                }
+                // Refinements — replace if remote has more
+                if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
+                  local.refinements = remote.refinements.map(r => {
+                    const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
+                    return modifier ? { modifier, value: r.value } : null;
+                  }).filter(Boolean);
+                }
+                // Artefact values — take max per size to preserve best drops
+                if (remote.artefactValues && local.artefactValues) {
+                  for (const sz of ['tiny', 'small', 'medium', 'large']) {
+                    if (typeof remote.artefactValues[sz] === 'number') {
+                      local.artefactValues[sz] = Math.max(local.artefactValues[sz] || 0, remote.artefactValues[sz]);
+                    }
+                  }
+                }
+              } catch (e) { logger.warn('[CARTO] failed to apply map data for index', i, e); }
+            }
+          } catch (e) { logger.warn('[CARTO] failed to process digSite', dsm.digSiteId, e); }
         }
       }
 
@@ -4507,8 +4517,12 @@ class Sync {
       // (re-renders the entire hex map) and can freeze the game. The render
       // queue entries we set above will be processed by the game's normal
       // render loop on the next tick.
-    } catch (e) { logger.error('applyCartography failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    } catch (e) { logger.error('[CARTO] applyCartography failed', e); }
+    finally {
+      this._applyingRemote = false;
+      this._scheduleSave();
+      logger.info('[CARTO] _applyCartography done in', Date.now() - t0, 'ms');
+    }
   }
 
   // ---- Stats sync -------------------------------------------------------
