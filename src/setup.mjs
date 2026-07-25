@@ -4339,7 +4339,12 @@ class Sync {
         if (wm && ca.activeMap !== wm) {
           ca.activeMap = wm;
           if (ca.renderQueue) {
-            ca.renderQueue.hexBackground = true;
+            // hexBackground is Set<Hex>, not boolean — add all hexes.
+            if (ca.renderQueue.hexBackground && wm.hexes) {
+              for (const qMap of wm.hexes.values()) {
+                for (const hex of qMap.values()) ca.renderQueue.hexBackground.add(hex);
+              }
+            }
             ca.renderQueue.visionRange = true;
             ca.renderQueue.playerMarker = true;
           }
