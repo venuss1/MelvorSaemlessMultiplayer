@@ -4953,7 +4953,10 @@ class Sync {
     // The action timer calls start(interval) — we intercept and halve it.
     this.ctx.patch(Timer, 'start').before(function (time, offsetByTick) {
       if (sync._coopBoost && this === game.activeAction?.actionTimer) {
-        return [time / 2, offsetByTick];
+        // Guard against Infinity/NaN/negative — only halve valid positive values.
+        if (typeof time === 'number' && time > 0 && isFinite(time)) {
+          return [time / 2, offsetByTick];
+        }
       }
     });
   }
