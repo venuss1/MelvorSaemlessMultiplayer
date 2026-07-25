@@ -2507,8 +2507,11 @@ class Sync {
         if (typeof Archaeology.prototype[m] === 'function') this.ctx.patch(Archaeology, m).after(() => send());
       }
       if (ar.museum) {
+        const MuseumClass = ar.museum.constructor;
         for (const m of ['donateItem', 'donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
-          if (typeof ArchaeologyMuseum.prototype[m] === 'function') this.ctx.patch(ArchaeologyMuseum, m).after(() => send());
+          if (typeof MuseumClass.prototype[m] === 'function') {
+            try { this.ctx.patch(MuseumClass, m).after(() => send()); } catch { /* skip */ }
+          }
         }
       }
     }
@@ -2655,6 +2658,12 @@ class Sync {
               const rw = s.museum.rewards.getObjectByID(rwId);
               if (rw) rw.awarded = true;
             }
+          }
+          // Museum has its own render pipeline separate from Archaeology.render
+          if (s.museum) {
+            try { s.museum.render(); } catch { /* noop */ }
+            try { s.museum.renderDonationProgress(); } catch { /* noop */ }
+            try { s.museum.renderAllArtefacts(); } catch { /* noop */ }
           }
           if (s.render) s.render();
           break;
@@ -6332,6 +6341,11 @@ class Sync {
                 const rw = ar.museum.rewards.getObjectByID(rwId);
                 if (rw) rw.awarded = true;
               }
+            }
+            if (ar.museum) {
+              try { ar.museum.render(); } catch { /* noop */ }
+              try { ar.museum.renderDonationProgress(); } catch { /* noop */ }
+              try { ar.museum.renderAllArtefacts(); } catch { /* noop */ }
             }
           }
         } catch (e) { logger.warn('applySkillSelects snapshot failed', e); }
