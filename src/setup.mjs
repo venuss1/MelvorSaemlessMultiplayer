@@ -842,10 +842,9 @@ class Sync {
     this._applyingRemote = true;
     try {
       // Use max to avoid resetting currencies to 0 from stale messages.
-      // In a shared save, both players should have at least as much as
-      // the other reports. If one spent some, the other's higher amount
-      // takes precedence (they haven't spent it yet).
-      const newAmt = Math.max(c._amount || 0, msg.qty || 0);
+      // Never go negative — ignore remote values below 0.
+      const remote = Math.max(0, msg.qty || 0);
+      const newAmt = Math.max(c._amount || 0, remote);
       c.set(newAmt);
       this._queueRender('currency');
     } catch (e) { logger.error('applyCurrency failed', e); }
@@ -6515,34 +6514,37 @@ class Sync {
     this._applyingRemote = true;
     let count = 0;
     try {
-      // 1. All skills to level 120 + abyssal level 120
+      // 1. All skills to level 120 + abyssal level 60
+      // Normal level 120 ≈ 104M XP; abyssal level 60 needs much more XP
+      // because the abyssal XP curve starts at normal level 99.
+      // Use abyssalExp.levelToXP(60) for the exact abyssal XP target.
+      const targetXp = exp.levelToXP(120);
+      const targetAxp = abyssalExp.levelToXP(60);
       for (const skill of game.skills.allObjects) {
         try {
-          // Normal XP — level 120 = 200M XP
-          if (skill._xp !== undefined) {
-            const targetXp = 200000000;
-            if (skill.xp < targetXp) {
-              const delta = targetXp - skill.xp;
-              skill.addXP(delta);
-            }
+          // Set level caps to max BEFORE adding XP so levels aren't capped
+          if (skill._currentLevelCap !== undefined && skill.maxLevelCap) {
+            skill._currentLevelCap = skill.maxLevelCap;
           }
-          // Abyssal XP — force set even if hasAbyssalLevels is false
-          // (some skills like Corruption/Harvesting may not report it correctly)
-          if (skill._abyssalXP !== undefined) {
-            const targetAxp = 200000000;
+          // Normal XP
+          if (skill._xp !== undefined && skill.xp < targetXp) {
+            skill.addXP(targetXp - skill.xp);
+          }
+          // Abyssal XP — only for skills that actually have abyssal levels
+          if (skill._abyssalXP !== undefined && skill._hasAbyssalLevels) {
+            // Set the abyssal level cap to max so addAbyssalXP doesn't cap
+            if (skill.maxAbyssalLevelCap && skill._currentAbyssalLevelCap !== undefined) {
+              skill._currentAbyssalLevelCap = skill.maxAbyssalLevelCap;
+            }
             if (skill.abyssalXP < targetAxp) {
               try {
                 skill.addAbyssalXP(targetAxp - skill.abyssalXP);
               } catch (e) {
                 // Force-set directly if addAbyssalXP fails
                 skill._abyssalXP = targetAxp;
-                if (skill._abyssalLevel !== undefined) skill._abyssalLevel = 120;
+                if (skill._abyssalLevel !== undefined) skill._abyssalLevel = 60;
               }
             }
-          }
-          // Also try to enable hasAbyssalLevels if the skill supports it
-          if (skill._hasAbyssalLevels === false && skill._abyssalXP !== undefined) {
-            skill._hasAbyssalLevels = true;
           }
           count++;
         } catch (e) { logger.warn(`[UNLOCK] Skill ${skill.id} failed: ${e.message}`); }
@@ -6661,12 +6663,13 @@ class Sync {
       }
       logger.info(`[UNLOCK] Bank items: ${itemCount} added`);
 
-      // 3. All currencies
+      // 3. All currencies — use set(max) instead of add to avoid
+      // going negative if add() triggers spending side-effects.
       let curCount = 0;
       if (game.currencies && game.currencies.allObjects) {
         for (const cur of game.currencies.allObjects) {
           try {
-            cur.add(1000000000);
+            cur.set(Math.max(cur._amount || 0, 1000000000));
             curCount++;
           } catch (e) { /* skip */ }
         }
@@ -7028,11 +7031,22 @@ class Sync {
         } catch (e) { /* skip */ }
       }
 
-      // 23. All level cap increases purchased
+      // 23. All level cap increases purchased + per-skill caps maxed
       try {
         if (game._levelCapIncreasesBought !== undefined) game._levelCapIncreasesBought = 50;
         if (game._abyssalLevelCapIncreasesBought !== undefined) game._abyssalLevelCapIncreasesBought = 50;
-        logger.info('[UNLOCK] Level cap increases: 50 purchased');
+        // Set per-skill level caps to their maximum
+        for (const skill of game.skills.allObjects) {
+          try {
+            if (skill._currentLevelCap !== undefined && skill.maxLevelCap) {
+              skill._currentLevelCap = skill.maxLevelCap;
+            }
+            if (skill._hasAbyssalLevels && skill._currentAbyssalLevelCap !== undefined && skill.maxAbyssalLevelCap) {
+              skill._currentAbyssalLevelCap = skill.maxAbyssalLevelCap;
+            }
+          } catch (e) { /* skip */ }
+        }
+        logger.info('[UNLOCK] Level cap increases: 50 purchased, per-skill caps maxed');
       } catch (e) { /* skip */ }
 
       logger.info('========== [MP] UNLOCK COMPLETE — forcing render & save ==========');
