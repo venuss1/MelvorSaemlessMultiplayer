@@ -2511,27 +2511,31 @@ class Sync {
         if (typeof Archaeology.prototype[m] === 'function') this.ctx.patch(Archaeology, m).after(() => send());
       }
       if (ar.museum) {
-        // ArchaeologyMuseum is a global class in the game. Use it directly
-        // for patching — ar.museum.constructor doesn't always work with the
-        // ctx.patch system.
-        const MuseumClass = (typeof ArchaeologyMuseum !== 'undefined') ? ArchaeologyMuseum : ar.museum.constructor;
-        // Patch donateItem to send an immediate MUSEUM_DONATE message with
-        // the specific item ID. This is faster than the bulk SKILL_SELECT
-        // sync and lets the peer auto-donate before they can double-donate.
-        if (typeof MuseumClass.prototype.donateItem === 'function') {
-          try {
-            this.ctx.patch(MuseumClass, 'donateItem').after(function (_ret, item) {
-              if (sync._applyingRemote || !sync.transport.isConnected) return;
-              if (item && item.id) {
+        // Direct instance method override for donateItem — more reliable than
+        // ctx.patch which may fail silently if the class reference doesn't
+        // work correctly. This ensures the MUSEUM_DONATE message is sent
+        // immediately when a player donates an artifact.
+        const museum = ar.museum;
+        if (typeof museum.donateItem === 'function') {
+          const origDonateItem = museum.donateItem.bind(museum);
+          museum.donateItem = function (item) {
+            const result = origDonateItem(item);
+            try {
+              if (!sync._applyingRemote && sync.transport.isConnected && item && item.id) {
+                logger.info('[MUSEUM] donateItem patched, sending MUSEUM_DONATE for', item.id);
                 sync.transport.send({ t: Msg.MUSEUM_DONATE, itemId: item.id });
+                send(); // also send bulk sync for rewards/etc
               }
-              send(); // also send bulk sync for rewards/etc
-            });
-          } catch { /* skip */ }
+            } catch (e) { logger.error('[MUSEUM] donateItem patch error', e); }
+            return result;
+          };
+          logger.info('[MUSEUM] donateItem patch installed on museum instance');
         }
+        // Patch donateAllGenericArtefacts via ctx.patch (less critical)
+        const MuseumClass = (typeof ArchaeologyMuseum !== 'undefined') ? ArchaeologyMuseum : museum.constructor;
         for (const m of ['donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
           if (typeof MuseumClass.prototype[m] === 'function') {
-            try { this.ctx.patch(MuseumClass, m).after(() => send()); } catch { /* skip */ }
+            try { this.ctx.patch(MuseumClass, m).after(() => send()); } catch (e) { logger.warn('[MUSEUM] patch failed for', m, e); }
           }
         }
       }
@@ -2708,20 +2712,22 @@ class Sync {
   // it too — removes from bank, adds to donatedItems, gives rewards, updates
   // museum UI. This way only 1 person needs to donate.
   _applyMuseumDonate(msg) {
+    logger.info('[MUSEUM] _applyMuseumDonate received for', msg.itemId);
     const ar = game.archaeology;
-    if (!ar || !ar.museum) return;
+    if (!ar || !ar.museum) { logger.warn('[MUSEUM] no archaeology/museum'); return; }
     const item = this._itemById(msg.itemId);
-    if (!item) return;
+    if (!item) { logger.warn('[MUSEUM] item not found:', msg.itemId); return; }
     // Already donated — skip (prevents double-donating)
-    if (ar.museum.isItemDonated(item)) return;
+    if (ar.museum.isItemDonated(item)) { logger.info('[MUSEUM] already donated, skipping'); return; }
     this._applyingRemote = true;
     try {
       // If the peer has the item in their bank, use the game's donateItem
       // method which handles everything: removes from bank, adds to
       // donatedItems, gives rewards, fires events, queues renders.
       const bankQty = game.bank.getQty(item);
+      logger.info('[MUSEUM] bank qty for', item.id, '=', bankQty);
       if (bankQty > 0) {
-        try { ar.museum.donateItem(item); } catch (e) { logger.warn('museum donateItem failed', e); }
+        try { ar.museum.donateItem(item); logger.info('[MUSEUM] donateItem called successfully'); } catch (e) { logger.warn('[MUSEUM] donateItem failed', e); }
       } else {
         // Peer doesn't have the item in bank — just mark as donated + found
         ar.museum.donatedItems.add(item);
