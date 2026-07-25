@@ -650,25 +650,17 @@ class Sync {
     this._applyingRemote = true;
     try {
       if (typeof msg.xp === 'number') {
+        // XP should only ever go UP — both players share the same character.
+        // Never decrease XP via sync (would undo the other player's progress).
         const deltaXp = msg.xp - skill.xp;
         if (deltaXp > 0) {
           skill.addXP(deltaXp);
-        } else if (deltaXp < 0) {
-          skill._xp = msg.xp;
-          const cap = skill.currentLevelCap || skill.maxLevelCap || Infinity;
-          skill._level = Math.min(cap, exp.xpToLevel(msg.xp));
-          if (skill.renderQueue) { skill.renderQueue.xp = true; skill.renderQueue.level = true; }
         }
       }
       if (typeof msg.abyssalXp === 'number' && skill.hasAbyssalLevels) {
         const deltaAxp = msg.abyssalXp - skill.abyssalXP;
         if (deltaAxp > 0) {
           skill.addAbyssalXP(deltaAxp);
-        } else if (deltaAxp < 0) {
-          skill._abyssalXP = msg.abyssalXp;
-          const cap = skill.currentAbyssalLevelCap || skill.maxAbyssalLevelCap || Infinity;
-          skill._abyssalLevel = Math.min(cap, abyssalExp.xpToLevel(msg.abyssalXp));
-          if (skill.renderQueue) { skill.renderQueue.abyssalXP = true; skill.renderQueue.abyssalLevel = true; }
         }
       }
       // Targeted render — only queue XP/mastery, not everything.
@@ -1100,9 +1092,9 @@ class Sync {
     this._applyingRemote = true;
     try {
       const current = game.itemCharges.getCharges(item);
-      const delta = msg.charges - current;
-      if (delta > 0) game.itemCharges.addCharges(item, delta);
-      else if (delta < 0) game.itemCharges.removeCharges(item, -delta);
+      // Only increase charges — never decrease via sync. Charges decrease
+      // through actual item usage, not through remote sync.
+      if (msg.charges > current) game.itemCharges.addCharges(item, msg.charges - current);
       if (game.itemCharges.render) game.itemCharges.render();
     } catch (e) { logger.error('applyItemCharge failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -2169,7 +2161,7 @@ class Sync {
         // standardModifiers/uniqueModifiers/abyssalModifiers arrays.
         const arr = type === 'standard' ? recipe.standardModifiers
           : (type === 'unique' ? recipe.uniqueModifiers : recipe.abyssalModifiers);
-        if (arr && arr[u.tier]) arr[u.tier].timesBought = u.timesBought;
+        if (arr && arr[u.tier]) arr[u.tier].timesBought = Math.max(arr[u.tier].timesBought || 0, u.timesBought);
       }
       // Recompute provided stats so modifier effects take effect.
       if (as.computeProvidedStats) try { as.computeProvidedStats(); } catch { /* noop */ }
@@ -2246,12 +2238,15 @@ class Sync {
           // Only credit new mark discoveries via the game method so that
           // discovery side-effects (XP/rewards) fire. discoverMark takes
           // only the recipe (not a count) — call it once per new discovery.
-          if (m.count > current && typeof su.discoverMark === 'function') {
-            try { su.discoverMark(recipe); su.marksUnlocked.set(recipe, m.count); }
-            catch (e) { su.marksUnlocked.set(recipe, m.count); }
-          } else {
-            su.marksUnlocked.set(recipe, m.count);
+          if (m.count > current) {
+            if (typeof su.discoverMark === 'function') {
+              try { su.discoverMark(recipe); su.marksUnlocked.set(recipe, m.count); }
+              catch (e) { su.marksUnlocked.set(recipe, m.count); }
+            } else {
+              su.marksUnlocked.set(recipe, m.count);
+            }
           }
+          // If m.count <= current, do nothing — don't decrease marks.
         }
       }
       if (msg.costs && su.selectedNonShardCosts) {
@@ -2910,13 +2905,13 @@ class Sync {
         const kind = c.kind || 'dungeon';
         if (kind === 'dungeon') {
           const d = game.dungeons.getObjectByID(c.id);
-          if (d && cm.dungeonCompletion) cm.dungeonCompletion.set(d, c.count);
+          if (d && cm.dungeonCompletion) cm.dungeonCompletion.set(d, Math.max(cm.dungeonCompletion.get(d) || 0, c.count));
         } else if (kind === 'abyssDepth') {
           const depth = game.abyssDepths && game.abyssDepths.getObjectByID(c.id);
-          if (depth) depth.timesCompleted = c.count;
+          if (depth) depth.timesCompleted = Math.max(depth.timesCompleted || 0, c.count);
         } else if (kind === 'stronghold') {
           const sh = game.strongholds && game.strongholds.getObjectByID(c.id);
-          if (sh) sh.timesCompleted = c.count;
+          if (sh) sh.timesCompleted = Math.max(sh.timesCompleted || 0, c.count);
         }
       }
       // Sync stronghold tier + area progress.
@@ -3563,7 +3558,7 @@ class Sync {
         if (!set || !set.foundRelics) continue;
         // Find the relic by ID in the game's ancientRelics registry
         const relic = game.ancientRelics.getObjectByID(r.relicId);
-        if (relic) set.foundRelics.set(relic, r.count);
+        if (relic) set.foundRelics.set(relic, Math.max(set.foundRelics.get(relic) || 0, r.count));
       }
     } catch (e) { logger.error('applyAncientRelic failed', e); }
     finally { this._applyingRemote = false; }
@@ -3605,12 +3600,13 @@ class Sync {
         if (!skill || !skill.skillTrees) continue;
         const tree = skill.skillTrees.getObjectByID(t.treeId);
         if (!tree) continue;
-        if (typeof t.points === 'number') tree._points = t.points;
+        if (typeof t.points === 'number') tree._points = Math.max(tree._points || 0, t.points);
         if (t.nodes && tree.unlockedNodes) {
-          tree.unlockedNodes.clear();
+          // Don't clear existing unlocks — only add new ones. Clearing would
+          // remove nodes the local player already unlocked.
           for (const nid of t.nodes) {
             const node = tree.nodes?.getObjectByID(nid);
-            if (node) { node.isUnlocked = true; tree.unlockedNodes.add(node); }
+            if (node && !node.isUnlocked) { node.isUnlocked = true; tree.unlockedNodes.add(node); }
           }
         }
       }
@@ -3719,7 +3715,7 @@ class Sync {
         if (!biome || !biome.buildingsBuilt) continue;
         for (const [bid, count] of Object.entries(b.buildings)) {
           const building = tw.buildings.getObjectByID(bid);
-          if (building) biome.buildingsBuilt.set(building, count);
+          if (building) biome.buildingsBuilt.set(building, Math.max(biome.buildingsBuilt.get(building) || 0, count));
         }
         // Sync building efficiency (decays over time; otherwise diverges).
         if (b.efficiency && biome.buildingEfficiency) {
@@ -3800,8 +3796,8 @@ class Sync {
           const remote = msg.steps[i];
           const local = ch.clueProgress[i];
           if (remote.id && local.id === remote.id) {
-            local.progress = remote.progress;
-            local.complete = remote.complete;
+            local.progress = Math.max(local.progress, remote.progress);
+            if (remote.complete) local.complete = true;
           }
         }
       }
@@ -6081,15 +6077,14 @@ class Sync {
           const item = this._itemById(ch.itemId);
           if (!item) continue;
           const cur = game.itemCharges.getCharges(item);
-          const delta = ch.charges - cur;
-          if (delta > 0) game.itemCharges.addCharges(item, delta);
-          else if (delta < 0) game.itemCharges.removeCharges(item, -delta);
+          // Only increase charges — never decrease via sync.
+          if (ch.charges > cur) game.itemCharges.addCharges(item, ch.charges - cur);
         }
       }
       if (msg.shopUpgrades && game.shop) {
         for (const [purchaseId, count] of Object.entries(msg.shopUpgrades)) {
           const purchase = game.shop.purchases.getObjectByID(purchaseId);
-          if (purchase) game.shop.upgradesPurchased.set(purchase, count);
+          if (purchase) game.shop.upgradesPurchased.set(purchase, Math.max(game.shop.upgradesPurchased.get(purchase) || 0, count));
         }
         if (game.shop.computeProvidedStats) game.shop.computeProvidedStats();
       }
@@ -6249,14 +6244,14 @@ class Sync {
             const am = skill.actionMastery.get(action);
             if (!am) continue;
             if (typeof a.xp === 'number') {
-              am.xp = a.xp;
-              am.level = exp.xpToLevel(a.xp);
+              am.xp = Math.max(am.xp || 0, a.xp);
+              am.level = exp.xpToLevel(am.xp);
             }
           }
           for (const p of (ms.pools || [])) {
             const realm = game.realms.getObjectByID(p.realmId);
             if (realm && skill._masteryPoolXP) {
-              skill._masteryPoolXP.set(realm, p.xp);
+              skill._masteryPoolXP.set(realm, Math.max(skill._masteryPoolXP.get(realm) || 0, p.xp));
             }
           }
           if (skill.renderQueue && skill.renderQueue.actionMastery) {
