@@ -3956,10 +3956,11 @@ class Sync {
       if (msg.itemCategoryBeingSelected !== undefined) r.itemCategoryBeingSelected = msg.itemCategoryBeingSelected;
       if (typeof msg.isSelectingPositiveModifier === 'boolean') r.isSelectingPositiveModifier = msg.isSelectingPositiveModifier;
       if (msg.randomModifiersBeingSelected) {
+        // randomModifiersBeingSelected is ModifierValue[] ({ modifier, value })
         r.randomModifiersBeingSelected = msg.randomModifiersBeingSelected.map(m => {
-          const mod = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-          return mod ? { ...mod, value: m.value } : { id: m.id, value: m.value };
-        });
+          const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
+          return modifier ? { modifier, value: m.value } : null;
+        }).filter(Boolean);
       }
     } catch (e) { logger.error('applyRaid failed', e); }
     finally { this._applyingRemote = false; }
