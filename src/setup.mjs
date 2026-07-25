@@ -4924,41 +4924,59 @@ class Sync {
 
   _startProgressBroadcaster() {
     // Every 500ms, if we have an active action, broadcast the timer progress
-    // so the other player's progress bar moves in sync.
+    // so the other player's panel progress bar moves in sync.
     this._progressTimer = setInterval(() => {
       if (!this.transport.isConnected || this._applyingRemote) return;
       const active = game.activeAction;
       if (!active) return;
       try {
-        // The active action IS the skill for gathering/artisan/crafting skills.
-        // It has an actionTimer property. For combat, it's the combat manager.
         let timer = null;
         let skillId = null;
+        let skillName = null;
 
         if (active.actionTimer) {
           timer = active.actionTimer;
           skillId = active.id;
+          skillName = active.name || skillId;
         } else if (active.skill && active.skill.actionTimer) {
           timer = active.skill.actionTimer;
           skillId = active.skill.id;
+          skillName = active.skill.name || skillId;
         }
 
-        // Also check if the active action is a skill in game.skills
         if (!timer) {
           const skill = game.skills.getObjectByID(active.id);
           if (skill && skill.actionTimer) {
             timer = skill.actionTimer;
             skillId = skill.id;
+            skillName = skill.name || skillId;
           }
         }
 
         if (!timer || !skillId) return;
 
+        // Gather recipe info — for woodcutting, multiple trees can be active.
+        // Send the list of active recipe IDs and their names.
+        const recipes = [];
+        try {
+          if (active.activeTrees && active.activeTrees.size > 0) {
+            // Woodcutting: multiple trees
+            for (const tree of active.activeTrees) {
+              recipes.push({ id: tree.id, name: tree.name || tree.id });
+            }
+          } else {
+            const ma = active.masteryAction;
+            if (ma) recipes.push({ id: ma.id, name: ma.name || ma.id });
+          }
+        } catch { /* noop */ }
+
         this.transport.send({
           t: Msg.ACTION_START,
           skillId,
+          skillName,
           actionId: active.id,
           recipeId: this._currentRecipeId || skillId,
+          recipes,
           progress: timer.progress,
           ticksLeft: timer._ticksLeft,
           maxTicks: timer._maxTicks,
@@ -4968,9 +4986,11 @@ class Sync {
         if (this._onLocalActionCb) {
           this._onLocalActionCb({
             skillId,
+            skillName,
             recipeId: this._currentRecipeId || skillId,
+            recipes,
             progress: timer.progress,
-            label: active.name || skillId,
+            label: skillName,
           });
         }
       } catch { /* noop */ }
@@ -4978,24 +4998,20 @@ class Sync {
   }
 
   _applyActionStart(msg) {
-    // When the remote player has an active action, show it in the panel's
-    // mini progress bar. We do NOT touch any game objects — no timers, no
-    // skill methods, no progress bar elements. Any call to skill methods
-    // (renderProgressBar, animateProgressFromTimer, etc.) can have side
-    // effects that activate the action on the local game, causing the
-    // game's tick loop to run the action with no resources selected,
-    // producing -Infinity tick errors and crashes.
+    // Show the remote player's action in the panel's fake progress bars.
+    // We do NOT touch any game objects — no timers, no skill methods, no
+    // game progress bar elements. Any call to skill methods can have side
+    // effects that activate the action on the local game, causing crashes.
     try {
-      const skill = game.skills.getObjectByID(msg.skillId || msg.actionId);
-      if (!skill) return;
-
       // Only update the panel's mini progress bar — nothing else.
       const progress = msg.progress || 0;
       this._remoteAction = {
-        skillId: skill.id,
+        skillId: msg.skillId || msg.actionId,
+        skillName: msg.skillName || msg.skillId || msg.actionId,
         recipeId: msg.recipeId,
+        recipes: msg.recipes || [],
         progress,
-        label: skill.name || skill.id,
+        label: msg.skillName || msg.skillId || msg.actionId,
       };
       if (this._onRemoteActionCb) this._onRemoteActionCb(this._remoteAction);
     } catch (e) { logger.warn('applyActionStart failed', e); }
@@ -7191,22 +7207,30 @@ class Panel {
             style="background:#1f2937;border:1px solid #7f1d1d;color:#fca5a5;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;">Disconnect</button>
         </div>
         <hr style="border:none;border-top:1px solid #374151;margin:4px 0;" />
-        <div style="display:flex;flex-direction:column;gap:4px;">
-          <div style="display:flex;align-items:center;gap:6px;">
-            <span style="width:8px;height:8px;border-radius:50%;background:#34d399;flex:0 0 auto;"></span>
-            <span style="font-weight:600;min-width:48px;" data-rmp="localName">You</span>
-            <span style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" data-rmp="localAction">Idle</span>
+        <div data-rmp="playersSection" style="display:flex;flex-direction:column;gap:6px;">
+          <!-- Local player -->
+          <div data-rmp="localPlayerBlock" class="rmp-player-block">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span style="width:8px;height:8px;border-radius:50%;background:#34d399;flex:0 0 auto;"></span>
+              <span style="font-weight:600;min-width:48px;" data-rmp="localName">You</span>
+              <span style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" data-rmp="localAction">Idle</span>
+            </div>
+            <div data-rmp="localProgressBar" hidden class="rmp-fake-bar" style="margin-left:14px;width:calc(100% - 14px);">
+              <div data-rmp="localProgressFill" class="rmp-fake-bar-fill rmp-fill-local" style="width:0%;"></div>
+            </div>
+            <div data-rmp="localRecipes" hidden style="margin-left:14px;display:flex;flex-wrap:wrap;gap:2px;"></div>
           </div>
-          <div data-rmp="localProgressBar" hidden style="margin-left:14px;width:calc(100% - 14px);height:6px;background:#1f2937;border-radius:3px;overflow:hidden;">
-            <div data-rmp="localProgressFill" style="width:0%;height:100%;background:#34d399;border-radius:3px;transition:width 0.5s linear;"></div>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px;">
-            <span style="width:8px;height:8px;border-radius:50%;background:#60a5fa;flex:0 0 auto;"></span>
-            <span style="font-weight:600;min-width:48px;" data-rmp="remoteName">Peer</span>
-            <span style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" data-rmp="remoteAction">Idle</span>
-          </div>
-          <div data-rmp="remoteProgressBar" hidden style="margin-left:14px;width:calc(100% - 14px);height:6px;background:#1f2937;border-radius:3px;overflow:hidden;">
-            <div data-rmp="remoteProgressFill" style="width:0%;height:100%;background:#60a5fa;border-radius:3px;transition:width 0.5s linear;"></div>
+          <!-- Remote player -->
+          <div data-rmp="remotePlayerBlock" class="rmp-player-block">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span style="width:8px;height:8px;border-radius:50%;background:#60a5fa;flex:0 0 auto;"></span>
+              <span style="font-weight:600;min-width:48px;" data-rmp="remoteName">Peer</span>
+              <span style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" data-rmp="remoteAction">Idle</span>
+            </div>
+            <div data-rmp="remoteProgressBar" hidden class="rmp-fake-bar" style="margin-left:14px;width:calc(100% - 14px);">
+              <div data-rmp="remoteProgressFill" class="rmp-fake-bar-fill rmp-fill-remote" style="width:0%;"></div>
+            </div>
+            <div data-rmp="remoteRecipes" hidden style="margin-left:14px;display:flex;flex-wrap:wrap;gap:2px;"></div>
           </div>
         </div>
         <hr style="border:none;border-top:1px solid #374151;margin:4px 0;" />
@@ -7414,13 +7438,30 @@ class Panel {
         const $ = (s) => this.$(s);
         const bar = $('remoteProgressBar');
         const fill = $('remoteProgressFill');
+        const recipesEl = $('remoteRecipes');
         if (!bar || !fill) return;
         if (remote) {
           bar.hidden = false;
           fill.style.width = (remote.progress * 100).toFixed(1) + '%';
+          // Apply skill-specific color class
+          fill.className = 'rmp-fake-bar-fill ' + this._skillColorClass(remote.skillId, 'remote');
+          // Show recipe chips (e.g. tree names for woodcutting)
+          if (recipesEl) {
+            const recipes = remote.recipes || [];
+            if (recipes.length > 0) {
+              recipesEl.hidden = false;
+              recipesEl.innerHTML = recipes.map(r =>
+                `<span class="rmp-recipe-chip">${this._esc(r.name || r.id)}</span>`
+              ).join('');
+            } else {
+              recipesEl.hidden = true;
+              recipesEl.innerHTML = '';
+            }
+          }
         } else {
           bar.hidden = true;
           fill.style.width = '0%';
+          if (recipesEl) { recipesEl.hidden = true; recipesEl.innerHTML = ''; }
         }
       });
     }
@@ -7431,16 +7472,65 @@ class Panel {
         const $ = (s) => this.$(s);
         const bar = $('localProgressBar');
         const fill = $('localProgressFill');
+        const recipesEl = $('localRecipes');
         if (!bar || !fill) return;
         if (local) {
           bar.hidden = false;
           fill.style.width = (local.progress * 100).toFixed(1) + '%';
+          fill.className = 'rmp-fake-bar-fill ' + this._skillColorClass(local.skillId, 'local');
+          if (recipesEl) {
+            const recipes = local.recipes || [];
+            if (recipes.length > 0) {
+              recipesEl.hidden = false;
+              recipesEl.innerHTML = recipes.map(r =>
+                `<span class="rmp-recipe-chip">${this._esc(r.name || r.id)}</span>`
+              ).join('');
+            } else {
+              recipesEl.hidden = true;
+              recipesEl.innerHTML = '';
+            }
+          }
         } else {
           bar.hidden = true;
           fill.style.width = '0%';
+          if (recipesEl) { recipesEl.hidden = true; recipesEl.innerHTML = ''; }
         }
       });
     }
+  }
+
+  /** Escape HTML to prevent injection in recipe chips. */
+  _esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  /** Get a skill-specific color class for the progress bar fill.
+   *  Matches the game's ProgressBarStyle colors where possible. */
+  _skillColorClass(skillId, side) {
+    // Map skill IDs to game-like bar colors
+    const map = {
+      'melvorD:Woodcutting': 'rmp-fill-woodcutting',
+      'melvorD:Mining': 'rmp-fill-mining',
+      'melvorD:Fishing': 'rmp-fill-fishing',
+      'melvorD:Firemaking': 'rmp-fill-firemaking',
+      'melvorD:Cooking': 'rmp-fill-cooking',
+      'melvorD:Smithing': 'rmp-fill-smithing',
+      'melvorD:Thieving': 'rmp-fill-thieving',
+      'melvorD:Farming': 'rmp-fill-farming',
+      'melvorD:Fletching': 'rmp-fill-fletching',
+      'melvorD:Crafting': 'rmp-fill-crafting',
+      'melvorD:Runecrafting': 'rmp-fill-runecrafting',
+      'melvorD:Herblore': 'rmp-fill-herblore',
+      'melvorD:Agility': 'rmp-fill-agility',
+      'melvorD:Summoning': 'rmp-fill-summoning',
+      'melvorD:Astrology': 'rmp-fill-astrology',
+      'melvorD:Archaeology': 'rmp-fill-archaeology',
+      'melvorD:Cartography': 'rmp-fill-cartography',
+      'melvorD:Harvesting': 'rmp-fill-harvesting',
+      'melvorD:Corruption': 'rmp-fill-corruption',
+      'melvorD:AltMagic': 'rmp-fill-altmagic',
+    };
+    return map[skillId] || (side === 'local' ? 'rmp-fill-local' : 'rmp-fill-remote');
   }
 
   _showRow(name) { const el = this.$(name); if (el) el.hidden = false; }

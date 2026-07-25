@@ -94,3 +94,62 @@
   padding: 6px 8px;
 }
 .rmp-hint { font-size: 10px; color: #6b7280; margin: 2px 0 0; }
+
+/* Fake progress bars — match the game's ProgressBarElement look.
+   The game uses Bootstrap-style .progress > .progress-bar with colored
+   bg-* classes. We replicate that with our own namespaced classes. */
+.rmp-fake-bar {
+  height: 8px;
+  background: #1f2937;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+.rmp-fake-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.5s linear;
+}
+/* Default fills (local=green, remote=blue) */
+.rmp-fill-local { background: #34d399; }
+.rmp-fill-remote { background: #60a5fa; }
+/* Skill-specific colors — matching the game's ProgressBarStyle where possible */
+.rmp-fill-woodcutting { background: #4ade80; }   /* bg-woodcutting: green */
+.rmp-fill-mining { background: #fbbf24; }        /* bg-mining: amber */
+.rmp-fill-fishing { background: #38bdf8; }       /* bg-info: sky blue */
+.rmp-fill-firemaking { background: #f87171; }    /* red-orange */
+.rmp-fill-cooking { background: #fb923c; }       /* orange */
+.rmp-fill-smithing { background: #d1d5db; }      /* light gray */
+.rmp-fill-thieving { background: #a78bfa; }      /* purple */
+.rmp-fill-farming { background: #84cc16; }       /* lime */
+.rmp-fill-fletching { background: #fcd34d; }     /* gold */
+.rmp-fill-crafting { background: #f472b6; }      /* pink */
+.rmp-fill-runecrafting { background: #c084fc; }  /* violet */
+.rmp-fill-herblore { background: #34d399; }      /* green */
+.rmp-fill-agility { background: #22d3ee; }       /* cyan */
+.rmp-fill-summoning { background: #f59e0b; }     /* amber-gold */
+.rmp-fill-astrology { background: #818cf8; }     /* indigo */
+.rmp-fill-archaeology { background: #d4a373; }   /* bg-archaeology: tan */
+.rmp-fill-cartography { background: #93c5fd; }   /* light blue */
+.rmp-fill-harvesting { background: #65a30d; }    /* bg-harvesting: dark green */
+.rmp-fill-corruption { background: #a855f7; }    /* dark purple */
+.rmp-fill-altmagic { background: #6366f1; }      /* indigo-blue */
+
+/* Recipe chips — small tags showing what's being gathered (e.g. tree names) */
+.rmp-recipe-chip {
+  display: inline-block;
+  font-size: 10px;
+  color: #d1d5db;
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+/* Player block spacing */
+.rmp-player-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
