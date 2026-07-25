@@ -409,7 +409,6 @@ class Sync {
     this._remoteAction = null; // { skillId, progress, actionLabel }
     this._onRemoteActionCb = null;
     this._onLocalActionCb = null;
-    this._coopBoost = false;
   }
 
   onRemoteAction(cb) { this._onRemoteActionCb = cb; }
@@ -4921,44 +4920,6 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync.transport.send({ t: Msg.ACTION_STOP });
     });
-
-    // When both players are gathering the same resource, speed up 2x.
-    // We patch GatheringSkill.startActionTimer() — if both players are on
-    // the same recipe, we start the timer with half the interval.
-    // This works for ALL skills since they all inherit from GatheringSkill.
-    this.ctx.patch(GatheringSkill, 'startActionTimer').before(function () {
-      if (!sync.transport.isConnected || sync._applyingRemote) return;
-      // Get the recipe ID for the current action.
-      let recipeId = null;
-      try {
-        const ma = this.masteryAction;
-        if (ma && ma.id) recipeId = ma.id;
-      } catch { /* noop */ }
-      if (!recipeId) {
-        try {
-          if (this.activeRecipe && this.activeRecipe.id) recipeId = this.activeRecipe.id;
-        } catch { /* noop */ }
-      }
-      if (!recipeId) return;
-      // Check if the remote player is on the same recipe.
-      if (sync.actionLock.isRecipeClaimed(this.id, recipeId)) {
-        // Both players on same resource — mark for 2x speed.
-        sync._coopBoost = true;
-      } else {
-        sync._coopBoost = false;
-      }
-    });
-
-    // Patch Timer.start to halve the time when coop boost is active.
-    // The action timer calls start(interval) — we intercept and halve it.
-    this.ctx.patch(Timer, 'start').before(function (time, offsetByTick) {
-      if (sync._coopBoost && this === game.activeAction?.actionTimer) {
-        // Guard against Infinity/NaN/negative — only halve valid positive values.
-        if (typeof time === 'number' && time > 0 && isFinite(time)) {
-          return [time / 2, offsetByTick];
-        }
-      }
-    });
   }
 
   _startProgressBroadcaster() {
@@ -7328,10 +7289,6 @@ class Panel {
             <div data-rmp="remoteProgressFill" style="width:0%;height:100%;background:#60a5fa;border-radius:3px;transition:width 0.5s linear;"></div>
           </div>
         </div>
-        <div data-rmp="conflict" hidden
-          style="font-size:11px;color:#6ee7b7;background:rgba(6,78,59,0.4);border:1px solid #065f46;border-radius:6px;padding:6px 8px;">
-          Co-op boost active! Both players gathering the same resource — 2x speed.
-        </div>
         <hr style="border:none;border-top:1px solid #374151;margin:4px 0;" />
         <div style="display:flex;gap:6px;">
           <button class="rmp-btn" data-rmp="copySaveBtn"
@@ -7601,7 +7558,6 @@ class Panel {
     $('remoteName').textContent = this.transport.peerName || 'Peer';
     $('localAction').textContent = lock.local ? formatAction(lock.local) : 'Idle';
     $('remoteAction').textContent = lock.remote ? formatAction(lock.remote) : 'Idle';
-    $('conflict').hidden = !lock.isConflict();
   }
 }
 
