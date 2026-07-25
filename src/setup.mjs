@@ -4222,12 +4222,26 @@ class Sync {
     if (!ca) return;
     logger.info('[CARTO] _patchCartography: starting');
 
+    // Use setTimeout(0) to make the send asynchronous — this prevents
+    // _sendCartography() from blocking the click handler that triggered
+    // the patch (e.g. createNewMapForDigSite → selectDigSiteMapOnClick).
+    // _sendCartography() iterates over all hexes/POIs/digSiteMaps which
+    // can be slow for large maps, and doing it synchronously inside a
+    // click handler freezes the game.
+    let cartoSendPending = false;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      this._sendCartography();
+      if (cartoSendPending) return; // batch multiple calls into one
+      cartoSendPending = true;
+      setTimeout(() => {
+        cartoSendPending = false;
+        try { this._sendCartography(); } catch (e) { logger.error('[CARTO] send failed', e); }
+      }, 0);
     };
 
     // Patch survey, discovery, travel, and paper methods
+    // Includes createNewMapForDigSite — the actual method that creates a
+    // dig site map (createMapOnClick only opens the modal).
     for (const m of ['discoverPOI', 'selectPaperRecipeOnClick', 'autoSurveyOnClick',
                      'travelOnClick', 'surveyOnClick', 'startAutoSurvey',
                      'startSurveyQueue', 'movePlayer', 'onHexTap',
@@ -4236,7 +4250,8 @@ class Sync {
                      'startUpgradingMap', 'selectDigSiteOnClick',
                      'selectDigSiteMapOnClick', 'deleteDigSiteMapOnClick',
                      'selectRefinementOnClick', 'unlockFastTravelOnClick',
-                     'goToWorldMapOnClick', 'goToPlayerOnClick']) {
+                     'goToWorldMapOnClick', 'goToPlayerOnClick',
+                     'createNewMapForDigSite', 'destroyDigSiteMap']) {
       if (typeof Cartography.prototype[m] === 'function') {
         this.ctx.patch(Cartography, m).after(() => send());
       }
@@ -4450,10 +4465,12 @@ class Sync {
           // operations (setDigSite, setDigSiteMap) which freeze the game.
           // Instead, create the DigSiteMap object directly and push it.
           while (digSite.maps.length < dsm.maps.length) {
+            logger.info('[CARTO] Creating new DigSiteMap for', dsm.digSiteId, 'current:', digSite.maps.length, 'target:', dsm.maps.length);
             try {
               if (typeof DigSiteMap !== 'undefined') {
                 const newMap = new DigSiteMap(digSite, game, ca);
                 digSite.maps.push(newMap);
+                logger.info('[CARTO] DigSiteMap created successfully');
               } else { break; }
             } catch (e) { logger.warn('[CARTO] failed to create DigSiteMap', e); break; }
           }
