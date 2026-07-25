@@ -14,83 +14,162 @@ peer-to-peer connection.
 > around that by having each client run only its own action and synchronising
 > the *results*. Back up your save before using it.
 
+---
+
 ## How it works
 
-1. Both players load the **same save** (one exports it, the other imports it
-   through the game's normal save manager).
-2. One player clicks **Host** and shares the generated code.
-3. The other player enters the code and clicks **Connect**.
-4. Each player trains a different skill (e.g. one woodcuts, the other mines).
-5. The mod patches dozens of game methods (`Skill.addXP`,
+1. The **host** starts a session and shares a connection code.
+2. The other player enters the code and clicks **Connect**.
+3. The host's **full save** is sent to the peer, who writes it to slot 0 and
+   reloads — both clients now run the exact same character.
+4. After reload, the peer **auto-reconnects** to the host automatically.
+5. The host sends a **full state snapshot** (every skill, bank item, currency,
+   equipment set, pet, plot, obstacle, etc.) so both clients converge.
+6. Each player trains a different skill (e.g. one woodcuts, the other mines).
+7. The mod patches dozens of game methods (`Skill.addXP`,
    `SkillWithMastery.addMasteryXP`, `Bank.addItem` / `removeItemQuantity`,
    `Currency.add/remove/set`, `Player.equipItem`, `Farming.plantPlot`,
    `Agility.buildObstacle`, `Shop.buyItemOnClick`, and many more) to broadcast
    the **absolute new value** of any state change to the peer.
-6. The peer writes that value straight into the game's internal fields and
+8. The peer writes that value straight into the game's internal fields and
    re-renders, bypassing the modifier pipeline so progress is never counted
    twice. Both clients converge on identical state.
 
+### Co-op boost
+
+When both players gather the **same resource** at the same time, a **co-op
+boost** kicks in and halves the action interval (2x speed) for both clients.
+
+### Action lock
+
 A "current action" watcher reports which skill each player is training and
 warns in the UI when both pick the same skill (since that would duplicate
-effort rather than parallelise it). When both players *do* gather the same
-resource, a **co-op boost** kicks in and halves the action interval (2x speed)
-for both clients.
+effort rather than parallelise it). An action-lock system tracks who is
+training what and shows advisory conflict warnings in the panel.
 
-### What gets synced
+---
+
+## What gets synced
 
 Nearly every game system is synchronised in real time:
 
+### Skills & progression
+
 | System | Coverage |
 |--------|----------|
-| **Skills (XP & levels)** | Normal and abyssal XP for all skills |
+| **Skills (XP & levels)** | Normal and abyssal XP for all skills, with level cap handling |
 | **Mastery** | Per-action mastery XP and mastery pool per realm |
-| **Bank** | Item quantities (add/remove/sell) |
-| **Currencies** | GP, Slayer Coins, Abyssal Pieces, and all modded currencies |
+| **Level caps** | Purchased caps, active increases, per-skill selections |
+| **Stats** | All stat trackers (per-skill, general, combat, items, monsters) — throttled to 3s |
+| **Skill trees** | Node unlocks and points per tree |
+| **Ancient relics** | Relic unlocks per skill per realm |
+
+### Skill selections & actions
+
+| System | Coverage |
+|--------|----------|
+| **Skill selections** | Cooking, Woodcutting, Firemaking, Fishing, Thieving, Alt Magic, Fletching, Herblore, Smithing, Crafting, Runecrafting, Harvesting, Archaeology |
+| **Mining** | Rock HP / ore depletion (skips locally-mined rock) |
+| **Farming** | Plot unlocks, planted seeds, compost, growth state, harvest, dead plot clearing, abyssal farming levels, selected recipes |
+| **Agility** | Built obstacles/pillars, blueprints, build counts, active obstacle (crash-proofed) |
+| **Astrology** | Modifier upgrades (standard/unique/abyssal), studied/explored constellation selection |
+| **Summoning** | Mark discoveries, non-shard cost selections |
+| **Slayer** | Active task, monster, kills left, extended flag, realm, category completions |
+| **Cartography** | Hex survey levels, POI discoveries, fast travel, player position, dig site maps (tier, upgrade actions, charges, refinements, artefact values), paper recipe, map upgrade digsite selection |
+| **Archaeology museum** | Dig site selection, tools, **auto-donation sync** (when one player donates an artifact, the peer receives it automatically — bank removal, rewards, UI update) |
+| **Cooking stockpiles** | Per-category stockpile items and quantities |
+| **Harvesting** | Selected vein, vein intensity (throttled to 2s) |
+
+### Inventory & equipment
+
+| System | Coverage |
+|--------|----------|
+| **Bank** | Item quantities (add/remove/sell), corrupted entry cleanup, render queue batching |
+| **Currencies** | GP, Slayer Coins, Raid Coins, Abyssal Pieces, Abyssal Slayer Coins, and all modded currencies — with 60s periodic safety-net sync |
 | **Equipment** | All equipment sets, slots, quantities, spell/prayer selections |
+| **Equipment set count** | Number of unlocked equipment set slots |
 | **Food** | Equipped food slots and selected slot |
 | **Prayers / Curses / Auroras** | Active prayers, prayer/soul points |
 | **Attack styles & spells** | Melee/ranged/magic styles, attack/curse/aurora selection |
 | **Pets** | Pet unlocks |
-| **Item charges** | Charged item counts |
+| **Item charges** | Charged item counts (amulets, rings, etc.) |
 | **Potions** | Active potions per action |
 | **Shop / Upgrades** | Purchased upgrade counts |
-| **Tutorial** | Stage progress, task progress, claims, completion |
-| **Mining** | Rock HP (available ore) |
-| **Farming** | Plot unlocks, planted seeds, compost, growth state |
-| **Agility** | Built obstacles/pillars, blueprints, build counts |
-| **Astrology** | Modifier upgrades (timesBought), constellation selection |
-| **Summoning** | Mark discoveries, non-shard cost selections |
-| **Slayer** | Active task, monster, kills left, category completions |
-| **Skill selections** | Cooking, Woodcutting, Firemaking, Fishing, Thieving, Alt Magic, Fletching, Herblore, Smithing, Crafting, Runecrafting, Harvesting, Archaeology |
-| **Combat events** | Active event, progress, passives, event areas |
-| **Combat** | Monster selection, damage events, HP, loot drops |
-| **Ancient relics** | Relic unlocks per skill |
-| **Skill trees** | Node unlocks |
-| **Township** | Buildings, resources, town data, worship, seasons |
-| **Township tasks** | Completed tasks, casual task progress |
-| **Clue hunt** | Step progress |
-| **Corruption** | Corruption row unlocks |
-| **Raids** | Raid state, modifiers, equipment |
-| **Fishing contest** | Active fish, results, leaderboard, trackers |
-| **Cartography** | Hex survey levels, POI discoveries, fast travel, dig site maps, paper recipes |
-| **Stats** | All stat trackers (per-skill, general, combat, items, monsters) |
-| **Level caps** | Purchased caps, active increases, selections |
-| **Game state** | Pause, tick timestamp, merchant's permit |
-| **Lore** | Book read status |
-| **Realm selection** | Current realm |
-| **Cooking stockpiles** | Passive cooking stockpile items |
-| **Equipment set count** | Number of equipment sets |
-| **Game settings** | Gameplay-affecting boolean settings |
+
+### Combat
+
+| System | Coverage |
+|--------|----------|
+| **Combat areas** | Dungeons, abyss depths, strongholds — completion counts, stronghold tier, area progress |
+| **Combat events** | Into the Mist, Spider Lair — event progress, passives, areas |
+| **Combat damage** | Real-time HP sync for player and enemy with damage splashes |
+| **Combat claim/release** | Only one player attacks at a time; the other spectates (spectator deals 0 damage to prevent double-damage) |
+| **Combat loot** | Both players receive all drops (items, GP, Slayer Coins, bones, barrier dust, signet halves, birthday presents) |
+| **Player combat state** | Prayer/soul points, active prayers, attack styles, spell selection |
+
+### Endgame & meta systems
+
+| System | Coverage |
+|--------|----------|
+| **Township** | Buildings, efficiency, resources, town data (population, happiness, education, worship, seasons, fortification, souls), worship selection — throttled to 5s |
+| **Township tasks** | Completed tasks, casual tasks with per-goal progress |
+| **Clue hunt** | Step progress and current step |
+| **Corruption** | Unlocked corruption effect rows |
+| **Raids (Golbin Raid)** | Wave, difficulty, history, loadout (equipment, food, modifiers), state, item selection, modifier selection |
+| **Fishing contest** | Active fish, actions remaining, difficulty, completion/mastery trackers, results, leaderboard |
+| **Tutorial** | Stage progress, task progress, stage claims, completion |
+
+### Game state & meta
+
+| System | Coverage |
+|--------|----------|
+| **Game state** | tickTimestamp, merchant's permit, pause state, visible completion |
+| **Lore books** | Read lore books (button disable state) |
+| **Realm selection** | Current active realm |
+| **Game settings** | Gameplay-affecting boolean settings (continueIfBankFull, continueThievingOnStun, autoRestartDungeon, enableAutoSlayer, enableAutoEquipFood, enableAutoSwapFood, enablePerfectCooking, enablePermaCorruption, enableOfflineCombat) |
 
 When a peer first connects, the host sends a **full state snapshot** covering
 all of the above so both clients start from the same baseline.
 
-### Networking
+---
 
-Connectivity uses [PeerJS](https://peerjs.com) (loaded from a CDN at runtime),
-which provides a free public signalling broker for WebRTC. No server of your
-own is required. The connection is direct between the two players once
-established.
+## UI features
+
+The mod adds a **floating, draggable panel** (top-right of the screen) with:
+
+- **Connection status** — host/join state, player names, ping/latency display
+- **Progress bars** — fake progress bars showing both players' current action
+  progress, color-coded per skill type to match the game's skill colors
+- **Recipe chips** — shows active recipes (e.g. multiple tree names for
+  woodcutting) so you can see exactly what the other player is doing
+- **Action labels** — skill name and recipe for each player's current action
+- **Hide/show toggle** — collapsible panel to minimize UI footprint
+- **Export save button** — generates a save string in a modal with download
+  option
+- **Download log button** — exports the mod's in-memory log as a text file
+  (useful for debugging)
+
+---
+
+## Networking
+
+Connectivity uses a **WebSocket relay server** with ping/pong (10s interval),
+latency tracking, and auto-reconnect after save sync. The connection is
+brokered through a relay and then relayed peer-to-peer. No server of your own
+is required for basic use; a default public relay is provided.
+
+Features:
+- **Ping/pong** heartbeat every 10s with latency display
+- **Auto-reconnect** after save sync reload (remembers server URL + name)
+- **Throttled updates** for high-frequency systems (Harvesting 2s, Township 5s,
+  Stats 3s, Combat events 80ms) to avoid flooding the connection
+- **Render queue batching** — debounced rendering via `requestAnimationFrame`
+  to avoid performance issues from rapid remote updates
+- **Re-entrancy guard** (`_applyingRemote` flag) prevents recursive sync loops
+  during remote application
+- **Auto-save** — debounced save 5s after state changes
+
+---
 
 ## Installation
 
@@ -103,10 +182,13 @@ established.
 
 ### Option B — Modfile / mod.io
 
-1. Zip the **contents** of this folder (so `manifest.json` is at the zip root).
+1. Download the latest `melvor_idle_realMultiplayer.zip` from the
+   [releases page](https://github.com/venuss1/MelvorSaemlessMultiplayer/releases).
 2. In the Creator Toolkit, add the zip as a local mod, or upload it to mod.io.
 
 > The mod has no build step. The `.mjs` files are loaded directly by the game.
+
+---
 
 ## Usage
 
@@ -115,10 +197,41 @@ established.
 3. Enter your name.
 4. **Player A:** click **Host**, then send the displayed code to Player B.
 5. **Player B:** click **Join**, paste the code, click **Connect**.
-6. (Optional) Click **Copy current save to clipboard** and have the other
-   player import it so you start from the same profile.
+6. The host's save is automatically sent to the peer. The peer reloads with the
+   host's character and auto-reconnects.
 7. Each player picks a different skill and starts training. Watch the other
    player's progress appear in the panel and on your skills/bank.
+
+### Unlock All (debug)
+
+The mod includes an `UNLOCK_ALL` command (sent via the bot or console) that
+mass-unlocks everything in the game for testing:
+
+- All skills to level 120 + abyssal level 60
+- All dungeons, abyss depths, strongholds completed
+- All realms unlocked
+- 1000 of every item in the bank
+- All pets unlocked
+- All item charges set to 10000
+- All mastery to level 99, all mastery pools maxed
+- All shop upgrades purchased
+- All agility obstacles/pillars built
+- All summoning marks discovered
+- All ancient relics found
+- All combat areas completed 100x
+- All skill tree nodes unlocked
+- All clue hunt steps completed
+- All corruption rows unlocked
+- All astrology modifiers upgraded
+- All archaeology dig sites unlocked
+- All cartography POIs discovered
+- All harvesting veins unlocked
+- Tutorial completed
+- Prayer/soul points maxed
+- All level cap increases purchased
+- All currencies maxed (done last to avoid negative)
+
+---
 
 ## Project layout
 
@@ -131,11 +244,11 @@ melvor_idle_realMultiplayer/
 ├── assets/
 │   └── icon.svg
 └── src/
-    ├── setup.mjs          # entry point: all patch/apply logic (~7700 lines)
+    ├── setup.mjs          # entry point: all patch/apply logic (~7900 lines)
     ├── util/
-    │   └── logger.mjs     # tagged console logger
+    │   └── logger.mjs     # tagged console logger with in-memory ring buffer
     ├── net/
-    │   ├── transport.mjs  # PeerJS wrapper (host/join, send, events)
+    │   ├── transport.mjs  # WebSocket relay wrapper (host/join, send, events)
     │   └── protocol.mjs   # wire message types + (de)serialisation
     ├── state/
     │   ├── actionLock.mjs # who-is-training-what reservation
@@ -160,26 +273,31 @@ Syntax-check without installing anything:
 node --check src/setup.mjs
 ```
 
+---
+
 ## Known limitations & caveats
 
 - **Combat is partially synced.** Monster selection, damage events, HP, and
   loot drops are mirrored between clients. However, combat involves a single
   `CombatManager` per client — both players see the fight progress, but the
   live animation/splash rendering is best-effort. One player should be the
-  designated "attacker" while the other spectates.
+  designated "attacker" (via combat claim) while the other spectates. The
+  spectator's attacks deal 0 damage to prevent double-damage.
 - **Random drops** are resolved on the acting client and broadcast as bank
   deltas, so both clients end up with the same items. But seed-based
   deterministic events that read local RNG state won't match — only the
   *results* are synced.
-- **Save ownership:** each client still owns its own local save. Periodically
-  one player should export and the other re-import to stay aligned, or just
-  rely on the live delta sync. The mod does not write to your save file
-  directly beyond what the game itself persists.
-- **PeerJS broker availability** depends on the public PeerJS cloud. For
-  guaranteed uptime you can self-host a broker and pass its config to the
-  `new Peer(...)` call in `src/net/transport.mjs`.
+- **Save ownership:** each client still owns its own local save. The host's
+  save is sent to the peer on connection (written to slot 0 + reload).
+  Periodically one player should export and the other re-import to stay
+  aligned, or just rely on the live delta sync.
+- **Relay server availability** depends on the default public relay. For
+  guaranteed uptime you can self-host a relay and pass its URL to the
+  transport.
 - **No anti-cheat.** This is a co-op tool for trusted friends, not a
   competitive multiplayer layer.
+
+---
 
 ## Public API (for other mods)
 
@@ -194,6 +312,8 @@ mp.teardown();    // full teardown
 ```
 
 There is also a `window.realMP` shorthand for the dev console.
+
+---
 
 ## License
 
