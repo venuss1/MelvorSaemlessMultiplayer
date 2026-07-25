@@ -2336,17 +2336,10 @@ class Sync {
       }
     }
 
-    // Woodcutting: active trees
-    const wc = game.woodcutting;
-    if (wc) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const trees = [];
-        if (wc.activeTrees) for (const t of wc.activeTrees) trees.push(t.id);
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Woodcutting', trees });
-      };
-      if (typeof Woodcutting.prototype.selectTree === 'function') this.ctx.patch(Woodcutting, 'selectTree').after(() => send());
-    }
+    // Woodcutting: active trees are NOT synced — tree selection is a
+    // per-player UI choice. Syncing activeTrees corrupts the receiver's
+    // woodcutting state (trees set without the action being started,
+    // causing -Infinity tick crashes when trees are deselected).
 
     // Firemaking: selected log, oil, bonfire
     const fm = game.firemaking;
@@ -2537,17 +2530,7 @@ class Sync {
           if (s.render) s.render();
           break;
         }
-        case 'melvorD:Woodcutting': {
-          const s = game.woodcutting;
-          if (!s || !msg.trees) break;
-          s.activeTrees.clear();
-          for (const tid of msg.trees) {
-            const tree = s.actions.getObjectByID(tid);
-            if (tree) s.activeTrees.add(tree);
-          }
-          if (s.render) s.render();
-          break;
-        }
+        // Woodcutting: active trees are NOT synced (per-player UI choice).
         case 'melvorD:Firemaking': {
           const s = game.firemaking;
           if (!s) break;
@@ -5643,10 +5626,7 @@ class Sync {
         }
         skillSelects.cooking = { recipes };
       }
-      // Woodcutting
-      if (game.woodcutting && game.woodcutting.activeTrees) {
-        skillSelects.woodcutting = { trees: [...game.woodcutting.activeTrees].map(t => t.id) };
-      }
+      // Woodcutting: active trees NOT synced (per-player UI choice).
       // Firemaking
       if (game.firemaking) {
         skillSelects.firemaking = {
@@ -6264,18 +6244,7 @@ class Sync {
               if (recipe) game.cooking.selectedRecipes.set(cat, recipe);
             }
           }
-          if (ss.woodcutting && game.woodcutting) {
-            // Don't clear activeTrees if the local player is actively
-            // woodcutting — clearing trees while the action is running
-            // causes -Infinity tick errors.
-            if (!game.woodcutting.isActive) {
-              game.woodcutting.activeTrees.clear();
-              for (const tid of ss.woodcutting.trees || []) {
-                const tree = game.woodcutting.actions.getObjectByID(tid);
-                if (tree) game.woodcutting.activeTrees.add(tree);
-              }
-            }
-          }
+          // Woodcutting: active trees NOT synced (per-player UI choice).
           if (ss.firemaking && game.firemaking) {
             if (ss.firemaking.recipeId) game.firemaking.selectedRecipe = game.firemaking.actions.getObjectByID(ss.firemaking.recipeId);
             if (ss.firemaking.oilId) game.firemaking.selectedOil = game.items.getObjectByID(ss.firemaking.oilId);
