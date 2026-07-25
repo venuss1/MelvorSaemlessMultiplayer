@@ -115,7 +115,7 @@ const decode = (data) => {
 // them and relays messages. This works through any firewall that allows
 // HTTPS (which is essentially all of them).
 
-const DEFAULT_SERVER = 'wss://preliminary-proprietary-positioning-simpson.trycloudflare.com';
+const DEFAULT_SERVER = 'wss://solo-tradition-respiratory-factors.trycloudflare.com';
 
 /** Get the saved server URL from localStorage, or fall back to DEFAULT_SERVER. */
 function getSavedServerUrl() {
