@@ -1995,8 +1995,8 @@ class Sync {
           if (obId === currentId) continue; // already in sync
 
           if (obId) {
-            // Build the obstacle — obstacles live in game.agility.actions
-            const ob = (ag.actions && ag.actions.getObjectByID(obId)) || game.items.getObjectByID(obId);
+            // AgilityObstacle is a MasteryAction in ag.actions, not an Item.
+            const ob = ag.actions && ag.actions.getObjectByID(obId);
             if (!ob) { logger.warn(`[AGILITY] Obstacle not found: ${obId}`); continue; }
             // Direct set the obstacle — don't call buildObstacle() because:
             // 1. buildObstacle(obstacle) takes only 1 param (not course+tier)
@@ -2018,7 +2018,8 @@ class Sync {
           if (piId === currentId) continue;
 
           if (piId) {
-            const pi = (ag.pillars && ag.pillars.getObjectByID(piId)) || game.items.getObjectByID(piId);
+            // AgilityPillar is a MasteryAction in ag.pillars, not an Item.
+            const pi = ag.pillars && ag.pillars.getObjectByID(piId);
             if (!pi) { logger.warn(`[AGILITY] Pillar not found: ${piId}`); continue; }
             // Direct set — same reasoning as obstacles above
             course.builtPillars.set(tierNum, pi);
@@ -2056,14 +2057,14 @@ class Sync {
           const bpObstacles = new Map();
           for (const [tier, obId] of Object.entries(bp.obstacles || {})) {
             if (obId) {
-              const ob = (ag.actions && ag.actions.getObjectByID(obId)) || game.items.getObjectByID(obId);
+              const ob = ag.actions && ag.actions.getObjectByID(obId);
               if (ob) bpObstacles.set(Number(tier), ob);
             }
           }
           const bpPillars = new Map();
           for (const [tier, piId] of Object.entries(bp.pillars || {})) {
             if (piId) {
-              const pi = (ag.pillars && ag.pillars.getObjectByID(piId)) || game.items.getObjectByID(piId);
+              const pi = ag.pillars && ag.pillars.getObjectByID(piId);
               if (pi) bpPillars.set(Number(tier), pi);
             }
           }
@@ -2074,7 +2075,7 @@ class Sync {
       // Sync obstacle build counts (take max to avoid losing progress)
       if (msg.buildCounts && ag.obstacleBuildCount) {
         for (const bc of msg.buildCounts) {
-          const ob = (ag.actions && ag.actions.getObjectByID(bc.id)) || game.items.getObjectByID(bc.id);
+          const ob = ag.actions && ag.actions.getObjectByID(bc.id);
           if (!ob) continue;
           const cur = ag.obstacleBuildCount.get(ob) || 0;
           if (bc.count > cur) ag.obstacleBuildCount.set(ob, bc.count);
