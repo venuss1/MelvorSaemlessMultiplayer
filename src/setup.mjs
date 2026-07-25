@@ -4445,8 +4445,17 @@ class Sync {
           const digSite = game.archaeology.actions.getObjectByID(dsm.digSiteId);
           if (!digSite || !digSite.maps) continue;
           // Ensure we have the right number of maps; create missing ones.
+          // Do NOT call ca.createNewMapForDigSite() — it consumes costs from
+          // the bank and triggers render queue flags that call expensive DOM
+          // operations (setDigSite, setDigSiteMap) which freeze the game.
+          // Instead, create the DigSiteMap object directly and push it.
           while (digSite.maps.length < dsm.maps.length) {
-            try { ca.createNewMapForDigSite(digSite); } catch { break; }
+            try {
+              if (typeof DigSiteMap !== 'undefined') {
+                const newMap = new DigSiteMap(digSite, game, ca);
+                digSite.maps.push(newMap);
+              } else { break; }
+            } catch (e) { logger.warn('[CARTO] failed to create DigSiteMap', e); break; }
           }
           for (let i = 0; i < dsm.maps.length && i < digSite.maps.length; i++) {
             const remote = dsm.maps[i];
