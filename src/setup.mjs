@@ -627,6 +627,19 @@ class Sync {
   _itemById(id) { return game.items.getObjectByID(id); }
   _currencyById(id) { return game.currencies.getObjectByID(id); }
 
+  // Check if an item is currently equipped in any equipment set.
+  // Used to prevent bank dupe when stale bank syncs arrive after equipment syncs.
+  _isItemEquipped(item) {
+    if (!game.combat || !game.combat.player || !game.combat.player.equipmentSets) return false;
+    for (const eqSet of game.combat.player.equipmentSets) {
+      if (!eqSet || !eqSet.equipment || !eqSet.equipment.equippedItems) continue;
+      for (const eqItem of Object.values(eqSet.equipment.equippedItems)) {
+        if (eqItem && eqItem.item && eqItem.item.id === item.id) return true;
+      }
+    }
+    return false;
+  }
+
   // ---- XP / Abyssal XP --------------------------------------------------
 
   _patchXP() {
@@ -691,15 +704,17 @@ class Sync {
     if (!skill || !skill.hasMastery) return;
     const action = skill.actions && skill.actions.getObjectByID(msg.actionId);
     if (!action) return;
+    // Don't return early if am is undefined — the actionMastery entry may not
+    // exist yet if the player has never trained this action. addMasteryXP
+    // creates it automatically. Use 0 as current XP in that case.
     const am = skill.actionMastery.get(action);
-    if (!am) return;
     this._applyingRemote = true;
     try {
       // Mastery should only ever go UP, never down. Both players share the
       // same character, so we take the max of local and remote XP. This
       // prevents a player with lower mastery from resetting the other
       // player's mastery down.
-      const currentXp = am.xp;
+      const currentXp = am ? am.xp : 0;
       if (msg.xp > currentXp) {
         // Use the game's own addMasteryXP method — it handles level-ups,
         // mastery unlocks, mastery bonuses, and rendering properly.
@@ -806,6 +821,15 @@ class Sync {
     const current = bank.getQty(item);
     const delta = msg.qty - current;
     if (delta === 0) return;
+    // Prevent dupe: if the bank sync says to ADD an item (delta > 0) but the
+    // item is currently equipped by the local player, skip the add. This
+    // happens when a stale bank sync from an unequip arrives after the
+    // equipment sync from a re-equip. The item is already equipped, so adding
+    // it back to the bank would create a duplicate.
+    if (delta > 0 && this._isItemEquipped(item)) {
+      logger.info('Bank sync skip (item equipped):', msg.itemId, 'current:', current, 'target:', msg.qty);
+      return;
+    }
     logger.info('Bank sync apply:', msg.itemId, 'current:', current, 'target:', msg.qty, 'delta:', delta);
     this._applyingRemote = true;
     try {
@@ -4427,16 +4451,47 @@ class Sync {
           }
 
           // Apply POI discoveries and fast travel unlock status.
-          // Do NOT call ca.discoverPOI() — it triggers rewards, UI cascading,
-          // and potentially recursive rendering that freezes the game.
-          // Just set the fields directly.
+          // We can't call ca.discoverPOI() directly because it gives rewards
+          // (which the host already got) and triggers UI cascading that can
+          // freeze. But we DO need to update the map's discovered/undiscovered
+          // lists and create the initial dig site map, otherwise the
+          // archaeology UI won't show the dig site as available.
           if (mData.pois && wm.pointsOfInterest) {
             for (const p of mData.pois) {
               const poi = wm.pointsOfInterest.getObjectByID(p.poiId);
               if (poi && !poi.isDiscovered) {
                 poi.isDiscovered = true;
+                // Update map's discovered/undiscovered lists
+                if (wm.discoveredPOIs && !wm.discoveredPOIs.includes(poi)) {
+                  wm.discoveredPOIs.push(poi);
+                }
+                if (wm.undiscoveredPOIs) {
+                  const idx = wm.undiscoveredPOIs.indexOf(poi);
+                  if (idx !== -1) wm.undiscoveredPOIs.splice(idx, 1);
+                }
                 if (ca.renderQueue && ca.renderQueue.poiMarkers) {
                   ca.renderQueue.poiMarkers.add(poi);
+                }
+                // If this is a DigSitePOI, create the initial free map and
+                // trigger archaeology render so the dig site shows up.
+                // discoverPOI() does this normally; we replicate it here
+                // without giving rewards.
+                if (poi.digSite && typeof DigSiteMap !== 'undefined') {
+                  try {
+                    if (poi.digSite.maps.length === 0) {
+                      poi.digSite.maps.push(DigSiteMap.createAverageMap(poi.digSite, game, ca, DigSiteMap.tiers[2]));
+                      poi.digSite.selectedUpgradeIndex = 0;
+                    }
+                    if (ca.renderQueue) {
+                      ca.renderQueue.digSiteSelect = true;
+                    }
+                    if (game.archaeology) {
+                      if (game.archaeology.renderQueue) {
+                        game.archaeology.renderQueue.digSiteVisibility = true;
+                        game.archaeology.renderQueue.mapSelection.add(poi.digSite);
+                      }
+                    }
+                  } catch (e) { logger.warn('[CARTO] failed to create initial dig site map for', p.poiId, e); }
                 }
               }
               // Apply fast travel unlock status
