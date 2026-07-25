@@ -4978,71 +4978,26 @@ class Sync {
   }
 
   _applyActionStart(msg) {
-    // When the remote player has an active action, animate the progress bar
-    // on the skill page — but ONLY if the user is already viewing that skill,
-    // and ONLY the specific progress bar for the resource being gathered.
-    // We do NOT auto-navigate, so the user can freely switch tabs.
-    //
-    // IMPORTANT: We must NOT set timer.active = true or modify the skill's
-    // internal action state. Doing so makes the game's tick loop think the
-    // LOCAL player is doing this action, which calls startActionTimer() with
-    // the local player's selected resources — if none are selected, the
-    // interval computes to -Infinity and crashes the game.
+    // When the remote player has an active action, show it in the panel's
+    // mini progress bar. We do NOT touch any game objects — no timers, no
+    // skill methods, no progress bar elements. Any call to skill methods
+    // (renderProgressBar, animateProgressFromTimer, etc.) can have side
+    // effects that activate the action on the local game, causing the
+    // game's tick loop to run the action with no resources selected,
+    // producing -Infinity tick errors and crashes.
     try {
       const skill = game.skills.getObjectByID(msg.skillId || msg.actionId);
-      if (!skill || !skill.actionTimer) return;
+      if (!skill) return;
 
-      this._applyingRemote = true;
-      try {
-        // Calculate elapsed and total time for animateProgress.
-        const maxTicks = msg.maxTicks || 1;
-        const ticksLeft = msg.ticksLeft || 0;
-        const elapsed = maxTicks - ticksLeft;
-        const total = maxTicks;
-        const elapsedMs = elapsed * 50;
-        const totalMs = total * 50;
-
-        // Only animate if the user is currently viewing this skill's page.
-        try {
-          const pages = game.getPagesForSkill(skill);
-          if (pages && pages.length > 0) {
-            const page = pages[0];
-            const container = document.getElementById(page.containerID);
-            if (container && !container.hidden) {
-              // Find the SPECIFIC progress bar for this action.
-              const bar = this._findActionProgressBar(skill, container, msg.recipeId);
-              if (bar) {
-                // Use animateProgressFromTimer first (most reliable),
-                // then fall back to animateProgress.
-                if (bar.animateProgressFromTimer) {
-                  // Create a lightweight fake timer object for animation only.
-                  const fakeTimer = { _ticksLeft: ticksLeft, _maxTicks: maxTicks, active: true };
-                  try { bar.animateProgressFromTimer(fakeTimer); } catch { /* noop */ }
-                } else if (bar.animateProgress) {
-                  try { bar.animateProgress(elapsedMs, totalMs); } catch { /* noop */ }
-                }
-              }
-              // Also call the skill's own renderProgressBar method if it has one.
-              // This ensures the game's internal state matches the bar.
-              if (skill.renderProgressBar) {
-                try { skill.renderProgressBar(); } catch { /* noop */ }
-              } else if (skill.renderProgressBars) {
-                try { skill.renderProgressBars(); } catch { /* noop */ }
-              }
-            }
-          }
-        } catch (e) { /* page lookup may fail, that's ok */ }
-
-        // Update the panel's mini progress bar (always, regardless of page).
-        const progress = msg.progress || 0;
-        this._remoteAction = {
-          skillId: skill.id,
-          recipeId: msg.recipeId,
-          progress,
-          label: skill.name || skill.id,
-        };
-        if (this._onRemoteActionCb) this._onRemoteActionCb(this._remoteAction);
-      } finally { this._applyingRemote = false; }
+      // Only update the panel's mini progress bar — nothing else.
+      const progress = msg.progress || 0;
+      this._remoteAction = {
+        skillId: skill.id,
+        recipeId: msg.recipeId,
+        progress,
+        label: skill.name || skill.id,
+      };
+      if (this._onRemoteActionCb) this._onRemoteActionCb(this._remoteAction);
     } catch (e) { logger.warn('applyActionStart failed', e); }
   }
 
@@ -5082,50 +5037,10 @@ class Sync {
   }
 
   _applyActionStop(msg) {
+    // Just clear the panel's mini progress bar. Don't touch any game
+    // objects — calling skill.stopActiveProgressBar() or similar methods
+    // can interfere with the local player's action and cause crashes.
     try {
-      if (this._remoteAction && this._remoteAction.skillId) {
-        const skill = game.skills.getObjectByID(this._remoteAction.skillId);
-        if (skill) {
-          // Only stop the in-game progress bar if the LOCAL player is NOT
-          // actively mining the same resource. If the local player is still
-          // mining (e.g. their rock still has HP), we should NOT stop their
-          // timer or progress bar — the remote player's rock depleting
-          // shouldn't affect the local player's action.
-          const localActive = game.activeAction;
-          const localIsSameAction = localActive && localActive.id === skill.id;
-
-          if (!localIsSameAction) {
-            // Local player is not doing this skill — safe to stop the bar.
-            // Only stop UI animation, do NOT touch the timer's active state
-            // to avoid interfering with the game's tick loop.
-            if (skill.stopActiveProgressBar) {
-              try { skill.stopActiveProgressBar(); } catch { /* noop */ }
-            }
-            if (skill.renderProgressBar) {
-              try { skill.renderProgressBar(); } catch { /* noop */ }
-            } else if (skill.renderProgressBars) {
-              try { skill.renderProgressBars(); } catch { /* noop */ }
-            }
-            // Stop the specific progress bar element.
-            try {
-              const pages = game.getPagesForSkill(skill);
-              if (pages && pages.length > 0) {
-                const container = document.getElementById(pages[0].containerID);
-                if (container) {
-                  const bar = this._findActionProgressBar(skill, container, this._remoteAction.recipeId);
-                  if (bar) {
-                    if (bar.stopAnimation) bar.stopAnimation();
-                    if (bar.setFixedPosition) {
-                      try { bar.setFixedPosition(0); } catch { /* noop */ }
-                    }
-                  }
-                }
-              }
-            } catch { /* noop */ }
-          }
-        }
-      }
-      // Always clear the panel's mini progress bar for the remote player.
       this._remoteAction = null;
       if (this._onRemoteActionCb) this._onRemoteActionCb(null);
     } catch (e) { logger.warn('applyActionStop failed', e); }
