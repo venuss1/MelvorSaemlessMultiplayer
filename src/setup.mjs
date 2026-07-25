@@ -1131,11 +1131,14 @@ class Sync {
       game.potions.activePotions.forEach((ap, action) => {
         game.potions.removePotion(action, true);
       });
+      // usePotion(item, loadPotions?) takes only the item — no action needed.
+      // The actionId in the message is informational (which action the potion
+      // was used for) but usePotion assigns the potion to the currently
+      // selected action internally.
       for (const p of msg.potions) {
         const item = this._itemById(p.itemId);
-        const action = game.actions.getObjectByID(p.actionId);
-        if (!item || !action) continue;
-        game.potions.usePotion(item, true);
+        if (!item) continue;
+        try { game.potions.usePotion(item, true); } catch { /* skip */ }
       }
       if (game.potions.computeProvidedStats) game.potions.computeProvidedStats();
       if (game.potions.render) game.potions.render();
