@@ -1814,14 +1814,11 @@ class Sync {
           else {
             if (typeof p.state === 'number') plot.state = p.state;
             if (p.plantedRecipeId !== undefined) {
+              // FarmingRecipe is a MasteryAction in game.farming.actions,
+              // not an Item — don't fall back to game.items.
               let plantedRecipe = null;
-              if (p.plantedRecipeId) {
-                if (game.farming.actions) {
-                  plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
-                }
-                if (!plantedRecipe && game.items) {
-                  plantedRecipe = game.items.getObjectByID(p.plantedRecipeId);
-                }
+              if (p.plantedRecipeId && game.farming.actions) {
+                plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
               }
               plot.plantedRecipe = plantedRecipe || undefined;
             }
@@ -1886,12 +1883,10 @@ class Sync {
 
         // Sync selected recipe
         if (p.selectedRecipeId !== undefined) {
+          // FarmingRecipe is a MasteryAction in farming.actions, not an Item.
           let selectedRecipe = null;
-          if (farming.actions) {
+          if (p.selectedRecipeId && farming.actions) {
             selectedRecipe = farming.actions.getObjectByID(p.selectedRecipeId);
-          }
-          if (!selectedRecipe && game.items) {
-            selectedRecipe = game.items.getObjectByID(p.selectedRecipeId);
           }
           plot.selectedRecipe = p.selectedRecipeId ? selectedRecipe : undefined;
         }
