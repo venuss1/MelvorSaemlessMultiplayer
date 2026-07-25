@@ -728,7 +728,7 @@ class Sync {
         if (skill.renderMasteryPool) skill.renderMasteryPool();
       }
     } catch (e) { logger.error('applyMasteryPool failed', e); }
-    finally { this._applyingRemote = false; }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
   // ---- Bank -------------------------------------------------------------
@@ -900,6 +900,13 @@ class Sync {
     // Patch EquippedFood class methods (prototype-level, works even if player not ready)
     this.ctx.patch(EquippedFood, 'setSlot').after(function () { sendFood(); });
     this.ctx.patch(EquippedFood, 'unequipSelected').after(function () { sendFood(); });
+    // Patch food consumption during combat
+    if (typeof Player.prototype.eatFood === 'function') {
+      this.ctx.patch(Player, 'eatFood').after(function () { sendFood(); });
+    }
+    if (typeof EquippedFood.prototype.consume === 'function') {
+      this.ctx.patch(EquippedFood, 'consume').after(function () { sendFood(); });
+    }
 
     // --- Prayers / Curses / Auroras ---
     const sendPrayers = () => {
@@ -1275,7 +1282,7 @@ class Sync {
         for (const taskData of (stageData.tasks || [])) {
           const task = stage.tasks.find(tt => tt.id === taskData.id);
           if (task && typeof taskData.progress === 'number') {
-            task.progress = taskData.progress;
+            task.progress = Math.max(task.progress || 0, taskData.progress);
           }
         }
       }
@@ -1310,6 +1317,13 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync._sendRockHP();
     });
+    // Patch respawnRock so rock respawns sync to the peer.
+    if (typeof Mining.prototype.respawnRock === 'function') {
+      this.ctx.patch(Mining, 'respawnRock').after(function () {
+        if (sync._applyingRemote || !sync.transport.isConnected) return;
+        sync._sendRockHP();
+      });
+    }
     // Don't patch passiveTick — it fires every game tick (20x/sec) and
     // would flood the network. renderRockHP already fires when rock HP
     // actually changes, which is all we need.
@@ -1589,6 +1603,12 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync._sendAllFarmingPlots();
     });
+    // Compost removal
+    if (typeof Farming.prototype.removeCompostFromPlot === 'function') {
+      this.ctx.patch(Farming, 'removeCompostFromPlot').after(function (_ret, plot) {
+        sendPlot(plot);
+      });
+    }
 
     // Destroy / clear / reset
     this.ctx.patch(Farming, 'destroyPlot').after(function (_ret, plot) {
@@ -2270,7 +2290,7 @@ class Sync {
       if (this._applyingRemote || !this.transport.isConnected) return;
       this._sendSlayer();
     };
-    for (const m of ['selectTask', 'extendTask', 'clickNewTask', 'addKill']) {
+    for (const m of ['selectTask', 'extendTask', 'clickNewTask', 'addKill', 'setTask', 'changeSelectedRealm', 'resetTaskState']) {
       if (typeof game.combat.slayerTask[m] === 'function') {
         this.ctx.patch(SlayerTask, m).after(() => send());
       }
@@ -2298,11 +2318,25 @@ class Sync {
     this._applyingRemote = true;
     try {
       const t = game.combat.slayerTask;
+      const remoteMonster = msg.monsterId ? game.monsters.getObjectByID(msg.monsterId) : undefined;
+      const isNewTask = !t.monster || !remoteMonster || t.monster.id !== remoteMonster.id;
       t.active = !!msg.active;
-      t.monster = msg.monsterId ? game.monsters.getObjectByID(msg.monsterId) : undefined;
-      t.killsLeft = msg.killsLeft || 0;
+      t.monster = remoteMonster;
+      // If the monster changed, this is a new task — set killsLeft directly.
+      // Otherwise use Math.max so stale messages can't regress the counter
+      // (killsLeft only decreases via addKill during active play).
+      if (isNewTask) {
+        t.killsLeft = msg.killsLeft || 0;
+      } else {
+        t.killsLeft = Math.max(t.killsLeft || 0, msg.killsLeft || 0);
+      }
       t.extended = !!msg.extended;
-      if (msg.realmId) t.realm = game.realms.getObjectByID(msg.realmId);
+      // Handle realmId null explicitly so deselection syncs correctly.
+      if (msg.realmId !== undefined && msg.realmId !== null) {
+        t.realm = game.realms.getObjectByID(msg.realmId);
+      } else if (msg.realmId === null) {
+        t.realm = undefined;
+      }
       if (msg.categoryId) {
         // Slayer task categories live on SlayerTask (game.combat.slayerTask.categories),
         // not on the Slayer skill class.
@@ -3273,7 +3307,7 @@ class Sync {
     // The spectator gets loot via COMBAT_LOOT sync messages, not local drops.
 
     // Patch pause/unpause — sync combat pause state and release claim on stop
-    for (const m of ['pause', 'stop', 'start']) {
+    for (const m of ['pause', 'stop', 'start', 'pauseDungeon', 'resumeDungeon']) {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
           this.ctx.patch(CombatManager, m).after(function () {
@@ -3727,7 +3761,12 @@ class Sync {
       }
       if (msg.resources) for (const [rid, data] of Object.entries(msg.resources)) {
         const r = tw.resources.getObjectByID(rid);
-        if (r) { r._amount = data.amount; r._cap = data.cap; }
+        if (r) {
+          // _amount fluctuates (consumed/produced) — direct assignment.
+          if (typeof data.amount === 'number') r._amount = data.amount;
+          // _cap only increases via buildings — use Math.max.
+          if (typeof data.cap === 'number') r._cap = Math.max(r._cap || 0, data.cap);
+        }
       }
       if (typeof msg.totalTicks === 'number') tw.totalTicks = msg.totalTicks;
       if (typeof msg.legacyTicks === 'number') tw.legacyTicks = msg.legacyTicks;
@@ -3738,16 +3777,16 @@ class Sync {
         if (typeof d.happiness === 'number') td.happiness = d.happiness;
         if (typeof d.education === 'number') td.education = d.education;
         if (typeof d.healthPercent === 'number') td.healthPercent = d.healthPercent;
-        if (typeof d.buildingStorage === 'number') td.buildingStorage = d.buildingStorage;
+        if (typeof d.buildingStorage === 'number') td.buildingStorage = Math.max(td.buildingStorage || 0, d.buildingStorage);
         if (typeof d.worshipCount === 'number') td.worshipCount = d.worshipCount;
-        if (typeof d.sectionsPurchased === 'number') td.sectionsPurchased = d.sectionsPurchased;
+        if (typeof d.sectionsPurchased === 'number') td.sectionsPurchased = Math.max(td.sectionsPurchased || 0, d.sectionsPurchased);
         if (typeof d.townCreated === 'boolean') td.townCreated = d.townCreated;
         if (typeof d.population === 'number') td.population = d.population;
         if (typeof d.seasonTicksRemaining === 'number') td.seasonTicksRemaining = d.seasonTicksRemaining;
         if (typeof d.health === 'number') td.health = d.health;
         if (typeof d.fortification === 'number') td.fortification = d.fortification;
         if (typeof d.souls === 'number') td.souls = d.souls;
-        if (typeof d.soulStorage === 'number') td.soulStorage = d.soulStorage;
+        if (typeof d.soulStorage === 'number') td.soulStorage = Math.max(td.soulStorage || 0, d.soulStorage);
         if (typeof d.abyssalWaveTicksRemaining === 'number') td.abyssalWaveTicksRemaining = d.abyssalWaveTicksRemaining;
         if (d.worshipId !== undefined) {
           td.worship = d.worshipId ? (tw.worships && tw.worships.getObjectByID(d.worshipId)) : (tw.noWorship || undefined);
@@ -4194,7 +4233,7 @@ class Sync {
         }
       }
       if (typeof msg.casualTasksCompleted === 'number' && tw.casualTasks) {
-        tw.casualTasks.casualTasksCompleted = msg.casualTasksCompleted;
+        tw.casualTasks.casualTasksCompleted = Math.max(tw.casualTasks.casualTasksCompleted || 0, msg.casualTasksCompleted);
       }
       if (msg.casual && tw.casualTasks && tw.casualTasks.currentCasualTasks) {
         // TownshipCasualTask has no .progress/.completed — progress is
@@ -4261,7 +4300,9 @@ class Sync {
     // it directly as that would send cartography data every tick (huge
     // payload). Instead, throttle via the periodic state sync.
     for (const m of ['surveyHex', 'onHexFullSurvey', 'onHexMastery',
-                     'surveyAuto', 'surveyActionQueue']) {
+                     'surveyAuto', 'surveyActionQueue',
+                     'useDigSiteMapCharges', 'mapUpgradeAction',
+                     'paperMakingAction', 'unsurveyWholeMap']) {
       if (typeof Cartography.prototype[m] === 'function') {
         this.ctx.patch(Cartography, m).after(() => send());
       }
@@ -4374,7 +4415,7 @@ class Sync {
               // Only update if the remote has more progress
               if (h.surveyLevel > hex._surveyLevel) {
                 hex._surveyLevel = h.surveyLevel;
-                hex._surveyXP = h.surveyXP;
+                hex._surveyXP = Math.max(hex._surveyXP || 0, h.surveyXP || 0);
                 // Queue render updates
                 if (ca.renderQueue) {
                   if (ca.renderQueue.hexBackground) ca.renderQueue.hexBackground.add(hex);
@@ -4485,7 +4526,7 @@ class Sync {
                 const remote = dsm.maps[i];
                 const local = digSite.maps[i];
                 if (!local) continue;
-                if (typeof remote.upgradeActions === 'number') local._upgradeActions = remote.upgradeActions;
+                if (typeof remote.upgradeActions === 'number') local._upgradeActions = Math.max(local._upgradeActions || 0, remote.upgradeActions);
                 if (typeof remote.charges === 'number') local.charges = remote.charges;
                 // Recompute tier from upgrade actions
                 if (typeof local.computeTier === 'function') {
@@ -5393,7 +5434,15 @@ class Sync {
         for (const [tier, ob] of course.builtObstacles) obstacles[tier] = ob ? ob.id : null;
         const pillars = {};
         for (const [tier, pi] of course.builtPillars) pillars[tier] = pi ? pi.id : null;
-        agilityData.push({ realmId: realm.id, obstacles, pillars });
+        const blueprints = [];
+        if (course.blueprints) for (const [slot, bp] of course.blueprints) {
+          const bpObstacles = {};
+          if (bp.obstacles) for (const [tier, ob] of bp.obstacles) bpObstacles[tier] = ob ? ob.id : null;
+          const bpPillars = {};
+          if (bp.pillars) for (const [tier, pi] of bp.pillars) bpPillars[tier] = pi ? pi.id : null;
+          blueprints.push({ slot, name: bp.name || '', obstacles: bpObstacles, pillars: bpPillars });
+        }
+        agilityData.push({ realmId: realm.id, obstacles, pillars, blueprints });
       }
       snapshot.agility = { courses: agilityData, activeObstacle: ag.currentlyActiveObstacle };
     }
@@ -6168,7 +6217,7 @@ class Sync {
           const vein = game.harvesting.actions.getObjectByID(v.id);
           if (!vein) continue;
           if (typeof v.intensity === 'number') vein.currentIntensity = v.intensity;
-          if (typeof v.max === 'number') vein.maxIntensity = v.max;
+          if (typeof v.max === 'number') vein.maxIntensity = Math.max(vein.maxIntensity || 0, v.max);
         }
         if (game.harvesting.renderVeinIntensity) game.harvesting.renderVeinIntensity();
         if (game.harvesting.renderVeinStatus) game.harvesting.renderVeinStatus();
@@ -6224,6 +6273,13 @@ class Sync {
         if (typeof cs.playerHp === 'number' && game.combat.player) {
           game.combat.player.hitpoints = cs.playerHp;
           if (game.combat.player.renderHitpoints) game.combat.player.renderHitpoints();
+        }
+        // Apply combat pause state
+        if (typeof cs.paused === 'boolean') {
+          try {
+            if (cs.paused && !game.combat.paused) game.combat.pause();
+            else if (!cs.paused && game.combat.paused) game.combat.start();
+          } catch { /* skip */ }
         }
       }
       // Combat Event system state from snapshot
