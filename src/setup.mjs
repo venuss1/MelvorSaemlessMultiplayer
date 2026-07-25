@@ -98,6 +98,7 @@ const Msg = Object.freeze({
   COOKING_STOCKPILE: 'cook_stock',  // cooking stockpile items
   EQUIP_SET_COUNT: 'equip_set_count', // number of equipment set slots
   SETTINGS: 'settings',             // gameplay-affecting game settings
+  MUSEUM_DONATE: 'museum_donate',   // { itemId } — 1 player donated, auto-donate for peer
 });
 const encode = (msg) => JSON.stringify(msg);
 const decode = (data) => {
@@ -2514,7 +2515,21 @@ class Sync {
         // for patching — ar.museum.constructor doesn't always work with the
         // ctx.patch system.
         const MuseumClass = (typeof ArchaeologyMuseum !== 'undefined') ? ArchaeologyMuseum : ar.museum.constructor;
-        for (const m of ['donateItem', 'donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
+        // Patch donateItem to send an immediate MUSEUM_DONATE message with
+        // the specific item ID. This is faster than the bulk SKILL_SELECT
+        // sync and lets the peer auto-donate before they can double-donate.
+        if (typeof MuseumClass.prototype.donateItem === 'function') {
+          try {
+            this.ctx.patch(MuseumClass, 'donateItem').after(function (_ret, item) {
+              if (sync._applyingRemote || !sync.transport.isConnected) return;
+              if (item && item.id) {
+                sync.transport.send({ t: Msg.MUSEUM_DONATE, itemId: item.id });
+              }
+              send(); // also send bulk sync for rewards/etc
+            });
+          } catch { /* skip */ }
+        }
+        for (const m of ['donateAllGenericArtefacts', 'giveReward', 'giveUnawardedRewards']) {
           if (typeof MuseumClass.prototype[m] === 'function') {
             try { this.ctx.patch(MuseumClass, m).after(() => send()); } catch { /* skip */ }
           }
@@ -2657,35 +2672,19 @@ class Sync {
             for (const itemId of msg.donatedItems) {
               const item = game.items.getObjectByID(itemId);
               if (!item) continue;
-              const wasAlreadyDonated = s.museum.donatedItems.has(item);
+              // Skip if already donated — the dedicated MUSEUM_DONATE message
+              // handles the actual donation (bank removal, rewards, etc).
+              // This bulk sync just ensures donatedItems stays in sync.
+              if (s.museum.donatedItems.has(item)) continue;
               s.museum.donatedItems.add(item);
-              // The museum checks game.stats.itemFindCount(item) > 0 to
-              // decide whether to show the artifact's picture or a question
-              // mark. If the peer never "found" the artifact, itemFindCount
-              // is 0 and the museum shows a question mark. Fix: add+remove
-              // from bank with found=true to increment the TimesFound stat.
+              // Mark as found so museum shows picture
               try {
                 if (game.stats && game.stats.itemFindCount(item) === 0) {
                   game.bank.addItem(item, 1, false, true, true, false);
                   game.bank.removeItemQuantity(item, 1, false);
                 }
               } catch { /* noop */ }
-              // When the other player donates an artifact, also remove it
-              // from this player's bank so only 1 person needs to donate.
-              // Only remove if not already donated (avoid removing twice).
-              if (!wasAlreadyDonated) {
-                try {
-                  const bankQty = game.bank.getQty(item);
-                  if (bankQty > 0) {
-                    game.bank.removeItemQuantity(item, 1, false);
-                  }
-                } catch { /* noop */ }
-              }
             }
-            // Queue museum renders so the DOM updates (donation count +
-            // artifact pictures). Setting render queue flags is safe —
-            // the game's render loop processes them on the next animation
-            // frame when the archaeology tab is visible.
             if (s.museum.renderQueue) {
               s.museum.renderQueue.donationProgress = true;
               s.museum.renderQueue.allArtefacts = true;
@@ -2701,6 +2700,46 @@ class Sync {
         }
       }
     } catch (e) { logger.error('applySkillSelect failed', e); }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
+  }
+
+  // ---- Museum donation sync ---------------------------------------------
+  // When one player donates an artifact, the other player's game auto-donates
+  // it too — removes from bank, adds to donatedItems, gives rewards, updates
+  // museum UI. This way only 1 person needs to donate.
+  _applyMuseumDonate(msg) {
+    const ar = game.archaeology;
+    if (!ar || !ar.museum) return;
+    const item = this._itemById(msg.itemId);
+    if (!item) return;
+    // Already donated — skip (prevents double-donating)
+    if (ar.museum.isItemDonated(item)) return;
+    this._applyingRemote = true;
+    try {
+      // If the peer has the item in their bank, use the game's donateItem
+      // method which handles everything: removes from bank, adds to
+      // donatedItems, gives rewards, fires events, queues renders.
+      const bankQty = game.bank.getQty(item);
+      if (bankQty > 0) {
+        try { ar.museum.donateItem(item); } catch (e) { logger.warn('museum donateItem failed', e); }
+      } else {
+        // Peer doesn't have the item in bank — just mark as donated + found
+        ar.museum.donatedItems.add(item);
+        try {
+          if (game.stats && game.stats.itemFindCount(item) === 0) {
+            game.bank.addItem(item, 1, false, true, true, false);
+            game.bank.removeItemQuantity(item, 1, false);
+          }
+        } catch { /* noop */ }
+        // Give any unawarded rewards
+        try { ar.museum.giveUnawardedRewards(); } catch { /* noop */ }
+        // Queue renders
+        if (ar.museum.renderQueue) {
+          ar.museum.renderQueue.donationProgress = true;
+          ar.museum.renderQueue.allArtefacts = true;
+        }
+      }
+    } catch (e) { logger.error('applyMuseumDonate failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
@@ -6225,22 +6264,15 @@ class Sync {
             for (const itemId of ad.donatedItems) {
               const item = game.items.getObjectByID(itemId);
               if (!item) continue;
-              const wasAlreadyDonated = ar.museum.donatedItems.has(item);
+              if (ar.museum.donatedItems.has(item)) continue;
               ar.museum.donatedItems.add(item);
-              // Mark as found so museum shows picture (see _applySkillSelect)
+              // Mark as found so museum shows picture
               try {
                 if (game.stats && game.stats.itemFindCount(item) === 0) {
                   game.bank.addItem(item, 1, false, true, true, false);
                   game.bank.removeItemQuantity(item, 1, false);
                 }
               } catch { /* noop */ }
-              // Remove from peer's bank so only 1 person needs to donate
-              if (!wasAlreadyDonated) {
-                try {
-                  const bankQty = game.bank.getQty(item);
-                  if (bankQty > 0) game.bank.removeItemQuantity(item, 1, false);
-                } catch { /* noop */ }
-              }
             }
             if (ar.museum.renderQueue) {
               ar.museum.renderQueue.donationProgress = true;
@@ -6385,22 +6417,15 @@ class Sync {
               for (const itemId of ss.archaeology.donatedItems || []) {
                 const item = game.items.getObjectByID(itemId);
                 if (!item) continue;
-                const wasAlreadyDonated = ar.museum.donatedItems.has(item);
+                if (ar.museum.donatedItems.has(item)) continue;
                 ar.museum.donatedItems.add(item);
-                // Mark as found so museum shows picture (see _applySkillSelect)
+                // Mark as found so museum shows picture
                 try {
                   if (game.stats && game.stats.itemFindCount(item) === 0) {
                     game.bank.addItem(item, 1, false, true, true, false);
                     game.bank.removeItemQuantity(item, 1, false);
                   }
                 } catch { /* noop */ }
-                // Remove from peer's bank so only 1 person needs to donate
-                if (!wasAlreadyDonated) {
-                  try {
-                    const bankQty = game.bank.getQty(item);
-                    if (bankQty > 0) game.bank.removeItemQuantity(item, 1, false);
-                  } catch { /* noop */ }
-                }
               }
               if (ar.museum.renderQueue) {
                 ar.museum.renderQueue.donationProgress = true;
@@ -7075,6 +7100,7 @@ class Sync {
       [Msg.SUMMONING]: (m) => this._applySummoning(m),
       [Msg.SLAYER]: (m) => this._applySlayer(m),
       [Msg.SKILL_SELECT]: (m) => this._applySkillSelect(m),
+      [Msg.MUSEUM_DONATE]: (m) => this._applyMuseumDonate(m),
       [Msg.PLAYER_STATE]: (m) => this._applyPlayerState(m),
       [Msg.COMBAT_AREA]: (m) => this._applyCombatArea(m),
       [Msg.COMBAT_EVENT_STATE]: (m) => this._applyCombatEventState(m),
