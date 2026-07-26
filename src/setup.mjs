@@ -7037,6 +7037,12 @@ class Panel {
     this.sync = sync;
     this.root = null;
     this._statusTimer = null;
+    this._tab = 'main';
+    this._lastLogCount = 0;
+    this._consoleBase = 0;      // ring-buffer index the console view starts at
+    this._consoleLines = [];    // session prints (kept across log re-renders)
+    this._consoleHistory = [];  // eval input history (ArrowUp/Down)
+    this._consoleHistIdx = -1;
   }
 
   mount() {
@@ -7045,7 +7051,7 @@ class Panel {
     // Critical inline styles so the panel is always visible.
     Object.assign(this.root.style, {
       position: 'fixed', top: '12px', right: '12px', zIndex: '99999',
-      width: '280px', fontFamily: 'Roboto, system-ui, sans-serif',
+      width: '300px', fontFamily: 'Roboto, system-ui, sans-serif',
       fontSize: '13px', color: '#e5e7eb',
       background: 'rgba(17,24,39,0.96)', border: '1px solid #374151',
       borderRadius: '10px', boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
@@ -7061,7 +7067,12 @@ class Panel {
             style="background:transparent;border:none;color:#9ca3af;cursor:pointer;font-size:16px;line-height:1;padding:0 2px;">–</button>
         </div>
       </div>
+      <div data-rmp="tabs" style="display:flex;gap:6px;padding:8px 12px 0;">
+        <button data-rmp="tabMain" style="flex:1;background:#1f2937;border:1px solid #34d399;color:#6ee7b7;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;font-weight:600;">Main</button>
+        <button data-rmp="tabConsole" style="flex:1;background:transparent;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;font-weight:600;">Console</button>
+      </div>
       <div data-rmp="body" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
+        <div data-rmp="pageMain" style="display:flex;flex-direction:column;gap:8px;">
         <div style="display:flex;gap:6px;align-items:center;">
           <input class="rmp-input" data-rmp="nameInput" placeholder="Your name" maxlength="16" value="${this._esc(getSavedName())}"
             style="flex:1;background:#111827;border:1px solid #4b5563;color:#f3f4f6;border-radius:6px;padding:5px 8px;font-size:12px;outline:none;" />
@@ -7121,11 +7132,26 @@ class Panel {
             style="flex:1;background:#1f2937;border:1px solid #4b5563;color:#e5e7eb;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;">Download log</button>
         </div>
         <div style="font-size:10px;color:#6b7280;margin:2px 0 0;">Tip: both players must load the same save before connecting.</div>
+        </div>
+        <div data-rmp="pageConsole" style="display:none;flex-direction:column;gap:6px;">
+          <div data-rmp="consoleLog" style="background:#0b1220;border:1px solid #1f2937;border-radius:6px;height:220px;overflow-y:auto;padding:6px;font-family:ui-monospace,monospace;font-size:10.5px;line-height:1.45;user-select:text;"></div>
+          <div style="display:flex;gap:6px;">
+            <input data-rmp="consoleInput" placeholder="e.g. game.gp.add(1000)" spellcheck="false"
+              style="flex:1;background:#111827;border:1px solid #4b5563;color:#a7f3d0;border-radius:6px;padding:5px 8px;font-size:11px;outline:none;font-family:ui-monospace,monospace;user-select:text;" />
+            <button data-rmp="consoleRunBtn" style="background:#1f2937;border:1px solid #34d399;color:#6ee7b7;border-radius:6px;padding:5px 10px;font-size:11px;cursor:pointer;font-weight:600;">Run</button>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button data-rmp="unlockAllBtn" style="flex:1;background:#1f2937;border:1px solid #7c3aed;color:#c4b5fd;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;">Unlock all</button>
+            <button data-rmp="snapshotBtn" style="flex:1;background:#1f2937;border:1px solid #4b5563;color:#e5e7eb;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;">Snapshot</button>
+            <button data-rmp="clearConsoleBtn" style="flex:1;background:#1f2937;border:1px solid #4b5563;color:#e5e7eb;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;">Clear</button>
+          </div>
+          <div style="font-size:10px;color:#6b7280;">Vars: game, sync, transport, logger, realMP. Enter = run, \u2191/\u2193 = history. Verbose logs: realMP.logger.setMinLevel('debug')</div>
+        </div>
       </div>
     `;
     document.body.appendChild(this.root);
     this._wire();
-    this._statusTimer = setInterval(() => this._refreshStatus(), 1000);
+    this._statusTimer = setInterval(() => { this._refreshStatus(); if (this._tab === 'console') this._renderConsoleLog(); }, 1000);
     this._refresh();
     logger.info('Panel mounted');
   }
@@ -7312,6 +7338,125 @@ class Panel {
     // Listen for local action progress updates.
     if (this.sync && this.sync.onLocalAction) {
       this.sync.onLocalAction((l) => this._renderProgress('local', l));
+    }
+
+    // ---- Tabs ----
+    $('tabMain').addEventListener('click', () => this._switchTab('main'));
+    $('tabConsole').addEventListener('click', () => this._switchTab('console'));
+
+    // ---- Dev console ----
+    const runCurrent = () => {
+      const code = $('consoleInput').value.trim();
+      if (!code) return;
+      this._consoleHistory.push(code);
+      this._consoleHistIdx = this._consoleHistory.length;
+      $('consoleInput').value = '';
+      this._runConsole(code);
+    };
+    $('consoleRunBtn').addEventListener('click', runCurrent);
+    $('consoleInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); runCurrent(); }
+      else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (this._consoleHistIdx > 0) { this._consoleHistIdx--; $('consoleInput').value = this._consoleHistory[this._consoleHistIdx] || ''; }
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (this._consoleHistIdx < this._consoleHistory.length - 1) { this._consoleHistIdx++; $('consoleInput').value = this._consoleHistory[this._consoleHistIdx] || ''; }
+        else { this._consoleHistIdx = this._consoleHistory.length; $('consoleInput').value = ''; }
+      }
+      e.stopPropagation();
+    });
+    $('unlockAllBtn').addEventListener('click', () => {
+      if (!sync) { this._consolePrint('sync not ready', '#f87171'); return; }
+      if (!confirm('Unlock EVERYTHING on both clients? (debug command)')) return;
+      this._consolePrint('Running unlock-all…', '#c4b5fd');
+      try { sync._unlockAll(); } catch (err) { this._consolePrint(String((err && err.stack) || err), '#f87171'); }
+    });
+    $('snapshotBtn').addEventListener('click', () => {
+      if (!sync) { this._consolePrint('sync not ready', '#f87171'); return; }
+      sync.requestSnapshot();
+      this._consolePrint('Snapshot requested from peer.', '#6ee7b7');
+    });
+    $('clearConsoleBtn').addEventListener('click', () => {
+      this._consoleLines = [];
+      this._consoleBase = _logBuf.length;
+      const logEl = $('consoleLog');
+      if (logEl) logEl.textContent = '';
+    });
+  }
+
+  // ---- Tabs + dev console ----
+
+  _switchTab(tab) {
+    this._tab = tab;
+    const main = tab === 'main';
+    this.$('pageMain').style.display = main ? 'flex' : 'none';
+    this.$('pageConsole').style.display = main ? 'none' : 'flex';
+    const on = { background: '#1f2937', color: '#6ee7b7', borderColor: '#34d399' };
+    const off = { background: 'transparent', color: '#9ca3af', borderColor: '#374151' };
+    Object.assign(this.$('tabMain').style, main ? on : off);
+    Object.assign(this.$('tabConsole').style, main ? off : on);
+    if (!main) this._renderConsoleLog();
+  }
+
+  // Rebuild the log tail from the ring buffer (only when it grew), then
+  // re-append this session's console prints so they survive refreshes.
+  _renderConsoleLog() {
+    const logEl = this.$('consoleLog');
+    if (!logEl || _logBuf.length === this._lastLogCount) return;
+    this._lastLogCount = _logBuf.length;
+    const nearBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 24;
+    logEl.textContent = '';
+    const COLORS = { ERROR: '#f87171', WARN: '#fbbf24', DEBUG: '#6b7280' };
+    const start = Math.max(this._consoleBase, _logBuf.length - 150);
+    for (const raw of _logBuf.slice(start)) {
+      const line = document.createElement('div');
+      const m = raw.match(/^\[[^\]]+\] \[(\w+)\] ([\s\S]*)$/);
+      line.textContent = m ? m[2] : raw;
+      line.style.color = COLORS[m && m[1]] || '#cbd5e1';
+      logEl.appendChild(line);
+    }
+    for (const { text, color } of this._consoleLines) {
+      const line = document.createElement('div');
+      line.textContent = text;
+      line.style.color = color;
+      logEl.appendChild(line);
+    }
+    if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  _consolePrint(text, color) {
+    this._consoleLines.push({ text, color: color || '#e5e7eb' });
+    if (this._consoleLines.length > 100) this._consoleLines.shift();
+    const logEl = this.$('consoleLog');
+    if (!logEl) return;
+    const line = document.createElement('div');
+    line.textContent = text;
+    line.style.color = color || '#e5e7eb';
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  _fmtResult(v) {
+    if (v === undefined) return 'undefined';
+    if (typeof v === 'function') return String(v).slice(0, 200);
+    if (typeof v === 'object' && v !== null) {
+      const s = _safeStr(v);
+      return s.length > 800 ? s.slice(0, 800) + '…' : s;
+    }
+    return String(v);
+  }
+
+  // Direct eval is intentional: a debug console with access to module scope
+  // (logger, sync, Msg) and game globals (game, realMP).
+  _runConsole(code) {
+    this._consolePrint('> ' + code, '#9ca3af');
+    logger.info('[CONSOLE]', code);
+    try {
+      const result = eval(code);
+      this._consolePrint(this._fmtResult(result), '#6ee7b7');
+    } catch (err) {
+      this._consolePrint(String((err && err.stack) || err), '#f87171');
     }
   }
 

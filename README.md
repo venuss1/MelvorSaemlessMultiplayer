@@ -134,7 +134,10 @@ all of the above so both clients start from the same baseline.
 
 ## UI features
 
-The mod adds a **floating, draggable panel** (top-right of the screen) with:
+The mod adds a **floating, draggable panel** (top-right of the screen) with
+two tabs:
+
+**Main**
 
 - **Connection controls** — relay server URL + player name fields, connect/
   disconnect button (URL and name persist across sessions)
@@ -149,6 +152,14 @@ The mod adds a **floating, draggable panel** (top-right of the screen) with:
   option
 - **Download log button** — exports the mod's in-memory log as a text file
   (useful for debugging)
+
+**Console** (dev/test tab)
+
+- **Live log view** — the mod's log ring buffer, color-coded by level,
+  auto-refreshing (verbose tracing: `realMP.logger.setMinLevel('debug')`)
+- **JS console** — evaluate expressions in mod scope (`game`, `sync`,
+  `transport`, `logger`, `realMP`), with result printing and ↑/↓ input history
+- **Quick actions** — Unlock all (debug), request snapshot, clear console
 
 ---
 
