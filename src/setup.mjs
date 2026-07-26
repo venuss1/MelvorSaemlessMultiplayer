@@ -41,7 +41,7 @@ const exportLog = () => _logBuf.join('\n');
 // Auto-save log to localStorage so it persists across game crashes/reloads
 const _saveLogToStorage = () => {
   try {
-    const text = _logBuf.join('\n');
+    const text = exportLog();
     localStorage.setItem('realMP_log', text);
     localStorage.setItem('realMP_log_ts', new Date().toISOString());
   } catch { /* storage full or unavailable */ }
@@ -411,62 +411,99 @@ class Sync {
     this._remoteAction = null; // { skillId, progress, actionLabel }
     this._onRemoteActionCb = null;
     this._onLocalActionCb = null;
+    this._renderQueue = null;      // Set of render types, flushed once per frame
+    this._renderScheduled = false;
+    this._lastRockHP = null;       // delta cache for rock-HP broadcasts
+    this._handlers = this._buildHandlers();
   }
 
   onRemoteAction(cb) { this._onRemoteActionCb = cb; }
   onLocalAction(cb) { this._onLocalActionCb = cb; }
+
+  // ---- Shared helpers ------------------------------------------------------
+  // Patch-callback convention: callbacks registered with `function` run with
+  // `this` bound to the patched GAME object and reach the Sync instance via
+  // the module-global `sync`; arrow callbacks use lexical `this` (the Sync
+  // instance). Never convert one form into the other.
+
+  /** True when a local change should be broadcast (not echoing a remote apply). */
+  _canSend() { return !this._applyingRemote && this.transport.isConnected; }
+
+  /** Guard + send in one call. Returns true if the message went out. */
+  _send(payload) {
+    if (!this._canSend()) return false;
+    this.transport.send(payload);
+    return true;
+  }
+
+  /**
+   * Apply a remote state change: hold the re-entrancy guard, log failures,
+   * and (unless save:false) schedule a save afterwards. The finally block runs
+   * even when `fn` returns early — call sites rely on that.
+   */
+  _applyRemote(label, fn, { save = true, level = 'error' } = {}) {
+    this._applyingRemote = true;
+    try { fn(); }
+    catch (e) { logger[level](`${label} failed`, e); }
+    finally { this._applyingRemote = false; if (save) this._scheduleSave(); }
+  }
+
+  /** Patch several methods of one class to run `cb` afterwards (skips missing). */
+  _afterEach(Cls, methods, cb) {
+    for (const m of methods) {
+      if (typeof Cls.prototype[m] === 'function') this.ctx.patch(Cls, m).after(cb);
+    }
+  }
 
   install() {
     if (this._installed) { logger.info('Sync already installed, skipping'); return; }
     this._installed = true;
     logger.info('========== [MP] INSTALLING SYNC PATCHES ==========');
     const patches = [
-      ['XP', () => this._patchXP()],
-      ['Mastery', () => this._patchMastery()],
-      ['Bank', () => this._patchBank()],
-      ['Currency', () => this._patchCurrency()],
-      ['Equipment+PlayerState', () => this._patchEquipment()],
-      ['Pets', () => this._patchPets()],
-      ['ItemCharges', () => this._patchItemCharges()],
-      ['Potions', () => this._patchPotions()],
-      ['Shop', () => this._patchShop()],
-      ['ActionStartStop', () => this._patchActionStartStop()],
-      ['MiningRockHP', () => this._patchMiningRockHP()],
-      ['Farming', () => this._patchFarming()],
-      ['Agility', () => this._patchAgility()],
-      ['Astrology', () => this._patchAstrology()],
-      ['Summoning', () => this._patchSummoning()],
-      ['Slayer', () => this._patchSlayer()],
-      ['SkillSelections', () => this._patchSkillSelections()],
-      ['PlayerState', () => this._patchPlayerState()],
-      ['CombatAreas', () => this._patchCombatAreas()],
-      ['CombatEvents', () => this._patchCombatEvents()],
-      ['CombatEventSystem', () => this._patchCombatEventSystem()],
-      ['AncientRelics', () => this._patchAncientRelics()],
-      ['SkillTree', () => this._patchSkillTree()],
-      ['Township', () => this._patchTownship()],
-      ['ClueHunt', () => this._patchClueHunt()],
-      ['Corruption', () => this._patchCorruption()],
-      ['Raids', () => this._patchRaids()],
-      ['FishingContest', () => this._patchFishingContest()],
-      ['TownshipTasks', () => this._patchTownshipTasks()],
-      ['Cartography', () => this._patchCartography()],
-      ['Stats', () => this._patchStats()],
-      ['LevelCaps', () => this._patchLevelCaps()],
-      ['GameState', () => this._patchGameState()],
-      ['Lore', () => this._patchLore()],
-      ['Tutorial', () => this._patchTutorial()],
-      ['RealmSelection', () => this._patchRealmSelection()],
-      ['SlayerCategories', () => this._patchSlayerCategories()],
-      ['CookingStockpile', () => this._patchCookingStockpile()],
-      ['EquipSetCount', () => this._patchEquipSetCount()],
-      ['GameSettings', () => this._patchGameSettings()],
+      ['XP', '_patchXP'],
+      ['Mastery', '_patchMastery'],
+      ['Bank', '_patchBank'],
+      ['Currency', '_patchCurrency'],
+      ['Equipment+PlayerState', '_patchEquipment'],
+      ['Pets', '_patchPets'],
+      ['ItemCharges', '_patchItemCharges'],
+      ['Potions', '_patchPotions'],
+      ['Shop', '_patchShop'],
+      ['ActionStartStop', '_patchActionStartStop'],
+      ['MiningRockHP', '_patchMiningRockHP'],
+      ['Farming', '_patchFarming'],
+      ['Agility', '_patchAgility'],
+      ['Astrology', '_patchAstrology'],
+      ['Summoning', '_patchSummoning'],
+      ['Slayer', '_patchSlayer'],
+      ['SkillSelections', '_patchSkillSelections'],
+      ['CombatAreas', '_patchCombatAreas'],
+      ['CombatEvents', '_patchCombatEvents'],
+      ['CombatEventSystem', '_patchCombatEventSystem'],
+      ['AncientRelics', '_patchAncientRelics'],
+      ['SkillTree', '_patchSkillTree'],
+      ['Township', '_patchTownship'],
+      ['ClueHunt', '_patchClueHunt'],
+      ['Corruption', '_patchCorruption'],
+      ['Raids', '_patchRaids'],
+      ['FishingContest', '_patchFishingContest'],
+      ['TownshipTasks', '_patchTownshipTasks'],
+      ['Cartography', '_patchCartography'],
+      ['Stats', '_patchStats'],
+      ['LevelCaps', '_patchLevelCaps'],
+      ['GameState', '_patchGameState'],
+      ['Lore', '_patchLore'],
+      ['Tutorial', '_patchTutorial'],
+      ['RealmSelection', '_patchRealmSelection'],
+      ['SlayerCategories', '_patchSlayerCategories'],
+      ['CookingStockpile', '_patchCookingStockpile'],
+      ['EquipSetCount', '_patchEquipSetCount'],
+      ['GameSettings', '_patchGameSettings'],
     ];
     let ok = 0, fail = 0;
-    for (const [name, fn] of patches) {
+    for (const [name, method] of patches) {
       try {
-        fn();
-        // Check if the patch actually did something (some return early if skill missing)
+        this[method]();
         logger.info(`  [PATCH] ${name}: OK`);
         ok++;
       } catch (e) {
@@ -477,59 +514,28 @@ class Sync {
     this._startWatcher();
     this._startProgressBroadcaster();
     this._startPeriodicStateSync();
-    logger.info(`========== [MP] PATCHES DONE: ${ok} ok, ${fail} failed, ${patches.length - ok - fail} skipped ==========`);
+    logger.info(`========== [MP] PATCHES DONE: ${ok} ok, ${fail} failed ==========`);
 
-    // Log what game systems are actually available
+    this._logSystemAvailability();
+  }
+
+  /** Log which game systems the current game/version actually provides. */
+  _logSystemAvailability() {
     logger.info('========== [MP] GAME SYSTEM AVAILABILITY ==========');
-    const systems = [
-      ['game.bank', !!game.bank],
-      ['game.combat', !!game.combat],
-      ['game.combat.player', !!(game.combat && game.combat.player)],
-      ['game.combat.player.food', !!(game.combat && game.combat.player && game.combat.player.food)],
-      ['game.combat.player.equipmentSets', !!(game.combat && game.combat.player && game.combat.player.equipmentSets)],
-      ['game.combat.player.activePrayers', !!(game.combat && game.combat.player && game.combat.player.activePrayers)],
-      ['game.combat.slayerTask', !!(game.combat && game.combat.slayerTask)],
-      ['game.currencies', !!game.currencies],
-      ['game.petManager', !!game.petManager],
-      ['game.itemCharges', !!game.itemCharges],
-      ['game.potions', !!game.potions],
-      ['game.shop', !!game.shop],
-      ['game.mining', !!game.mining],
-      ['game.farming', !!game.farming],
-      ['game.agility', !!game.agility],
-      ['game.astrology', !!game.astrology],
-      ['game.summoning', !!game.summoning],
-      ['game.slayer', !!game.slayer],
-      ['game.cooking', !!game.cooking],
-      ['game.woodcutting', !!game.woodcutting],
-      ['game.firemaking', !!game.firemaking],
-      ['game.fishing', !!game.fishing],
-      ['game.fishing.contest', !!(game.fishing && game.fishing.contest)],
-      ['game.thieving', !!game.thieving],
-      ['game.altMagic', !!game.altMagic],
-      ['game.fletching', !!game.fletching],
-      ['game.harvesting', !!game.harvesting],
-      ['game.archaeology', !!game.archaeology],
-      ['game.archaeology.museum', !!(game.archaeology && game.archaeology.museum)],
-      ['game.cartography', !!game.cartography],
-      ['game.dungeons', !!game.dungeons],
-      ['game.ancientRelics', !!game.ancientRelics],
-      ['game.township', !!game.township],
-      ['game.township.tasks', !!(game.township && game.township.tasks)],
-      ['game.township.casualTasks', !!(game.township && game.township.casualTasks)],
-      ['game.clueHunt', !!game.clueHunt],
-      ['game.corruption', !!game.corruption],
-      ['game.corruption.corruptionEffects', !!(game.corruption && game.corruption.corruptionEffects)],
-      ['game.golbinRaid', !!game.golbinRaid],
-      ['game.stats', !!game.stats],
-      ['game.tutorial', !!game.tutorial],
-      ['game.realms', !!game.realms],
-      ['game.equipmentSlots', !!game.equipmentSlots],
-      ['game.prayers', !!game.prayers],
-      ['game.attackSpells', !!game.attackSpells],
+    const paths = [
+      'bank', 'combat', 'combat.player', 'combat.player.food',
+      'combat.player.equipmentSets', 'combat.player.activePrayers', 'combat.slayerTask',
+      'currencies', 'petManager', 'itemCharges', 'potions', 'shop', 'mining', 'farming',
+      'agility', 'astrology', 'summoning', 'slayer', 'cooking', 'woodcutting',
+      'firemaking', 'fishing', 'fishing.contest', 'thieving', 'altMagic', 'fletching',
+      'harvesting', 'archaeology', 'archaeology.museum', 'cartography', 'dungeons',
+      'ancientRelics', 'township', 'township.tasks', 'township.casualTasks',
+      'clueHunt', 'corruption', 'corruption.corruptionEffects', 'golbinRaid',
+      'stats', 'tutorial', 'realms', 'equipmentSlots', 'prayers', 'attackSpells',
     ];
-    for (const [name, available] of systems) {
-      logger.info(`  [SYS] ${name}: ${available ? 'AVAILABLE' : 'MISSING'}`);
+    for (const path of paths) {
+      const available = path.split('.').reduce((o, k) => o && o[k], game);
+      logger.info(`  [SYS] game.${path}: ${available ? 'AVAILABLE' : 'MISSING'}`);
     }
     logger.info('========== [MP] SYSTEM CHECK DONE ==========');
   }
@@ -545,9 +551,6 @@ class Sync {
   // Debounced render — batches multiple updates into a single render frame.
   // Instead of re-rendering everything on every message, we queue what needs
   // updating and process it once per animation frame (or after a short delay).
-  _renderQueue = null;
-  _renderScheduled = false;
-
   _queueRender(type) {
     if (!this._renderQueue) this._renderQueue = new Set();
     this._renderQueue.add(type);
@@ -2909,9 +2912,6 @@ class Sync {
   }
 
   // ---- Player state sync (prayers, food, attack styles) -----------------
-  // Player state patches are now all in _patchEquipment to avoid double-patching.
-  _patchPlayerState() { /* no-op — handled by _patchEquipment */ }
-
   _applyPlayerState(msg) {
     const p = game.combat.player;
     if (!p) return;
@@ -7346,11 +7346,12 @@ class Sync {
 
   // ---- Message dispatch -------------------------------------------------
 
-  handle(msg) {
-    // Log every incoming message with a readable name
-    const msgName = Object.keys(Msg).find(k => Msg[k] === msg.t) || msg.t;
-    logger.info(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
-    const handlers = {
+  // Message dispatch table, built once in the constructor. Action claims are
+  // routed straight to the ActionLock; everything else goes to an _applyX.
+  _buildHandlers() {
+    return {
+      [Msg.ACTION_CLAIM]: (m) => this.actionLock.applyRemoteClaim(m),
+      [Msg.ACTION_RELEASE]: (m) => this.actionLock.applyRemoteRelease(m),
       [Msg.XP]: (m) => this._applyXP(m),
       [Msg.MASTERY]: (m) => this._applyMastery(m),
       [Msg.MASTERY_POOL]: (m) => this._applyMasteryPool(m),
@@ -7403,7 +7404,13 @@ class Sync {
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
       [Msg.UNLOCK_ALL]: () => this._unlockAll(),
     };
-    const handler = handlers[msg.t];
+  }
+
+  handle(msg) {
+    // Log every incoming message with a readable name
+    const msgName = Object.keys(Msg).find(k => Msg[k] === msg.t) || msg.t;
+    logger.info(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
+    const handler = this._handlers[msg.t];
     if (!handler) {
       logger.warn(`[RECV] No handler for message type: ${msgName}`);
       return;
@@ -7955,23 +7962,9 @@ export function setup(ctx) {
     return;
   }
 
-  // Route incoming messages.
-  transport.on('message', (msg) => {
-    const msgName = Object.keys(Msg).find(k => Msg[k] === msg.t) || msg.t;
-    switch (msg.t) {
-      case Msg.ACTION_CLAIM:
-        logger.info(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
-        try { actionLock.applyRemoteClaim(msg); logger.info(`[APPLY OK] ${msgName}`); }
-        catch (e) { logger.error(`[APPLY FAIL] ${msgName}:`, e.message); }
-        break;
-      case Msg.ACTION_RELEASE:
-        logger.info(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
-        try { actionLock.applyRemoteRelease(msg); logger.info(`[APPLY OK] ${msgName}`); }
-        catch (e) { logger.error(`[APPLY FAIL] ${msgName}:`, e.message); }
-        break;
-      default: syncInstance.handle(msg);
-    }
-  });
+  // Route incoming messages — action claims are dispatched to the ActionLock
+  // by Sync.handle's table, everything else to the matching _applyX.
+  transport.on('message', (msg) => syncInstance.handle(msg));
 
   // Host: automatically send save to peer when they connect.
   transport.on('send_save', () => {
