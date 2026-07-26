@@ -754,6 +754,14 @@ class Sync {
         sync.transport.send({ t: Msg.MASTERY_POOL, skillId: this.id, realmId: realm.id, xp: value });
       });
     });
+    // Mastery pool XP can also be added directly (claiming mastery tokens,
+    // pool spending) — that path bypasses addMasteryForAction, so patch it too.
+    this.ctx.patch(SkillWithMastery, 'addMasteryPoolXP').after(function () {
+      if (sync._applyingRemote || !sync.transport.isConnected) return;
+      this._masteryPoolXP.forEach((value, realm) => {
+        sync.transport.send({ t: Msg.MASTERY_POOL, skillId: this.id, realmId: realm.id, xp: value });
+      });
+    });
   }
 
   _applyMastery(msg) {
@@ -3345,7 +3353,7 @@ class Sync {
 
     // Patch Enemy.damage — fires after enemy takes damage
     if (typeof Enemy !== 'undefined' && Enemy.prototype && typeof Enemy.prototype.damage === 'function') {
-      this.ctx.patch(Enemy, 'damage').after(function (amount, source) {
+      this.ctx.patch(Enemy, 'damage').after(function (_ret, amount, source) {
         if (amount <= 0) return;
         // Only send if we're the attacker (not spectating)
         if (sync._combatOwner === 'peer') return;
@@ -3363,7 +3371,7 @@ class Sync {
 
     // Patch Player.damage — fires after player takes damage
     if (typeof Player !== 'undefined' && Player.prototype && typeof Player.prototype.damage === 'function') {
-      this.ctx.patch(Player, 'damage').after(function (amount, source) {
+      this.ctx.patch(Player, 'damage').after(function (_ret, amount, source) {
         if (amount <= 0) return;
         // Only send if we're the attacker (not spectating)
         if (sync._combatOwner === 'peer') return;
@@ -3380,7 +3388,7 @@ class Sync {
 
     // Patch Character.heal — fires after healing (both player and enemy)
     if (typeof Character !== 'undefined' && Character.prototype && typeof Character.prototype.heal === 'function') {
-      this.ctx.patch(Character, 'heal').after(function (amount) {
+      this.ctx.patch(Character, 'heal').after(function (_ret, amount) {
         if (amount <= 0) return;
         // Only send if we're the attacker (not spectating)
         if (sync._combatOwner === 'peer') return;
@@ -3423,7 +3431,7 @@ class Sync {
 
     // Patch CombatLoot.add — when attacker gets loot, sync to spectator
     if (typeof CombatLoot !== 'undefined' && CombatLoot.prototype && typeof CombatLoot.prototype.add === 'function') {
-      this.ctx.patch(CombatLoot, 'add').after(function (item, quantity) {
+      this.ctx.patch(CombatLoot, 'add').after(function (_ret, item, quantity) {
         // Only sync if we're the attacker
         if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
           const itemId = item && item.id ? item.id : null;
@@ -3531,7 +3539,9 @@ class Sync {
     // The spectator gets loot via COMBAT_LOOT sync messages, not local drops.
 
     // Patch pause/unpause — sync combat pause state and release claim on stop
-    for (const m of ['pause', 'stop', 'start', 'pauseDungeon', 'resumeDungeon']) {
+    // CombatManager.pause/start do not exist in the game (pause = pauseDungeon
+    // + a `paused` field) — only these three methods can be hooked.
+    for (const m of ['stop', 'pauseDungeon', 'resumeDungeon']) {
       if (typeof CombatManager.prototype[m] === 'function') {
         try {
           this.ctx.patch(CombatManager, m).after(function () {
@@ -4036,9 +4046,11 @@ class Sync {
       if (!payload) return;
       this.transport.send({ t: Msg.CLUE_HUNT, ...payload });
     };
-    // Patch any method that advances clue progress
+    // Patch methods that advance clue progress. updateClue1-6Progress are
+    // constructor arrow-function instance props (unpatchable via prototype),
+    // and the whole system is inert outside the 2023 birthday event.
     if (typeof ClueHunt !== 'undefined') {
-      for (const m of ['startClueHunt', 'giveReward', 'updateClue1Progress', 'updateClue2Progress', 'updateClue3Progress', 'updateClue4Progress', 'updateClue5Progress', 'updateClue6Progress']) {
+      for (const m of ['startClueHunt', 'giveReward']) {
         if (typeof ClueHunt.prototype[m] === 'function') {
           this.ctx.patch(ClueHunt, m).after(() => send());
         }
@@ -4956,6 +4968,9 @@ class Sync {
         }
       }
       if (game.stats.renderMutatedStats) try { game.stats.renderMutatedStats(); } catch { /* noop */ }
+      // Token stats derive from the Items tracker (TimesClaimed) — recompute
+      // after merging so claimed-token bonuses apply on the peer too.
+      if (game.computeTokenItemStats) try { game.computeTokenItemStats(true); } catch { /* noop */ }
     }, { save: false });
   }
 
@@ -5046,7 +5061,6 @@ class Sync {
 
   _serializeGameState() {
     return {
-      tickTimestamp: game.tickTimestamp,
       merchantsPermitRead: game.merchantsPermitRead,
       isPaused: game._isPaused,
       visibleCompletion: game.completion ? game.completion.visibleCompletion : undefined,
@@ -5060,7 +5074,6 @@ class Sync {
 
   _applyGameState(msg) {
     this._applyRemote('applyGameState', () => {
-      if (typeof msg.tickTimestamp === 'number') game.tickTimestamp = msg.tickTimestamp;
       if (typeof msg.merchantsPermitRead === 'boolean') {
         game.merchantsPermitRead = msg.merchantsPermitRead;
         // Mirror the game's own read path (Bank.readItemOnClick): refresh shop costs.
@@ -5177,12 +5190,14 @@ class Sync {
   // ---- Realm selection sync ----------------------------------------------
   _patchRealmSelection() {
     if (typeof game.selectRealm !== 'function') return;
-    const send = () => {
+    // Game.selectRealm performs the actual switch ~1s later behind an
+    // 'Entering realm' modal (async setTimeout) — reading game.currentRealm
+    // here would broadcast the OLD realm. Send the target from the argument.
+    if (typeof Game !== 'undefined') this.ctx.patch(Game, 'selectRealm').after((_ret, realm) => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      if (!game.currentRealm) return;
-      this.transport.send({ t: Msg.REALM, realmId: game.currentRealm.id });
-    };
-    if (typeof Game !== 'undefined') this.ctx.patch(Game, 'selectRealm').after(() => send());
+      if (!realm || !realm.id) return;
+      this.transport.send({ t: Msg.REALM, realmId: realm.id });
+    });
   }
 
   _applyRealmSelection(msg) {
@@ -5351,13 +5366,15 @@ class Sync {
   // block). Guard-neutral: never touches _applyingRemote or _scheduleSave.
   _applySettingsPayload(settings) {
     const s = game.settings;
-    // Settings are getter-only properties on the Settings class.
-    // Use setTogglesChecked() to actually change them (it sets the
-    // internal backing field and updates the UI checkbox).
+    // setTogglesChecked() only updates the DOM checkboxes — the real state is
+    // boolData[key].currentValue (see Settings.toggleSetting in game source).
     for (const key of SETTINGS_BOOL_KEYS) {
-      if (typeof settings[key] === 'boolean') {
-        try { s.setTogglesChecked(key, settings[key]); } catch { /* skip */ }
-      }
+      if (typeof settings[key] !== 'boolean') continue;
+      const data = s.boolData && s.boolData[key];
+      if (!data || data.currentValue === settings[key]) continue;
+      data.currentValue = settings[key];
+      try { if (data.onChange !== undefined) data.onChange(!settings[key], settings[key]); } catch { /* noop */ }
+      try { s.setTogglesChecked(key, settings[key]); } catch { /* noop */ }
     }
   }
 
