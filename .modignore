@@ -6,5 +6,6 @@ tsconfig.json
 .git/
 AGENTS.md
 docs/
+relay/
 *.zip
 *.map

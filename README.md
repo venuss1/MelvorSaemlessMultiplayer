@@ -208,7 +208,15 @@ router changes.
    You must see something like `v20.x.x`. If you get "not recognized", close
    and reopen the terminal, or reinstall Node.js.
 
-### Step 2 — Create the server file
+### Step 2 — Get the server file
+
+**Easiest — download it:** grab **`relay-server.zip`** from the
+[releases page](https://github.com/venuss1/melvor-idle-real-multiplayer/releases),
+unzip it, and open a terminal inside the extracted `relay` folder (Windows:
+Shift + right-click → *Open in Terminal*). Then continue with Step 3.
+(The same files live in the [`relay/`](relay/) folder of this repo.)
+
+**By hand:**
 
 1. Create a folder, e.g. `melvor-relay`, and open a terminal inside it
    (Windows: Shift + right-click the folder → *Open in Terminal* /
@@ -292,12 +300,14 @@ router changes.
 
 ### Step 3 — Install the one dependency
 
-In the same folder, run:
+In the server folder, run:
 
 ```
-npm init -y
-npm install ws
+npm install
 ```
+
+(Downloaded zip: this reads the included `package.json`. By hand: run
+`npm init -y` first, then `npm install ws`.)
 
 ### Step 4 — Start the relay
 
