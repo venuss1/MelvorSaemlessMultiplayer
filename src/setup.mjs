@@ -984,7 +984,7 @@ class Sync {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       // attackStyles is { melee?: AttackStyle, ranged?: AttackStyle, magic?: AttackStyle }
       const styles = sync._serializeAttackStyles();
-      sync.transport.send({ t: Msg.PLAYER_STATE, attackStyles });
+      sync.transport.send({ t: Msg.PLAYER_STATE, attackStyles: styles });
     };
     // Patch Player class prototype (works even if player instance not ready yet)
     this._afterEach(Player, ['setAttackStyle'], function () { sendAttackStyles(); });
