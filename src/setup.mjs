@@ -20,7 +20,13 @@ const _safeStr = (v) => {
   } catch { return String(v); }
 };
 
+// Minimum-level gate: filtered calls return BEFORE any string formatting,
+// so debug logging is free unless explicitly enabled (realMP.logger.setMinLevel).
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+let minLogLevel = LOG_LEVELS.info;
+
 const log = (level, ...args) => {
+  if (LOG_LEVELS[level] < minLogLevel) return;
   const ts = new Date().toISOString();
   const line = `[${ts}] [${level}] ${args.map(_safeStr).join(' ')}`;
   _logBuf.push(line);
@@ -34,6 +40,7 @@ const logger = {
   info: (...a) => log('info', ...a),
   warn: (...a) => log('warn', ...a),
   error: (...a) => log('error', ...a),
+  setMinLevel: (lvl) => { if (lvl in LOG_LEVELS) minLogLevel = LOG_LEVELS[lvl]; },
 };
 
 const exportLog = () => _logBuf.join('\n');
@@ -55,6 +62,7 @@ window.addEventListener('beforeunload', _saveLogToStorage);
 // ============================================================================
 const Msg = Object.freeze({
   HELLO: 'hello', WELCOME: 'welcome', PING: 'ping', PONG: 'pong',
+  BATCH: 'batch', // envelope: several game messages in one WebSocket frame
   ACTION_CLAIM: 'claim', ACTION_RELEASE: 'release',
   ACTION_START: 'action_start', ACTION_STOP: 'action_stop',
   XP: 'xp', MASTERY: 'mastery', MASTERY_POOL: 'pool',
@@ -169,8 +177,11 @@ class Transport {
     this._peerName = '';
     this._pingTimer = null;
     this._lastPong = 0;
+    this._rttMs = undefined;   // RTT of the last pong (echoed ping timestamp)
     this._connected = false;
     this._paired = false;
+    this._outbox = [];         // queued game messages, flushed once per frame
+    this._flushTimer = null;
   }
   on(evt, cb) {
     if (!this._listeners.has(evt)) this._listeners.set(evt, new Set());
@@ -321,7 +332,25 @@ class Transport {
       logger.warn('send() called but not paired, msg.t =', msg.t);
       return false;
     }
-    return this._rawSend(msg);
+    // Batch: coalesce everything produced within a frame into one envelope —
+    // one WebSocket frame per 16ms instead of dozens of tiny JSON packets.
+    // Order is preserved; the latency cost is at most one frame.
+    this._outbox.push(msg);
+    this._scheduleFlush();
+    return true;
+  }
+
+  _scheduleFlush() {
+    if (this._flushTimer) return;
+    this._flushTimer = setTimeout(() => this._flushOutbox(), 16);
+  }
+
+  _flushOutbox() {
+    this._flushTimer = null;
+    if (!this._outbox.length) return;
+    const batch = this._outbox;
+    this._outbox = [];
+    this._rawSend(batch.length === 1 ? batch[0] : { t: Msg.BATCH, msgs: batch });
   }
 
   _startPing() {
@@ -344,6 +373,8 @@ class Transport {
     this._connected = false;
     this._paired = false;
     this._stopPing();
+    if (this._flushTimer) { clearTimeout(this._flushTimer); this._flushTimer = null; }
+    this._outbox = [];
   }
   close() {
     this._resetConnection();
@@ -1540,10 +1571,10 @@ class Sync {
   _patchFarming() {
     const farming = game.farming;
     if (!farming) return;
-    logger.info('[FARM] _patchFarming: starting, farming plots count:', farming.plots ? farming.plots.size : 'unknown');
-    logger.info('[FARM] unlockPlotOnClick type:', typeof farming.unlockPlotOnClick);
-    logger.info('[FARM] plantPlot type:', typeof farming.plantPlot);
-    logger.info('[FARM] compostPlot type:', typeof farming.compostPlot);
+    logger.debug('[FARM] _patchFarming: starting, farming plots count:', farming.plots ? farming.plots.size : 'unknown');
+    logger.debug('[FARM] unlockPlotOnClick type:', typeof farming.unlockPlotOnClick);
+    logger.debug('[FARM] plantPlot type:', typeof farming.plantPlot);
+    logger.debug('[FARM] compostPlot type:', typeof farming.compostPlot);
 
     // Patch the farming custom elements to be error-resilient.
     // The game's rendering code throws "Cannot read properties of undefined
@@ -1568,7 +1599,7 @@ class Sync {
       const LockedPlotEl = customElements.get('locked-farming-plot');
       if (LockedPlotEl) {
         wrapMethod(LockedPlotEl.prototype, 'setPlot');
-        logger.info('[FARM] Patched LockedFarmingPlotElement');
+        logger.debug('[FARM] Patched LockedFarmingPlotElement');
       }
 
       // Patch FarmingPlotElement — used for unlocked plots.
@@ -1581,7 +1612,7 @@ class Sync {
                          'updateGrowthTime', 'updateSelectedSeed',
                          'updateSeedQuantities', 'destroyTooltips']) {
           if (wrapMethod(PlotEl.prototype, m)) {
-            logger.info(`[FARM] Patched FarmingPlotElement.${m}`);
+            logger.debug(`[FARM] Patched FarmingPlotElement.${m}`);
           }
         }
       }
@@ -1590,7 +1621,7 @@ class Sync {
       const CatOptsEl = customElements.get('farming-category-options');
       if (CatOptsEl) {
         wrapMethod(CatOptsEl.prototype, 'setCategory');
-        logger.info('[FARM] Patched FarmingCategoryOptionsElement.setCategory');
+        logger.debug('[FARM] Patched FarmingCategoryOptionsElement.setCategory');
       }
     } catch (e) { logger.warn('[FARM] Could not patch custom elements:', e.message); }
 
@@ -1598,14 +1629,14 @@ class Sync {
     // calls updateGrowthTime. If one throws, the rest don't get rendered.
     if (typeof Farming.prototype.renderGrowthStatus === 'function') {
       wrapMethod(Farming.prototype, 'renderGrowthStatus', 'renderGrowthStatus');
-      logger.info('[FARM] Patched Farming.renderGrowthStatus');
+      logger.debug('[FARM] Patched Farming.renderGrowthStatus');
     }
 
     // Patch Farming.render — the main render method called from the game
     // render loop. If it throws, the entire game UI breaks.
     if (typeof Farming.prototype.render === 'function') {
       wrapMethod(Farming.prototype, 'render', 'Farming.render');
-      logger.info('[FARM] Patched Farming.render');
+      logger.debug('[FARM] Patched Farming.render');
     }
 
     // Patch showPlotsInCategory to be error-resilient. The original can
@@ -1623,7 +1654,7 @@ class Sync {
           catch (e2) { logger.warn(`[FARM] showPlotsInCategory second try also threw: ${e2.message}`); }
         }
       };
-      logger.info('[FARM] Patched showPlotsInCategory');
+      logger.debug('[FARM] Patched showPlotsInCategory');
     }
 
     const sendPlot = function (plot) {
@@ -1645,24 +1676,24 @@ class Sync {
       }
       // Already unlocked — do nothing
       if (plot.state !== 0) {
-        logger.info(`[FARM] unlockPlotOnClick: plot ${plot.id} already unlocked (state=${plot.state})`);
+        logger.debug(`[FARM] unlockPlotOnClick: plot ${plot.id} already unlocked (state=${plot.state})`);
         return;
       }
       const gpBefore = game.gp ? game.gp.amount : 0;
-      logger.info(`[FARM] unlockPlotOnClick: plot=${plot.id}, state=${plot.state}, level=${plot.level}, myLevel=${this._level}, myGP=${gpBefore}`);
+      logger.debug(`[FARM] unlockPlotOnClick: plot=${plot.id}, state=${plot.state}, level=${plot.level}, myLevel=${this._level}, myGP=${gpBefore}`);
 
       // Pay costs using the Costs system (handles currencyCosts + itemCosts)
       let paid = false;
       try {
         if (this.getPlotUnlockCosts) {
           const costs = this.getPlotUnlockCosts(plot);
-          logger.info(`[FARM] getPlotUnlockCosts returned: ${costs ? typeof costs : 'null'}`);
+          logger.debug(`[FARM] getPlotUnlockCosts returned: ${costs ? typeof costs : 'null'}`);
           if (costs) {
             // Check if we can afford it
             if (costs.checkIfOwned && costs.checkIfOwned()) {
               costs.consumeCosts();
               paid = true;
-              logger.info(`[FARM] Paid costs via Costs API for ${plot.id}, gp now=${game.gp ? game.gp.amount : 'no-gp'}`);
+              logger.debug(`[FARM] Paid costs via Costs API for ${plot.id}, gp now=${game.gp ? game.gp.amount : 'no-gp'}`);
             } else {
               logger.warn(`[FARM] Cannot afford costs for ${plot.id}`);
               // Can't afford — don't unlock
@@ -1675,14 +1706,14 @@ class Sync {
         // Restore any GP that was eaten
         if (game.gp && game.gp.amount < gpBefore) {
           const eaten = gpBefore - game.gp.amount;
-          try { game.gp.add(eaten); logger.info(`[FARM] Restored ${eaten} GP after cost error`); }
+          try { game.gp.add(eaten); logger.debug(`[FARM] Restored ${eaten} GP after cost error`); }
           catch (e2) { /* skip */ }
         }
       }
 
       // Force the unlock — set state to Empty
       plot.state = 1;
-      logger.info(`[FARM] Unlocked plot ${plot.id}, state=${plot.state}, paid=${paid}`);
+      logger.debug(`[FARM] Unlocked plot ${plot.id}, state=${plot.state}, paid=${paid}`);
 
       // Re-render the UI completely
       try {
@@ -1700,7 +1731,7 @@ class Sync {
     // Single-plot plant/harvest methods share one log format; the bulk
     // ("...All...") methods share one send-everything callback.
     const logSendPlot = (name) => function (_ret, plot) {
-      logger.info(`[FARM] ${name} called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
+      logger.debug(`[FARM] ${name} called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
     };
     // Planting — sync so both players plant the same seeds.
@@ -1713,7 +1744,7 @@ class Sync {
     });
     // Compost — sync so both players compost (weird gloop, abyssal compost, etc.)
     this.ctx.patch(Farming, 'compostPlot').after(function (_ret, plot) {
-      logger.info(`[FARM] compostPlot called: plot=${plot ? plot.id : 'null'}, compostLevel=${plot ? plot.compostLevel : 'null'}, compostItem=${plot && plot.compostItem ? plot.compostItem.id : 'null'}`);
+      logger.debug(`[FARM] compostPlot called: plot=${plot ? plot.id : 'null'}, compostLevel=${plot ? plot.compostLevel : 'null'}, compostItem=${plot && plot.compostItem ? plot.compostItem.id : 'null'}`);
       sendPlot(plot);
     });
 
@@ -1737,7 +1768,7 @@ class Sync {
     // Growth tick — send updates when plots grow
     this.ctx.patch(Farming, 'growPlots').after(function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
-      logger.info('[FARM] growPlots tick — sending all plots');
+      logger.debug('[FARM] growPlots tick — sending all plots');
       sync._sendAllFarmingPlots();
     });
   }
@@ -1745,7 +1776,7 @@ class Sync {
   _sendFarmingPlot(plot) {
     const data = this._serializePlot(plot);
     if (!data) return;
-    logger.info(`[FARM] Sending plot: ${JSON.stringify(data)}`);
+    logger.debug(`[FARM] Sending plot: ${JSON.stringify(data)}`);
     this.transport.send({ t: Msg.FARMING, plots: [data] });
   }
 
@@ -1818,7 +1849,7 @@ class Sync {
       // Create a new growth timer with the remaining time
       try {
         farming.createGrowthTimer([plot], intervalMs);
-        logger.info(`[FARM] Created ${logTag} for ${plot.id}, interval=${intervalMs}ms`);
+        logger.debug(`[FARM] Created ${logTag} for ${plot.id}, interval=${intervalMs}ms`);
       } catch (e) {
         logger.warn(`[FARM] Failed to create ${logTag}: ${e.message}`);
       }
@@ -1838,7 +1869,7 @@ class Sync {
   _applyFarming(msg) {
     const farming = game.farming;
     if (!farming || !msg.plots) return;
-    logger.info(`[FARM] _applyFarming: received ${msg.plots.length} plots`);
+    logger.debug(`[FARM] _applyFarming: received ${msg.plots.length} plots`);
     this._applyRemote('applyFarming', () => {
       for (const p of msg.plots) {
         const plot = farming.plots.getObjectByID(p.id);
@@ -1846,14 +1877,14 @@ class Sync {
           logger.warn(`[FARM] Plot not found: ${p.id}`);
           continue;
         }
-        logger.info(`[FARM] Applying: plot=${p.id}, remoteState=${p.state}, localState=${plot.state}, plantedRecipeId=${p.plantedRecipeId}, compostItemId=${p.compostItemId}, compostLevel=${p.compostLevel}`);
+        logger.debug(`[FARM] Applying: plot=${p.id}, remoteState=${p.state}, localState=${plot.state}, plantedRecipeId=${p.plantedRecipeId}, compostItemId=${p.compostItemId}, compostLevel=${p.compostLevel}`);
 
         // Handle plot unlock: if the plot was unlocked by the other player,
         // unlock it here too (without charging)
         if (typeof p.state === 'number' && p.state > 0 && plot.state === 0) {
           // Plot is unlocked on the other side but locked here — unlock it
           plot.state = 1; // Empty
-          logger.info(`[FARM] Synced plot unlock: ${p.id}`);
+          logger.debug(`[FARM] Synced plot unlock: ${p.id}`);
           // Force show plots in category to update UI
           if (farming.showPlotsInCategory && plot.category) {
             try { farming.showPlotsInCategory(plot.category); } catch (e) { /* skip */ }
@@ -1870,7 +1901,7 @@ class Sync {
             plot.state = p.state;
             plot.plantedRecipe = recipe;
             plot.growthTime = p.growthTime || 0;
-            logger.info(`[FARM] Synced plant: ${p.id} → ${p.plantedRecipeId}, state=${p.state}`);
+            logger.debug(`[FARM] Synced plant: ${p.id} → ${p.plantedRecipeId}, state=${p.state}`);
 
             // Create a growth timer so the UI shows the remaining time
             // and the crop eventually grows/hrows on the receiver too.
@@ -1894,7 +1925,7 @@ class Sync {
             // Different recipe — update it
             plot.plantedRecipe = recipe;
             plot.growthTime = p.growthTime || 0;
-            logger.info(`[FARM] Updated planted recipe: ${p.id} → ${p.plantedRecipeId}`);
+            logger.debug(`[FARM] Updated planted recipe: ${p.id} → ${p.plantedRecipeId}`);
           }
           // If the receiver has no timer but the sender does, create one
           if (p.state === 2 && farming.growthTimerMap && !farming.growthTimerMap.get(plot) && farming.createGrowthTimer) {
@@ -1910,7 +1941,7 @@ class Sync {
           if (oldState === 3 && p.state === 1 && plot.plantedRecipe && farming.harvestPlot) {
             try {
               farming.harvestPlot(plot);
-              logger.info(`[FARM] Synced harvest: ${p.id}`);
+              logger.debug(`[FARM] Synced harvest: ${p.id}`);
             } catch (e) {
               logger.warn(`[FARM] Synced harvest failed, setting state directly: ${e.message}`);
               plot.state = 1;
@@ -1924,7 +1955,7 @@ class Sync {
             plot.state = 1;
             plot.plantedRecipe = undefined;
             plot.growthTime = 0;
-            logger.info(`[FARM] Synced clear dead: ${p.id}`);
+            logger.debug(`[FARM] Synced clear dead: ${p.id}`);
           }
           // If the plot was Growing (2) or Grown (3) and the remote says
           // it's now Empty (1), the other player destroyed/cleared it.
@@ -1932,7 +1963,7 @@ class Sync {
             plot.state = 1;
             plot.plantedRecipe = undefined;
             plot.growthTime = 0;
-            logger.info(`[FARM] Synced destroy/clear: ${p.id}`);
+            logger.debug(`[FARM] Synced destroy/clear: ${p.id}`);
           }
           // Otherwise just update the state directly
           else {
@@ -1952,7 +1983,7 @@ class Sync {
           }
           // Queue render updates
           this._queueFarmRender(farming, plot);
-          logger.info(`[FARM] State update: ${p.id} ${oldState}→${p.state}`);
+          logger.debug(`[FARM] State update: ${p.id} ${oldState}→${p.state}`);
         }
 
         // Handle compost: sync compost item and level
@@ -1968,7 +1999,7 @@ class Sync {
               try {
                 const amount = p.compostLevel - plot.compostLevel;
                 farming.compostPlot(plot, compostItem, amount);
-                logger.info(`[FARM] Synced compost: ${p.id} → ${p.compostItemId}, level ${p.compostLevel}`);
+                logger.debug(`[FARM] Synced compost: ${p.id} → ${p.compostItemId}, level ${p.compostLevel}`);
               } catch (e) {
                 // Fallback: set directly
                 plot.compostItem = compostItem;
@@ -6803,6 +6834,7 @@ class Sync {
   // routed straight to the ActionLock; everything else goes to an _applyX.
   _buildHandlers() {
     return {
+      [Msg.BATCH]: (m) => { for (const sub of (m.msgs || [])) this.handle(sub); },
       [Msg.ACTION_CLAIM]: (m) => this.actionLock.applyRemoteClaim(m),
       [Msg.ACTION_RELEASE]: (m) => this.actionLock.applyRemoteRelease(m),
       [Msg.XP]: (m) => this._applyXP(m),
@@ -6864,7 +6896,7 @@ class Sync {
   handle(msg) {
     // Log every incoming message with a readable name
     const msgName = Object.keys(Msg).find(k => Msg[k] === msg.t) || msg.t;
-    logger.info(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
+    logger.debug(`[RECV] ${msgName}`, JSON.stringify(msg).slice(0, 200));
     const handler = this._handlers[msg.t];
     if (!handler) {
       logger.warn(`[RECV] No handler for message type: ${msgName}`);
@@ -6872,7 +6904,7 @@ class Sync {
     }
     try {
       handler(msg);
-      logger.info(`[APPLY OK] ${msgName}`);
+      logger.debug(`[APPLY OK] ${msgName}`);
     } catch (e) {
       logger.error(`[APPLY FAIL] ${msgName}:`, e.message, e.stack);
     }
@@ -7516,8 +7548,8 @@ export function setup(ctx) {
     panel = null;
   };
 
-  ctx.api({ transport, actionLock, sync: syncInstance, teardown, exportLog });
-  window.realMP = { transport, actionLock, sync: syncInstance, teardown, exportLog };
+  ctx.api({ transport, actionLock, sync: syncInstance, teardown, exportLog, logger });
+  window.realMP = { transport, actionLock, sync: syncInstance, teardown, exportLog, logger };
 
   logger.info('realMultiplayer mod loaded successfully');
 }
