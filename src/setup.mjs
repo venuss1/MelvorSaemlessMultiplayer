@@ -280,7 +280,7 @@ class Transport {
           return;
         }
         if (msg.t === Msg.PING) { this._rawSend({ t: Msg.PONG, ts: msg.ts }); return; }
-        if (msg.t === Msg.PONG) { this._lastPong = Date.now(); return; }
+        if (msg.t === Msg.PONG) { this._lastPong = Date.now(); if (typeof msg.ts === 'number') this._rttMs = Date.now() - msg.ts; return; }
 
         // Game state messages
         this._emit('message', msg);
@@ -338,7 +338,8 @@ class Transport {
   _stopPing() {
     if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
   }
-  get latencyMs() { return this._lastPong ? Date.now() - this._lastPong : -1; }
+  // Round-trip time of the last ping (the echoed ts), -1 until first pong.
+  get latencyMs() { return this._rttMs !== undefined ? this._rttMs : -1; }
   _resetConnection() {
     this._connected = false;
     this._paired = false;
@@ -3889,27 +3890,30 @@ class Sync {
       resources[r.id] = { amount: r._amount, cap: r._cap };
     }
     // Town data — the live town state (population, happiness, education,
-    // worship, season, fortification, souls, health, etc.)
+    // worship, season, fortification, souls, health, etc.). Guarded: a game
+    // update renaming a field must not crash the game tick this runs inside.
     const townData = {};
     if (tw.townData) {
-      const td = tw.townData;
-      townData.happiness = td.happiness;
-      townData.education = td.education;
-      townData.healthPercent = td.healthPercent;
-      townData.buildingStorage = td.buildingStorage;
-      townData.worshipCount = td.worshipCount;
-      townData.sectionsPurchased = td.sectionsPurchased;
-      townData.worshipId = td.worship ? td.worship.id : null;
-      townData.townCreated = td.townCreated;
-      townData.population = td.population;
-      townData.seasonTicksRemaining = td.seasonTicksRemaining;
-      townData.seasonId = td.season ? td.season.id : null;
-      townData.previousSeasonId = td.previousSeason ? td.previousSeason.id : null;
-      townData.health = td.health;
-      townData.fortification = td.fortification;
-      townData.souls = td.souls;
-      townData.soulStorage = td.soulStorage;
-      townData.abyssalWaveTicksRemaining = td.abyssalWaveTicksRemaining;
+      try {
+        const td = tw.townData;
+        townData.happiness = td.happiness;
+        townData.education = td.education;
+        townData.healthPercent = td.healthPercent;
+        townData.buildingStorage = td.buildingStorage;
+        townData.worshipCount = td.worshipCount;
+        townData.sectionsPurchased = td.sectionsPurchased;
+        townData.worshipId = td.worship ? td.worship.id : null;
+        townData.townCreated = td.townCreated;
+        townData.population = td.population;
+        townData.seasonTicksRemaining = td.seasonTicksRemaining;
+        townData.seasonId = td.season ? td.season.id : null;
+        townData.previousSeasonId = td.previousSeason ? td.previousSeason.id : null;
+        townData.health = td.health;
+        townData.fortification = td.fortification;
+        townData.souls = td.souls;
+        townData.soulStorage = td.soulStorage;
+        townData.abyssalWaveTicksRemaining = td.abyssalWaveTicksRemaining;
+      } catch (e) { logger.warn('[TOWNSHIP] townData serialize failed (skipped)', e); }
     }
     return {
       biomes,
@@ -4852,7 +4856,7 @@ class Sync {
               if (!name) return;
               throttledSend();
             });
-          } catch { /* skip */ }
+          } catch (e) { logger.warn('[STATS] failed to patch StatTracker.' + m, e); }
         }
       }
     }
@@ -7010,11 +7014,11 @@ class Panel {
       </div>
       <div data-rmp="body" style="padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;">
         <div style="display:flex;gap:6px;align-items:center;">
-          <input class="rmp-input" data-rmp="nameInput" placeholder="Your name" maxlength="16" value="${getSavedName()}"
+          <input class="rmp-input" data-rmp="nameInput" placeholder="Your name" maxlength="16" value="${this._esc(getSavedName())}"
             style="flex:1;background:#111827;border:1px solid #4b5563;color:#f3f4f6;border-radius:6px;padding:5px 8px;font-size:12px;outline:none;" />
         </div>
         <div style="display:flex;gap:6px;align-items:center;">
-          <input class="rmp-input" data-rmp="serverInput" value="${getSavedServerUrl()}" title="WebSocket relay server URL"
+          <input class="rmp-input" data-rmp="serverInput" value="${this._esc(getSavedServerUrl())}" title="WebSocket relay server URL"
             style="flex:1;background:#111827;border:1px solid #4b5563;color:#f3f4f6;border-radius:6px;padding:5px 8px;font-size:11px;outline:none;font-family:ui-monospace,monospace;" />
         </div>
         <button class="rmp-btn" data-rmp="connectBtn"
