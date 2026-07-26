@@ -121,7 +121,7 @@ Nearly every game system is synchronised in real time:
 
 | System | Coverage |
 |--------|----------|
-| **Game state** | tickTimestamp, merchant's permit, pause state, visible completion, secret fishing area unlock |
+| **Game state** | merchant's permit, pause state, visible completion, secret fishing area unlock |
 | **Skill unlocks** | Mid-game skill unlocks via the lock icon (e.g. Corruption) |
 | **Lore books** | Read lore books (button disable state) |
 | **Realm selection** | Current active realm |
@@ -165,7 +165,10 @@ default public relay is provided.
 > relay and paste its URL into the panel (the URL persists in localStorage).
 
 Features:
-- **Ping/pong** heartbeat every 10s with latency display
+- **Ping/pong** heartbeat every 10s with real RTT latency display
+- **Message batching** — all game messages produced within a frame are coalesced
+  into a single envelope (one WebSocket frame per ~16ms), preserving order while
+  cutting packet count during bursts (bank operations, snapshot traffic)
 - **Auto-reconnect** after save sync reload (remembers server URL + name)
 - **Throttled updates** for high-frequency systems (Harvesting 2s, Township 5s,
   Stats 3s, Combat events 80ms) to avoid flooding the connection

@@ -26,6 +26,25 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   `Map<AnyItem, BankItem>` where `BankItem.quantity`.
 - Currency: `Currency.add/remove/set`, internal `_amount`, `.render()`.
 
+### Verified against the actual v1.3.1 game source (144 modules)
+- **`ctx.patch(...).after` hooks are called `(returnValue, ...args)`** (game's
+  loader, mod.js). Always declare the leading `_ret` param in callbacks —
+  omitting it silently shifts every argument one position left.
+- `Game.selectRealm` performs the switch ~1s later via setTimeout behind a
+  modal — read the target realm from the method ARGUMENT, not `game.currentRealm`.
+- `Settings.setTogglesChecked` only updates DOM checkboxes; real state is
+  `settings.boolData[key].currentValue` (+ optional onChange/saveOnChange).
+- `Skill(WithMastery).addMasteryPoolXP(realm, xp)` is called directly by
+  mastery-token claims and pool spending — patch it, not just addMasteryForAction.
+- `CombatManager.pause()/start()` do not exist (pause = `pauseDungeon()` +
+  `paused` field). `ClueHunt.updateClueNProgress` are constructor arrow instance
+  props, unpatchable via prototype; the system is inert outside the 2023 event.
+- `game.tickTimestamp` is rewritten by the game loop every frame — syncing it
+  is dead weight. `equipmentSwapPurchased` is legacy-save-only (vestigial).
+- Mastery-token claims: `Bank.claimMasteryTokenOnClick` → `addMasteryPoolXP`.
+  Token stats derive from the Items tracker (TimesClaimed) via
+  `game.computeTokenItemStats(true)`.
+
 ## Architecture of this mod
 "Shared save, parallel actions, absolute-value delta sync."
 - Each client runs only its own action; broadcasts absolute new values of any

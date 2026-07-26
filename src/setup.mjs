@@ -98,7 +98,7 @@ const Msg = Object.freeze({
   SAVE_SYNC: 'save_sync',
   UNLOCK_ALL: 'unlock_all',
   LEVEL_CAP: 'level_cap',           // skill level cap increases purchased
-  GAME_STATE: 'game_state',         // tickTimestamp, merchantsPermitRead, pause, etc.
+  GAME_STATE: 'game_state',         // merchantsPermitRead, pause, completion, etc.
   LORE: 'lore',                     // lore books read
   SECRET_AREA: 'secret_area',       // message in a bottle read (fishing)
   SKILL_UNLOCK: 'skill_unlock',     // skill unlocked mid-game via lock icon
@@ -5046,7 +5046,7 @@ class Sync {
     });
   }
 
-  // ---- Game state sync (tickTimestamp, merchantsPermitRead, pause) ------
+  // ---- Game state sync (merchantsPermitRead, pause, completion) ----------
   _patchGameState() {
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
@@ -5736,7 +5736,7 @@ class Sync {
     // Skill level cap increases
     snapshot.levelCaps = this._serializeLevelCaps();
 
-    // Game state (tickTimestamp, merchantsPermitRead, pause, visibleCompletion)
+    // Game state (merchantsPermitRead, pause, visibleCompletion, secretAreaUnlocked)
     snapshot.gameState = this._serializeGameState();
 
     // Lore books read
