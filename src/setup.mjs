@@ -1263,26 +1263,55 @@ class Sync {
           changedPurchases.push(purchase);
         }
       }
+      if (changedPurchases.length === 0) return;
       if (game.shop.computeProvidedStats) game.shop.computeProvidedStats();
-      // Update the shop's internal render queue.
+      // Mirror the render queue flags set by the real buyItemOnClick so
+      // unlock displays in other skills update on the peer.
       if (game.shop.renderQueue) {
+        game.shop.renderQueue.upgrades = true;
         game.shop.renderQueue.requirements = true;
         game.shop.renderQueue.costs = true;
-        game.shop.renderQueue.upgrades = true;
       }
-      if (game.shop.render) game.shop.render();
-      // Shop.render() only processes the internal render queue — the actual
-      // DOM elements in the shop modal are managed by the global shopMenu
-      // (ShopMenu instance). Without these calls the peer's shop UI still
-      // shows the upgrade as available/unsold even though upgradesPurchased
-      // was updated and the stat effect was applied.
+      if (game.queueRequirementRenders) game.queueRequirementRenders();
+      if (game.woodcutting?.renderQueue) game.woodcutting.renderQueue.treeUnlocks = true;
+      if (game.mining?.renderQueue) game.mining.renderQueue.rockUnlock = true;
+      if (game.harvesting?.renderQueue) game.harvesting.renderQueue.veinUnlock = true;
+      if (game.archaeology?.actions) {
+        game.archaeology.actions.forEach((action) => {
+          if (game.archaeology.renderQueue?.digSites) game.archaeology.renderQueue.digSites.add(action);
+        });
+      }
+      if (game.firemaking?.renderQueue) game.firemaking.renderQueue.oilQty = true;
+      // Emit the purchaseMade event — other systems (requirements, mod
+      // listeners) depend on it.
+      for (const purchase of changedPurchases) {
+        try {
+          const event = new ShopPurchaseMadeEvent(purchase, 1);
+          game.shop._events.emit('purchaseMade', event);
+        } catch (e) { /* event emission is best-effort */ }
+      }
+      // The critical call: updateItemSelection() on the relevant tab is what
+      // actually makes the shop "advance" — it removes the purchased item
+      // from the list (shouldShowItem returns DontShow/ShowAtBuyLimit) and
+      // creates new ShopItem DOM elements for the next upgrade in the chain
+      // that just became available. Without this the peer's shop still shows
+      // the old upgrade as buyable. updateItemPostPurchase only updates the
+      // description of an existing item — it does NOT remove it or create
+      // new ones.
       if (typeof shopMenu !== 'undefined' && shopMenu) {
         for (const purchase of changedPurchases) {
-          try { shopMenu.updateItemPostPurchase(purchase); } catch (e) { /* shop may not be open */ }
+          try {
+            const tab = shopMenu.tabs.get(purchase.category);
+            if (tab) tab.menu.updateItemSelection();
+          } catch (e) { /* shop may not be open yet */ }
+          try { shopMenu.updateItemPostPurchase(purchase); } catch (e) { /* ignore */ }
         }
         try { shopMenu.updateForCostChange(); } catch (e) { /* ignore */ }
         try { shopMenu.updateForRequirementChange(); } catch (e) { /* ignore */ }
       }
+      // Process the shop's internal render queue (renderUpgrades updates
+      // upgrade-chain-display elements in the sidebar/etc.).
+      if (game.shop.render) game.shop.render();
       this._forceRender();
     } catch (e) { logger.error('applyShop failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
