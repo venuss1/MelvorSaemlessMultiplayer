@@ -92,6 +92,8 @@ const Msg = Object.freeze({
   LEVEL_CAP: 'level_cap',           // skill level cap increases purchased
   GAME_STATE: 'game_state',         // tickTimestamp, merchantsPermitRead, pause, etc.
   LORE: 'lore',                     // lore books read
+  SECRET_AREA: 'secret_area',       // message in a bottle read (fishing)
+  SKILL_UNLOCK: 'skill_unlock',     // skill unlocked mid-game via lock icon
   ASTROLOGY_SELECT: 'astro_select', // studied/explored constellation
   REALM: 'realm',                   // current realm selection
   SLAYER_CAT: 'slayer_cat',         // slayer task category completions
@@ -518,6 +520,7 @@ class Sync {
       ['LevelCaps', '_patchLevelCaps'],
       ['GameState', '_patchGameState'],
       ['Lore', '_patchLore'],
+      ['Unlocks', '_patchUnlocks'],
       ['Tutorial', '_patchTutorial'],
       ['RealmSelection', '_patchRealmSelection'],
       ['SlayerCategories', '_patchSlayerCategories'],
@@ -4994,6 +4997,7 @@ class Sync {
       merchantsPermitRead: game.merchantsPermitRead,
       isPaused: game._isPaused,
       visibleCompletion: game.completion ? game.completion.visibleCompletion : undefined,
+      secretAreaUnlocked: !!(game.fishing && game.fishing.secretAreaUnlocked),
     };
   }
 
@@ -5019,7 +5023,42 @@ class Sync {
       if (msg.visibleCompletion !== undefined && game.completion) {
         try { game.completion.setVisibleCompletion(msg.visibleCompletion); } catch { /* noop */ }
       }
+      if (msg.secretAreaUnlocked && game.fishing && !game.fishing.secretAreaUnlocked) {
+        try { game.fishing.unlockSecretArea(); } catch { /* noop */ }
+      }
     }, { save: false });
+  }
+
+  // ---- One-off unlock sync (message in a bottle, skill unlocks) -----------
+  _patchUnlocks() {
+    // Message in a bottle -> secret fishing area. The bottle is a ReadableItem
+    // (just a modal); the state change is Fishing.unlockSecretArea().
+    if (game.fishing && typeof Fishing !== 'undefined') {
+      this._afterEach(Fishing, ['unlockSecretArea'], () => {
+        this._send({ t: Msg.SECRET_AREA });
+      });
+    }
+    // Skills unlocked mid-game via the lock icon (e.g. Corruption). Snapshots
+    // already carry skill unlock state; this makes it propagate live.
+    this._afterEach(Skill, ['setUnlock'], function (isUnlocked) {
+      if (!isUnlocked) return;
+      sync._send({ t: Msg.SKILL_UNLOCK, skillId: this.id });
+    });
+  }
+
+  _applySecretArea() {
+    if (!game.fishing) return;
+    this._applyRemote('applySecretArea', () => {
+      if (!game.fishing.secretAreaUnlocked) game.fishing.unlockSecretArea();
+    });
+  }
+
+  _applySkillUnlock(msg) {
+    const skill = this._skillById(msg.skillId);
+    if (!skill || !skill.setUnlock) return;
+    this._applyRemote('applySkillUnlock', () => {
+      if (!skill.isUnlocked) skill.setUnlock(true);
+    });
   }
 
   // ---- Lore books read sync ---------------------------------------------
@@ -6793,6 +6832,8 @@ class Sync {
       [Msg.LEVEL_CAP]: (m) => this._applyLevelCaps(m),
       [Msg.GAME_STATE]: (m) => this._applyGameState(m),
       [Msg.LORE]: (m) => this._applyLore(m),
+      [Msg.SECRET_AREA]: () => this._applySecretArea(),
+      [Msg.SKILL_UNLOCK]: (m) => this._applySkillUnlock(m),
       [Msg.REALM]: (m) => this._applyRealmSelection(m),
       [Msg.SLAYER_CAT]: (m) => this._applySlayerCategories(m),
       [Msg.COOKING_STOCKPILE]: (m) => this._applyCookingStockpile(m),

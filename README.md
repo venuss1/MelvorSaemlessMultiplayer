@@ -67,6 +67,7 @@ Nearly every game system is synchronised in real time:
 |--------|----------|
 | **Skill selections** | Cooking, Woodcutting, Firemaking, Fishing, Thieving, Alt Magic, Fletching, Herblore, Smithing, Crafting, Runecrafting, Harvesting, Archaeology |
 | **Mining** | Rock HP / ore depletion (skips locally-mined rock) |
+| **Fishing** | **Secret area unlock** (message in a bottle) — live + snapshot |
 | **Farming** | Plot unlocks, planted seeds, compost, growth state, harvest, dead plot clearing, abyssal farming levels, selected recipes |
 | **Agility** | Built obstacles/pillars, blueprints, build counts, active obstacle (crash-proofed) |
 | **Astrology** | Modifier upgrades (standard/unique/abyssal), studied/explored constellation selection |
@@ -120,7 +121,8 @@ Nearly every game system is synchronised in real time:
 
 | System | Coverage |
 |--------|----------|
-| **Game state** | tickTimestamp, merchant's permit, pause state, visible completion |
+| **Game state** | tickTimestamp, merchant's permit, pause state, visible completion, secret fishing area unlock |
+| **Skill unlocks** | Mid-game skill unlocks via the lock icon (e.g. Corruption) |
 | **Lore books** | Read lore books (button disable state) |
 | **Realm selection** | Current active realm |
 | **Game settings** | Gameplay-affecting boolean settings (continueIfBankFull, continueThievingOnStun, autoRestartDungeon, enableAutoSlayer, enableAutoEquipFood, enableAutoSwapFood, enablePerfectCooking, enablePermaCorruption, enableOfflineCombat) |
