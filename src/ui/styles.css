@@ -15,15 +15,6 @@
   user-select: none;
   backdrop-filter: blur(4px);
 }
-.rmp-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid #374151;
-  cursor: default;
-}
-.rmp-title { font-weight: 700; letter-spacing: .3px; }
 .rmp-status {
   font-size: 11px;
   padding: 2px 8px;
@@ -31,10 +22,7 @@
   background: #374151;
   color: #cbd5e1;
 }
-.rmp-status.rmp-ok { background: #065f46; color: #6ee7b7; }
 .rmp-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
-.rmp-row { display: flex; gap: 6px; align-items: center; }
-.rmp-buttons { justify-content: space-between; }
 .rmp-input {
   flex: 1;
   background: #111827;
@@ -58,42 +46,7 @@
 }
 .rmp-btn:hover:not(:disabled) { background: #374151; border-color: #6b7280; }
 .rmp-btn:disabled { opacity: .5; cursor: default; }
-.rmp-btn-sm { padding: 3px 8px; font-size: 11px; }
-.rmp-btn-danger { border-color: #7f1d1d; color: #fca5a5; }
-.rmp-btn-danger:hover { background: #7f1d1d; color: #fff; }
-.rmp-label { font-size: 11px; color: #9ca3af; }
-.rmp-codeRow { display: flex; gap: 6px; align-items: center; width: 100%; }
-.rmp-code {
-  flex: 1;
-  background: #0b1220;
-  border: 1px dashed #4b5563;
-  border-radius: 6px;
-  padding: 4px 6px;
-  font-family: ui-monospace, monospace;
-  font-size: 11px;
-  color: #34d399;
-  overflow-x: auto;
-  white-space: nowrap;
-}
-.rmp-peer { flex: 1; display: flex; gap: 8px; align-items: center; }
 .rmp-ping { font-size: 11px; color: #9ca3af; }
-.rmp-sep { border: none; border-top: 1px solid #374151; margin: 4px 0; }
-.rmp-players { display: flex; flex-direction: column; gap: 4px; }
-.rmp-player { display: flex; align-items: center; gap: 6px; }
-.rmp-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
-.rmp-dot-local { background: #34d399; }
-.rmp-dot-remote { background: #60a5fa; }
-.rmp-playername { font-weight: 600; min-width: 48px; }
-.rmp-action { color: #9ca3af; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rmp-conflict {
-  font-size: 11px;
-  color: #fca5a5;
-  background: rgba(127, 29, 29, 0.4);
-  border: 1px solid #7f1d1d;
-  border-radius: 6px;
-  padding: 6px 8px;
-}
-.rmp-hint { font-size: 10px; color: #6b7280; margin: 2px 0 0; }
 
 /* Fake progress bars — match the game's ProgressBarElement look.
    The game uses Bootstrap-style .progress > .progress-bar with colored

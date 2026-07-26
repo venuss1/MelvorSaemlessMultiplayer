@@ -101,6 +101,26 @@ const Msg = Object.freeze({
   MUSEUM_DONATE: 'museum_donate',   // { itemId } — 1 player donated, auto-donate for peer
   BANK_TAB_COUNT: 'bank_tab_count', // number of bank tabs purchased
 });
+
+// Named StatTracker keys on game.stats — shared by the stats sync and the
+// snapshot builder.
+const STATS_TRACKER_KEYS = [
+  'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
+  'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
+  'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
+  'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
+  'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
+  'General', 'Combat', 'GolbinRaid', 'Shop',
+];
+// MappedStatTracker keys on game.stats (keyed by game object).
+const STATS_MAPPED_TRACKER_KEYS = ['Items', 'Monsters'];
+// Gameplay-affecting boolean game settings synced between peers.
+const SETTINGS_BOOL_KEYS = [
+  'continueIfBankFull', 'continueThievingOnStun', 'autoRestartDungeon',
+  'enableAutoSlayer', 'enableAutoEquipFood', 'enableAutoSwapFood',
+  'enablePerfectCooking', 'enablePermaCorruption', 'enableOfflineCombat',
+];
+
 const encode = (msg) => JSON.stringify(msg);
 const decode = (data) => {
   try {
@@ -119,33 +139,24 @@ const decode = (data) => {
 
 const DEFAULT_SERVER = 'wss://vaccine-knowledgestorm-fundamentals-trends.trycloudflare.com';
 
+// localStorage helpers — values are trimmed on read only; writes store raw.
+const getSaved = (key, fallback) => {
+  try {
+    const s = localStorage.getItem(key);
+    if (s && s.trim()) return s.trim();
+  } catch { /* noop */ }
+  return fallback;
+};
+const saveVal = (key, v) => { try { localStorage.setItem(key, v); } catch { /* noop */ } };
+
 /** Get the saved server URL from localStorage, or fall back to DEFAULT_SERVER. */
-function getSavedServerUrl() {
-  try {
-    const saved = localStorage.getItem('rmp_server_url');
-    if (saved && saved.trim()) return saved.trim();
-  } catch { /* noop */ }
-  return DEFAULT_SERVER;
-}
-
+const getSavedServerUrl = () => getSaved('rmp_server_url', DEFAULT_SERVER);
 /** Save the server URL to localStorage so it persists across reloads. */
-function saveServerUrl(url) {
-  try { localStorage.setItem('rmp_server_url', url); } catch { /* noop */ }
-}
-
+const saveServerUrl = (url) => saveVal('rmp_server_url', url);
 /** Get the saved player name from localStorage. */
-function getSavedName() {
-  try {
-    const saved = localStorage.getItem('rmp_player_name');
-    if (saved && saved.trim()) return saved.trim();
-  } catch { /* noop */ }
-  return '';
-}
-
+const getSavedName = () => getSaved('rmp_player_name', '');
 /** Save the player name to localStorage. */
-function saveName(name) {
-  try { localStorage.setItem('rmp_player_name', name); } catch { /* noop */ }
-}
+const saveName = (name) => saveVal('rmp_player_name', name);
 
 class Transport {
   constructor() {
@@ -169,6 +180,7 @@ class Transport {
       try { cb(...args); } catch (e) { logger.error('listener error', evt, e); }
     }
   }
+  // "connected" means "paired with a peer" (relay handshake complete).
   get isConnected() { return this._paired; }
   get role() { return this._myRole; }
   get myName() { return this._myName; }
@@ -283,9 +295,7 @@ class Transport {
         clearTimeout(timeout);
         logger.info('WebSocket closed, code =', event.code, 'reason =', event.reason);
         const wasPaired = this._paired;
-        this._connected = false;
-        this._paired = false;
-        this._stopPing();
+        this._resetConnection();
         if (wasPaired) this._emit('close');
       };
     });
@@ -327,12 +337,15 @@ class Transport {
     if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
   }
   get latencyMs() { return this._lastPong ? Date.now() - this._lastPong : -1; }
-  close() {
-    this._stopPing();
-    try { this.ws && this.ws.close(); } catch { /* noop */ }
-    this.ws = null;
+  _resetConnection() {
     this._connected = false;
     this._paired = false;
+    this._stopPing();
+  }
+  close() {
+    this._resetConnection();
+    try { this.ws && this.ws.close(); } catch { /* noop */ }
+    this.ws = null;
     this._emit('close');
   }
 }
@@ -647,25 +660,19 @@ class Sync {
   // ---- XP / Abyssal XP --------------------------------------------------
 
   _patchXP() {
-    this.ctx.patch(Skill, 'addXP').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
+    const sendXP = function () {
       const p = { t: Msg.XP, skillId: this.id, xp: this.xp };
       if (this.hasAbyssalLevels) p.abyssalXp = this.abyssalXP;
-      sync.transport.send(p);
-    });
-    this.ctx.patch(Skill, 'addAbyssalXP').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const p = { t: Msg.XP, skillId: this.id, xp: this.xp };
-      if (this.hasAbyssalLevels) p.abyssalXp = this.abyssalXP;
-      sync.transport.send(p);
-    });
+      sync._send(p);
+    };
+    this.ctx.patch(Skill, 'addXP').after(sendXP);
+    this.ctx.patch(Skill, 'addAbyssalXP').after(sendXP);
   }
 
   _applyXP(msg) {
     const skill = this._skillById(msg.skillId);
     if (!skill) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyXP', () => {
       if (typeof msg.xp === 'number') {
         // XP should only ever go UP — both players share the same character.
         // Never decrease XP via sync (would undo the other player's progress).
@@ -682,8 +689,7 @@ class Sync {
       }
       // Targeted render — only queue XP/mastery, not everything.
       this._queueRender('xp');
-    } catch (e) { logger.error('applyXP failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Mastery + mastery pool ------------------------------------------
@@ -712,8 +718,7 @@ class Sync {
     // exist yet if the player has never trained this action. addMasteryXP
     // creates it automatically. Use 0 as current XP in that case.
     const am = skill.actionMastery.get(action);
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyMastery', () => {
       // Mastery should only ever go UP, never down. Both players share the
       // same character, so we take the max of local and remote XP. This
       // prevents a player with lower mastery from resetting the other
@@ -728,8 +733,7 @@ class Sync {
       // Queue render for the action's mastery display.
       if (skill.renderQueue && skill.renderQueue.actionMastery) skill.renderQueue.actionMastery.add(action);
       this._queueRender('mastery');
-    } catch (e) { logger.error('applyMastery failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   _applyMasteryPool(msg) {
@@ -737,8 +741,7 @@ class Sync {
     if (!skill || !skill.hasMastery) return;
     const realm = game.realms.getObjectByID(msg.realmId);
     if (!realm) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyMasteryPool', () => {
       // Mastery pool should only ever go UP, never down — same as mastery XP.
       const current = skill._masteryPoolXP.get(realm) || 0;
       if (msg.xp > current) {
@@ -746,8 +749,7 @@ class Sync {
         if (skill.renderQueue && skill.renderQueue.masteryPool) skill.renderQueue.masteryPool.add(realm);
         if (skill.renderMasteryPool) skill.renderMasteryPool();
       }
-    } catch (e) { logger.error('applyMasteryPool failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Bank -------------------------------------------------------------
@@ -789,30 +791,23 @@ class Sync {
       };
     }
 
-    // Adding items
-    this.ctx.patch(Bank, 'addItem').after(function (_ret, item) {
+    // Adding / removing / selling items — same handler for all three
+    const onBankItem = function (_ret, item) {
       sendBankUpdate.call(this, item);
-    });
-    this.ctx.patch(Bank, 'addItemByID').after(function (_ret, itemID) {
+    };
+    for (const m of ['addItem', 'removeItemQuantity', 'processItemSale']) {
+      this.ctx.patch(Bank, m).after(onBankItem);
+    }
+
+    // By-ID variants look the item up first, then share the same handler
+    const onBankItemByID = function (_ret, itemID) {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       const item = game.items.getObjectByID(itemID);
       sendBankUpdate.call(this, item);
-    });
-
-    // Removing items
-    this.ctx.patch(Bank, 'removeItemQuantity').after(function (_ret, item) {
-      sendBankUpdate.call(this, item);
-    });
-    this.ctx.patch(Bank, 'removeItemQuantityByID').after(function (_ret, itemID) {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const item = game.items.getObjectByID(itemID);
-      sendBankUpdate.call(this, item);
-    });
-
-    // Selling items
-    this.ctx.patch(Bank, 'processItemSale').after(function (_ret, item) {
-      sendBankUpdate.call(this, item);
-    });
+    };
+    for (const m of ['addItemByID', 'removeItemQuantityByID']) {
+      this.ctx.patch(Bank, m).after(onBankItemByID);
+    }
 
     // Bank tab purchases (from the shop) — sync tab count so the peer's
     // bank has the same number of tabs available.
@@ -823,22 +818,19 @@ class Sync {
       });
     }
 
-    // Also patch addItemOnLoad for items loaded from save
     logger.info('Bank patches installed: addItem, addItemByID, removeItemQuantity, removeItemQuantityByID, processItemSale, addTabs');
   }
 
   _applyBankTabCount(msg) {
     if (typeof msg.count !== 'number' || !game.bank) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyBankTabCount', () => {
       const current = game.bank.tabCount || 0;
       // Tab count only ever increases (purchased permanently) — apply the
       // delta via addTabs() so the game's own logic sets up the new tab.
       if (msg.count > current && typeof game.bank.addTabs === 'function') {
         try { game.bank.addTabs(msg.count - current); } catch (e) { logger.warn('addTabs failed', e); }
       }
-    } catch (e) { logger.error('applyBankTabCount failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   _applyBank(msg) {
@@ -858,8 +850,7 @@ class Sync {
       return;
     }
     logger.info('Bank sync apply:', msg.itemId, 'current:', current, 'target:', msg.qty, 'delta:', delta);
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('bank apply', () => {
       if (delta > 0) {
         // found=true marks the item as discovered in the completion log,
         // which reveals its picture in the museum and item log. notify=false
@@ -869,8 +860,7 @@ class Sync {
         try { bank.removeItemQuantity(item, -delta, false); } catch (e) { logger.warn('bank removeItem failed', msg.itemId, e); }
       }
       this._queueRender('bank');
-    } catch (e) { logger.warn('bank apply failed', msg.itemId, e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    }, { level: 'warn' });
   }
 
   // ---- Currencies -------------------------------------------------------
@@ -894,8 +884,7 @@ class Sync {
       sync.transport.send({ t: Msg.CURRENCY, currencyId: this.id, delta: amount });
     };
     const sendCurrencySet = function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.CURRENCY, currencyId: this.id, qty: this._amount });
+      sync._send({ t: Msg.CURRENCY, currencyId: this.id, qty: this._amount });
     };
     this.ctx.patch(Currency, 'add').after(function (_ret, amount) { sendCurrencyDelta.call(this, amount); });
     this.ctx.patch(Currency, 'remove').after(function (_ret, amount) { sendCurrencyDelta.call(this, -amount); });
@@ -908,8 +897,7 @@ class Sync {
   _applyCurrency(msg) {
     const c = this._currencyById(msg.currencyId);
     if (!c) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCurrency', () => {
       if (typeof msg.delta === 'number') {
         // Apply the exact delta the sender applied on their end. This is
         // commutative regardless of message arrival order and correctly
@@ -924,8 +912,7 @@ class Sync {
         c.set(Math.max(0, msg.qty));
       }
       this._queueRender('currency');
-    } catch (e) { logger.error('applyCurrency failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Equipment --------------------------------------------------------
@@ -934,83 +921,49 @@ class Sync {
     // --- Gear / equipment sets ---
     const sendEquip = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const sets = [];
-      for (let i = 0; i < game.combat.player.equipmentSets.length; i++) {
-        const eqSet = game.combat.player.equipmentSets[i];
-        const eq = eqSet.equipment;
-        const slots = {};
-        for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
-          slots[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
-        }
-        // Per-set spell/prayer selection
-        const spellSel = eqSet.spellSelection || {};
-        const prayerSel = eqSet.prayerSelection;
-        slots.__spellSelection = {
-          attackId: spellSel.attack ? spellSel.attack.id : null,
-          curseId: spellSel.curse ? spellSel.curse.id : null,
-          auroraId: spellSel.aurora ? spellSel.aurora.id : null,
-        };
-        slots.__prayerSelection = prayerSel ? [...prayerSel].map(ap => ap.id) : [];
-        sets.push(slots);
-      }
       sync.transport.send({
-        t: Msg.EQUIPMENT, sets,
+        t: Msg.EQUIPMENT, sets: sync._serializeEquipSets(),
         selectedSet: game.combat.player.selectedEquipmentSet,
       });
     };
-    this.ctx.patch(Player, 'equipItem').after(function () { sendEquip(); });
-    this.ctx.patch(Player, 'unequipItem').after(function () { sendEquip(); });
-    this.ctx.patch(Player, 'changeEquipmentSet').after(function () { sendEquip(); });
+    const afterEquip = function () { sendEquip(); };
+    for (const m of ['equipItem', 'unequipItem', 'changeEquipmentSet']) {
+      this.ctx.patch(Player, m).after(afterEquip);
+    }
 
     // --- Food ---
     const sendFood = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const food = [];
-      if (game.combat.player.food && game.combat.player.food.slots) {
-        for (let i = 0; i < game.combat.player.food.slots.length; i++) {
-          const s = game.combat.player.food.slots[i];
-          food.push({ slot: i, itemId: s.item ? s.item.id : null, qty: s.quantity });
-        }
-      }
-      sync.transport.send({ t: Msg.PLAYER_STATE, food, selectedFoodSlot: game.combat.player.food.selectedSlot });
+      sync.transport.send({ t: Msg.PLAYER_STATE, ...sync._serializeFood() });
     };
-    this.ctx.patch(Player, 'equipFood').after(function () { sendFood(); });
-    this.ctx.patch(Player, 'unequipFood').after(function () { sendFood(); });
+    const afterFood = function () { sendFood(); };
+    for (const m of ['equipFood', 'unequipFood']) {
+      this.ctx.patch(Player, m).after(afterFood);
+    }
     // Patch EquippedFood class methods (prototype-level, works even if player not ready)
-    this.ctx.patch(EquippedFood, 'setSlot').after(function () { sendFood(); });
-    this.ctx.patch(EquippedFood, 'unequipSelected').after(function () { sendFood(); });
+    for (const m of ['setSlot', 'unequipSelected']) {
+      this.ctx.patch(EquippedFood, m).after(afterFood);
+    }
     // Patch food consumption during combat
-    if (typeof Player.prototype.eatFood === 'function') {
-      this.ctx.patch(Player, 'eatFood').after(function () { sendFood(); });
-    }
-    if (typeof EquippedFood.prototype.consume === 'function') {
-      this.ctx.patch(EquippedFood, 'consume').after(function () { sendFood(); });
-    }
+    this._afterEach(Player, ['eatFood'], afterFood);
+    this._afterEach(EquippedFood, ['consume'], afterFood);
 
     // --- Prayers / Curses / Auroras ---
     const sendPrayers = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const prayers = [];
-      if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) prayers.push(ap.id);
-      sync.transport.send({
-        t: Msg.PLAYER_STATE, prayers,
-        prayerPoints: game.combat.player.prayerPoints,
-        soulPoints: game.combat.player.soulPoints,
-      });
+      sync.transport.send({ t: Msg.PLAYER_STATE, ...sync._serializePrayers() });
     };
-    this.ctx.patch(Player, 'togglePrayer').after(function () { sendPrayers(); });
-    this.ctx.patch(Player, 'toggleCurse').after(function () { sendPrayers(); });
-    this.ctx.patch(Player, 'toggleAurora').after(function () { sendPrayers(); });
+    const afterPrayers = function () { sendPrayers(); };
+    for (const m of ['togglePrayer', 'toggleCurse', 'toggleAurora']) {
+      this.ctx.patch(Player, m).after(afterPrayers);
+    }
+    // --- Prayer/soul points changes (combat) ---
+    this._afterEach(Player, ['consumePrayerPoints', 'addPrayerPoints', 'consumeSoulPoints', 'addSoulPoints'], afterPrayers);
 
     // --- Attack spell selection ---
     const sendAttackSpell = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({
-        t: Msg.PLAYER_STATE,
-        attackSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.attack) ? game.combat.player.spellSelection.attack.id : null,
-        curseSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.curse) ? game.combat.player.spellSelection.curse.id : null,
-        auroraSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.aurora) ? game.combat.player.spellSelection.aurora.id : null,
-      });
+      sync.transport.send({ t: Msg.PLAYER_STATE, ...sync._serializeAttackSpell() });
     };
     this.ctx.patch(Player, 'selectAttackSpell').after(function () { sendAttackSpell(); });
 
@@ -1018,33 +971,84 @@ class Sync {
     const sendAttackStyles = () => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       // attackStyles is { melee?: AttackStyle, ranged?: AttackStyle, magic?: AttackStyle }
-      const styles = [];
-      const as = game.combat.player.attackStyles;
-      if (as) {
-        for (const at of ['melee', 'ranged', 'magic']) {
-          const style = as[at];
-          styles.push({ attackType: at, styleId: style ? style.id : null });
-        }
-      }
+      const styles = sync._serializeAttackStyles();
       sync.transport.send({ t: Msg.PLAYER_STATE, attackStyles });
     };
     // Patch Player class prototype (works even if player instance not ready yet)
-    if (Player.prototype && typeof Player.prototype.setAttackStyle === 'function') {
-      this.ctx.patch(Player, 'setAttackStyle').after(function () { sendAttackStyles(); });
-    }
+    this._afterEach(Player, ['setAttackStyle'], function () { sendAttackStyles(); });
+  }
 
-    // --- Prayer/soul points changes (combat) ---
-    for (const m of ['consumePrayerPoints', 'addPrayerPoints', 'consumeSoulPoints', 'addSoulPoints']) {
-      if (Player.prototype && typeof Player.prototype[m] === 'function') {
-        this.ctx.patch(Player, m).after(function () { sendPrayers(); });
+  // Wave-2 serializers: each returns the exact wire fragment its sender
+  // emits today, reading state via game.combat.player (never callback this).
+
+  _serializeEquipSets() {
+    const sets = [];
+    for (let i = 0; i < game.combat.player.equipmentSets.length; i++) {
+      const eqSet = game.combat.player.equipmentSets[i];
+      const eq = eqSet.equipment;
+      const slots = {};
+      for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
+        slots[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
+      }
+      // Per-set spell/prayer selection
+      const spellSel = eqSet.spellSelection || {};
+      const prayerSel = eqSet.prayerSelection;
+      slots.__spellSelection = {
+        attackId: spellSel.attack ? spellSel.attack.id : null,
+        curseId: spellSel.curse ? spellSel.curse.id : null,
+        auroraId: spellSel.aurora ? spellSel.aurora.id : null,
+      };
+      slots.__prayerSelection = prayerSel ? [...prayerSel].map(ap => ap.id) : [];
+      sets.push(slots);
+    }
+    return sets;
+  }
+
+  _serializeFood() {
+    const food = [];
+    if (game.combat.player.food && game.combat.player.food.slots) {
+      for (let i = 0; i < game.combat.player.food.slots.length; i++) {
+        const s = game.combat.player.food.slots[i];
+        food.push({ slot: i, itemId: s.item ? s.item.id : null, qty: s.quantity });
       }
     }
+    return { food, selectedFoodSlot: game.combat.player.food.selectedSlot };
+  }
+
+  _serializePrayers() {
+    const prayers = [];
+    if (game.combat.player.activePrayers) for (const ap of game.combat.player.activePrayers) prayers.push(ap.id);
+    return {
+      prayers,
+      prayerPoints: game.combat.player.prayerPoints,
+      soulPoints: game.combat.player.soulPoints,
+    };
+  }
+
+  _serializeAttackSpell() {
+    return {
+      attackSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.attack) ? game.combat.player.spellSelection.attack.id : null,
+      curseSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.curse) ? game.combat.player.spellSelection.curse.id : null,
+      auroraSpellId: (game.combat.player.spellSelection && game.combat.player.spellSelection.aurora) ? game.combat.player.spellSelection.aurora.id : null,
+    };
+  }
+
+  _serializeAttackStyles() {
+    // attackStyles is { melee?: AttackStyle, ranged?: AttackStyle, magic?: AttackStyle }
+    const styles = [];
+    const as = game.combat.player.attackStyles;
+    if (as) {
+      for (const at of ['melee', 'ranged', 'magic']) {
+        const style = as[at];
+        styles.push({ attackType: at, styleId: style ? style.id : null });
+      }
+    }
+    return styles;
   }
 
   _applyEquipment(msg) {
     if (!msg.sets || !game.combat.player) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyEquipment', () => {
       for (let i = 0; i < msg.sets.length; i++) {
         const remoteSlots = msg.sets[i];
         const eqSet = game.combat.player.equipmentSets[i];
@@ -1133,84 +1137,69 @@ class Sync {
       this._queueRender('bank');
       // Update active skills/minibar
       this._queueRender('xp');
-    } catch (e) { logger.error('applyEquipment failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Pets -------------------------------------------------------------
 
   _patchPets() {
     this.ctx.patch(PetManager, 'unlockPet').after(function (_ret, pet) {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.PET, petId: pet.id });
+      sync._send({ t: Msg.PET, petId: pet.id });
     });
   }
 
   _applyPet(msg) {
     const pet = game.pets.getObjectByID(msg.petId);
     if (!pet) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyPet', () => {
       if (!game.petManager.unlocked.has(pet)) {
         game.petManager.unlocked.add(pet);
         if (game.petManager.computeProvidedStats) game.petManager.computeProvidedStats();
       }
-    } catch (e) { logger.error('applyPet failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Item Charges -----------------------------------------------------
 
   _patchItemCharges() {
-    this.ctx.patch(ItemCharges, 'addCharges').after(function (_ret, item) {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.ITEM_CHARGE, itemId: item.id, charges: this.getCharges(item) });
-    });
-    this.ctx.patch(ItemCharges, 'removeCharges').after(function (_ret, item) {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.ITEM_CHARGE, itemId: item.id, charges: this.getCharges(item) });
-    });
+    const sendCharges = function (_ret, item) {
+      sync._send({ t: Msg.ITEM_CHARGE, itemId: item.id, charges: this.getCharges(item) });
+    };
+    for (const m of ['addCharges', 'removeCharges']) this.ctx.patch(ItemCharges, m).after(sendCharges);
   }
 
   _applyItemCharge(msg) {
     const item = this._itemById(msg.itemId);
     if (!item) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyItemCharge', () => {
       const current = game.itemCharges.getCharges(item);
       // Only increase charges — never decrease via sync. Charges decrease
       // through actual item usage, not through remote sync.
       if (msg.charges > current) game.itemCharges.addCharges(item, msg.charges - current);
       if (game.itemCharges.render) game.itemCharges.render();
-    } catch (e) { logger.error('applyItemCharge failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Potions ----------------------------------------------------------
 
   _patchPotions() {
-    this.ctx.patch(PotionManager, 'usePotion').after(function (_ret, item) {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const potions = [];
-      this.activePotions.forEach((active, action) => {
-        potions.push({ actionId: action.id, itemId: active.item.id, charges: active.charges });
-      });
-      sync.transport.send({ t: Msg.POTION, potions });
+    const sendPotions = function () {
+      sync._send({ t: Msg.POTION, potions: sync._serializePotions() });
+    };
+    for (const m of ['usePotion', 'removePotion']) this.ctx.patch(PotionManager, m).after(sendPotions);
+  }
+
+  _serializePotions() {
+    const potions = [];
+    game.potions.activePotions.forEach((active, action) => {
+      potions.push({ actionId: action.id, itemId: active.item.id, charges: active.charges });
     });
-    this.ctx.patch(PotionManager, 'removePotion').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const potions = [];
-      this.activePotions.forEach((active, action) => {
-        potions.push({ actionId: action.id, itemId: active.item.id, charges: active.charges });
-      });
-      sync.transport.send({ t: Msg.POTION, potions });
-    });
+    return potions;
   }
 
   _applyPotion(msg) {
     if (!msg.potions || !game.potions) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyPotion', () => {
       game.potions.activePotions.forEach((ap, action) => {
         game.potions.removePotion(action, true);
       });
@@ -1225,8 +1214,7 @@ class Sync {
       }
       if (game.potions.computeProvidedStats) game.potions.computeProvidedStats();
       if (game.potions.render) game.potions.render();
-    } catch (e) { logger.error('applyPotion failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Shop / Upgrades --------------------------------------------------
@@ -1235,25 +1223,24 @@ class Sync {
     // Sync when a shop purchase is made. Both buyItemOnClick and
     // quickBuyItemOnClick are separate code paths that need patching.
     const sendShopState = function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      const upgrades = {};
-      for (const [p, count] of this.upgradesPurchased) {
-        upgrades[p.id] = count;
-      }
-      sync.transport.send({ t: Msg.SHOP, upgrades });
+      sync._send({ t: Msg.SHOP, upgrades: sync._serializeShopUpgrades() });
     };
-    this.ctx.patch(Shop, 'buyItemOnClick').after(function (_ret, _purchase) {
-      sendShopState.call(this);
-    });
-    this.ctx.patch(Shop, 'quickBuyItemOnClick').after(function (_ret, _purchase) {
-      sendShopState.call(this);
-    });
+    for (const m of ['buyItemOnClick', 'quickBuyItemOnClick']) {
+      this.ctx.patch(Shop, m).after(sendShopState);
+    }
+  }
+
+  _serializeShopUpgrades() {
+    const upgrades = {};
+    for (const [p, count] of game.shop.upgradesPurchased) {
+      upgrades[p.id] = count;
+    }
+    return upgrades;
   }
 
   _applyShop(msg) {
     if (!msg.upgrades || !game.shop) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyShop', () => {
       const changedPurchases = [];
       for (const [purchaseId, count] of Object.entries(msg.upgrades)) {
         const purchase = game.shop.purchases.getObjectByID(purchaseId);
@@ -1316,8 +1303,7 @@ class Sync {
       // upgrade-chain-display elements in the sidebar/etc.).
       if (game.shop.render) game.shop.render();
       this._forceRender();
-    } catch (e) { logger.error('applyShop failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Tutorial ---------------------------------------------------------
@@ -1326,28 +1312,21 @@ class Sync {
   // to avoid crashing the render system.
 
   _patchTutorial() {
-    // Broadcast after any task progress update.
-    this.ctx.patch(Tutorial, 'updateTaskProgress').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
-    });
-    // Broadcast after stage transitions.
-    this.ctx.patch(Tutorial, 'startNextStage').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
-    });
-    this.ctx.patch(Tutorial, 'completeTutorial').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
-    });
-    this.ctx.patch(TutorialStage, 'setClaimed').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
-    });
-    this.ctx.patch(Tutorial, 'skipTutorial').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
-    });
+    // Broadcast after any task progress update or stage transition.
+    const sendTutorial = () => {
+      sync._send({ t: Msg.TUTORIAL, tutorial: sync._buildTutorialState() });
+    };
+    /** @type {Array<[any, string]>} */
+    const tutorialPatches = [
+      [Tutorial, 'updateTaskProgress'],
+      [Tutorial, 'startNextStage'],
+      [Tutorial, 'completeTutorial'],
+      [TutorialStage, 'setClaimed'],
+      [Tutorial, 'skipTutorial'],
+    ];
+    for (const [C, m] of tutorialPatches) {
+      if (typeof C !== 'undefined' && typeof C.prototype[m] === 'function') this.ctx.patch(C, m).after(sendTutorial);
+    }
   }
 
   _buildTutorialState() {
@@ -1372,12 +1351,10 @@ class Sync {
     if (!msg.tutorial || !game.tutorial) return;
     const data = msg.tutorial;
     const t = game.tutorial;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyTutorial', () => {
       // Handle tutorial completion.
       if (data.complete && !t.complete) {
         try { t.completeTutorial(); } catch (e) { logger.warn('tutorial completeTutorial failed', e); }
-        this._applyingRemote = false;
         return;
       }
 
@@ -1427,13 +1404,8 @@ class Sync {
       if (t.renderProgress) {
         try { t.renderProgress(); } catch { /* noop */ }
       }
-    } catch (e) { logger.error('applyTutorial failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
-
-  // ---- Action start/stop + progress bar sync ---------------------------
-  // When one player starts an action, the other player sees the progress
-  // bar moving too. We sync the skill ID and the timer progress.
 
   // ---- Mining rock HP sync ---------------------------------------------
   // Mining rocks have HP (available ore count) that depletes as you mine.
@@ -1459,20 +1431,28 @@ class Sync {
     // actually changes, which is all we need.
   }
 
+  _serializeRockHP() {
+    const rocks = [];
+    for (const rock of game.mining.actions.allObjects) {
+      if (rock && typeof rock.currentHP === 'number') {
+        rocks.push({ id: rock.id, hp: rock.currentHP, maxHp: rock.maxHP });
+      }
+    }
+    return rocks;
+  }
+
   _sendRockHP() {
     const mining = game.mining;
     if (!mining) return;
     const rocks = [];
-    for (const rock of mining.actions.allObjects) {
-      if (rock && typeof rock.currentHP === 'number') {
-        // Only send if HP changed since last send.
-        const key = rock.id;
-        const last = this._lastRockHP ? this._lastRockHP[key] : undefined;
-        if (last !== undefined && last === rock.currentHP) continue;
-        if (!this._lastRockHP) this._lastRockHP = {};
-        this._lastRockHP[key] = rock.currentHP;
-        rocks.push({ id: rock.id, hp: rock.currentHP, maxHp: rock.maxHP });
-      }
+    for (const r of this._serializeRockHP()) {
+      // Only send if HP changed since last send.
+      const key = r.id;
+      const last = this._lastRockHP ? this._lastRockHP[key] : undefined;
+      if (last !== undefined && last === r.hp) continue;
+      if (!this._lastRockHP) this._lastRockHP = {};
+      this._lastRockHP[key] = r.hp;
+      rocks.push(r);
     }
     if (rocks.length === 0) return; // Nothing changed — don't send.
     this.transport.send({ t: Msg.ROCK_HP, rocks });
@@ -1490,8 +1470,7 @@ class Sync {
       else if (mining.activeProgressRock && mining.activeProgressRock.id) localRockId = mining.activeProgressRock.id;
     } catch { /* noop */ }
 
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyRockHP', () => {
       let changed = false;
       for (const r of msg.rocks) {
         // Skip the rock the local player is actively mining.
@@ -1506,8 +1485,7 @@ class Sync {
         if (mining.renderRockHP) mining.renderRockHP();
         if (mining.renderRockStatus) mining.renderRockStatus();
       }
-    } catch (e) { logger.error('applyRockHP failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Farming sync -----------------------------------------------------
@@ -1528,18 +1506,20 @@ class Sync {
     // (reading 'item')" when rendering some plots (e.g. recipe.seedCost.item
     // is undefined for some recipes). This crashes the entire category view
     // AND the game's main render loop. We wrap ALL update methods in
-    // try/catch so one broken plot doesn't break the rest.
-    try {
-      const wrapMethod = (proto, name) => {
-        if (!proto || !proto[name]) return false;
-        const orig = proto[name];
-        proto[name] = function (...args) {
-          try { return orig.apply(this, args); }
-          catch (e) { logger.warn(`[FARM] ${proto.constructor.name}.${name} threw: ${e.message}`); }
-        };
-        return true;
+    // try/catch so one broken plot doesn't break the rest. `label` overrides
+    // the log tag (defaults to ConstructorName.methodName).
+    const wrapMethod = (proto, name, label) => {
+      if (!proto || !proto[name]) return false;
+      const orig = proto[name];
+      const tag = label || `${proto.constructor.name}.${name}`;
+      proto[name] = function (...args) {
+        try { return orig.apply(this, args); }
+        catch (e) { logger.warn(`[FARM] ${tag} threw: ${e.message}`); }
       };
+      return true;
+    };
 
+    try {
       // Patch LockedFarmingPlotElement — used for locked plots
       const LockedPlotEl = customElements.get('locked-farming-plot');
       if (LockedPlotEl) {
@@ -1573,22 +1553,14 @@ class Sync {
     // Patch Farming.renderGrowthStatus — iterates over plot elements and
     // calls updateGrowthTime. If one throws, the rest don't get rendered.
     if (typeof Farming.prototype.renderGrowthStatus === 'function') {
-      const origRenderGrowth = Farming.prototype.renderGrowthStatus;
-      Farming.prototype.renderGrowthStatus = function () {
-        try { return origRenderGrowth.call(this); }
-        catch (e) { logger.warn(`[FARM] renderGrowthStatus threw: ${e.message}`); }
-      };
+      wrapMethod(Farming.prototype, 'renderGrowthStatus', 'renderGrowthStatus');
       logger.info('[FARM] Patched Farming.renderGrowthStatus');
     }
 
     // Patch Farming.render — the main render method called from the game
     // render loop. If it throws, the entire game UI breaks.
     if (typeof Farming.prototype.render === 'function') {
-      const origRender = Farming.prototype.render;
-      Farming.prototype.render = function () {
-        try { return origRender.call(this); }
-        catch (e) { logger.warn(`[FARM] Farming.render threw: ${e.message}`); }
-      };
+      wrapMethod(Farming.prototype, 'render', 'Farming.render');
       logger.info('[FARM] Patched Farming.render');
     }
 
@@ -1681,89 +1653,48 @@ class Sync {
       sendPlot(plot);
     };
 
-    // Planting — sync so both players plant the same seeds
-    this.ctx.patch(Farming, 'plantPlot').after(function (_ret, plot) {
-      logger.info(`[FARM] plantPlot called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
+    // Single-plot plant/harvest methods share one log format; the bulk
+    // ("...All...") methods share one send-everything callback.
+    const logSendPlot = (name) => function (_ret, plot) {
+      logger.info(`[FARM] ${name} called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
       sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'plantPlotOnClick').after(function (_ret, plot) {
-      logger.info(`[FARM] plantPlotOnClick called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'plantAllPlots').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync._sendAllFarmingPlots();
-    });
-    this.ctx.patch(Farming, 'plantAllOnClick').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync._sendAllFarmingPlots();
-    });
+    };
+    // Planting — sync so both players plant the same seeds.
+    // Harvesting — sync so both players harvest.
+    for (const m of ['plantPlot', 'plantPlotOnClick', 'harvestPlot', 'harvestPlotOnClick']) {
+      this.ctx.patch(Farming, m).after(logSendPlot(m));
+    }
     this.ctx.patch(Farming, 'plantRecipe').after(function (_ret, recipe, plot) {
       sendPlot(plot);
     });
-    this.ctx.patch(Farming, 'plantAllRecipe').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync._sendAllFarmingPlots();
-    });
-    this.ctx.patch(Farming, 'plantAllSelectedOnClick').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync._sendAllFarmingPlots();
-    });
-
-    // Harvesting — sync so both players harvest
-    this.ctx.patch(Farming, 'harvestPlot').after(function (_ret, plot) {
-      logger.info(`[FARM] harvestPlot called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'harvestPlotOnClick').after(function (_ret, plot) {
-      logger.info(`[FARM] harvestPlotOnClick called: plot=${plot ? plot.id : 'null'}, state=${plot ? plot.state : 'null'}`);
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'harvestAllOnClick').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync._sendAllFarmingPlots();
-    });
-
     // Compost — sync so both players compost (weird gloop, abyssal compost, etc.)
     this.ctx.patch(Farming, 'compostPlot').after(function (_ret, plot) {
       logger.info(`[FARM] compostPlot called: plot=${plot ? plot.id : 'null'}, compostLevel=${plot ? plot.compostLevel : 'null'}, compostItem=${plot && plot.compostItem ? plot.compostItem.id : 'null'}`);
       sendPlot(plot);
     });
-    this.ctx.patch(Farming, 'compostAllOnClick').after(function () {
+
+    // Destroy / clear / reset / selected recipe changes — same body, no logging
+    const onPlot = function (_ret, plot) { sendPlot(plot); };
+    for (const m of ['destroyPlot', 'destroyPlotOnClick', 'clearDeadPlot', 'resetPlot', 'setPlantAllSelected']) {
+      this.ctx.patch(Farming, m).after(onPlot);
+    }
+    // Compost removal
+    this._afterEach(Farming, ['removeCompostFromPlot'], onPlot);
+
+    // Bulk operations — send every plot
+    const sendAllPlots = function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync._sendAllFarmingPlots();
-    });
-    // Compost removal
-    if (typeof Farming.prototype.removeCompostFromPlot === 'function') {
-      this.ctx.patch(Farming, 'removeCompostFromPlot').after(function (_ret, plot) {
-        sendPlot(plot);
-      });
+    };
+    for (const m of ['plantAllPlots', 'plantAllOnClick', 'plantAllRecipe',
+                     'plantAllSelectedOnClick', 'harvestAllOnClick', 'compostAllOnClick']) {
+      this.ctx.patch(Farming, m).after(sendAllPlots);
     }
-
-    // Destroy / clear / reset
-    this.ctx.patch(Farming, 'destroyPlot').after(function (_ret, plot) {
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'destroyPlotOnClick').after(function (_ret, plot) {
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'clearDeadPlot').after(function (_ret, plot) {
-      sendPlot(plot);
-    });
-    this.ctx.patch(Farming, 'resetPlot').after(function (_ret, plot) {
-      sendPlot(plot);
-    });
-
     // Growth tick — send updates when plots grow
     this.ctx.patch(Farming, 'growPlots').after(function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       logger.info('[FARM] growPlots tick — sending all plots');
       sync._sendAllFarmingPlots();
-    });
-
-    // Selected recipe changes
-    this.ctx.patch(Farming, 'setPlantAllSelected').after(function (_ret, plot) {
-      sendPlot(plot);
     });
   }
 
@@ -1807,12 +1738,60 @@ class Sync {
     };
   }
 
+  // FarmingRecipe lookup — recipes live in farming.actions (a NamespaceRegistry),
+  // so getObjectByID covers every registered recipe.
+  _farmRecipe(id) {
+    if (!id || !game.farming.actions) return null;
+    return game.farming.actions.getObjectByID(id);
+  }
+
+  _stopGrowthTimer(farming, plot) {
+    const timer = farming.growthTimerMap.get(plot);
+    if (timer) {
+      try { timer.stop(); } catch { /* noop */ }
+      if (farming.growthTimers && farming.growthTimers.delete) {
+        try { farming.growthTimers.delete(timer); } catch { /* noop */ }
+      }
+      farming.growthTimerMap.delete(plot);
+    }
+  }
+
+  _ensureGrowthTimer(farming, plot, recipe, remainingMs, logTag) {
+    // Use the remaining time from the sender if available,
+    // otherwise compute the full interval.
+    let intervalMs = remainingMs || 0;
+    if (intervalMs <= 0 && farming.modifyInterval && recipe && recipe.baseInterval) {
+      try { intervalMs = farming.modifyInterval(recipe.baseInterval, recipe); }
+      catch { intervalMs = recipe.baseInterval; }
+    }
+    if (intervalMs > 0) {
+      // Remove any existing timer for this plot first
+      this._stopGrowthTimer(farming, plot);
+      // Create a new growth timer with the remaining time
+      try {
+        farming.createGrowthTimer([plot], intervalMs);
+        logger.info(`[FARM] Created ${logTag} for ${plot.id}, interval=${intervalMs}ms`);
+      } catch (e) {
+        logger.warn(`[FARM] Failed to create ${logTag}: ${e.message}`);
+      }
+    }
+  }
+
+  _queueFarmRender(farming, plot) {
+    if (farming.renderQueue) {
+      if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
+      if (farming.renderQueue.growthTime) {
+        const timer = farming.growthTimerMap.get(plot);
+        if (timer) farming.renderQueue.growthTime.add(timer);
+      }
+    }
+  }
+
   _applyFarming(msg) {
     const farming = game.farming;
     if (!farming || !msg.plots) return;
     logger.info(`[FARM] _applyFarming: received ${msg.plots.length} plots`);
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyFarming', () => {
       for (const p of msg.plots) {
         const plot = farming.plots.getObjectByID(p.id);
         if (!plot) {
@@ -1837,15 +1816,7 @@ class Sync {
         if (p.plantedRecipeId && p.state >= 2 && plot.state === 1) {
           // Other player has a crop growing, we're empty — plant it
           // FarmingRecipe is stored in farming.actions, not game.items
-          let recipe = null;
-          if (game.farming.actions) {
-            recipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
-          }
-          if (!recipe && game.farming.actions && game.farming.actions.allObjects) {
-            for (const r of game.farming.actions.allObjects) {
-              if (r.id === p.plantedRecipeId) { recipe = r; break; }
-            }
-          }
+          const recipe = this._farmRecipe(p.plantedRecipeId);
           if (recipe) {
             // Set plot state directly (don't consume seeds on the receiver)
             plot.state = p.state;
@@ -1856,40 +1827,10 @@ class Sync {
             // Create a growth timer so the UI shows the remaining time
             // and the crop eventually grows/hrows on the receiver too.
             if (p.state === 2 && farming.createGrowthTimer) {
-              // Use the remaining time from the sender if available,
-              // otherwise compute the full interval.
-              let intervalMs = p.remainingTimeMs || 0;
-              if (intervalMs <= 0 && farming.modifyInterval && recipe.baseInterval) {
-                try { intervalMs = farming.modifyInterval(recipe.baseInterval, recipe); }
-                catch { intervalMs = recipe.baseInterval; }
-              }
-              if (intervalMs > 0) {
-                // Remove any existing timer for this plot first
-                const oldTimer = farming.growthTimerMap.get(plot);
-                if (oldTimer) {
-                  try { oldTimer.stop(); } catch { /* noop */ }
-                  if (farming.growthTimers && farming.growthTimers.delete) {
-                    try { farming.growthTimers.delete(oldTimer); } catch { /* noop */ }
-                  }
-                  farming.growthTimerMap.delete(plot);
-                }
-                // Create a new growth timer with the remaining time
-                try {
-                  farming.createGrowthTimer([plot], intervalMs);
-                  logger.info(`[FARM] Created growth timer for ${p.id}, interval=${intervalMs}ms`);
-                } catch (e) {
-                  logger.warn(`[FARM] Failed to create growth timer: ${e.message}`);
-                }
-              }
+              this._ensureGrowthTimer(farming, plot, recipe, p.remainingTimeMs, 'growth timer');
             }
             // Queue render updates
-            if (farming.renderQueue) {
-              if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
-              if (farming.renderQueue.growthTime) {
-                const timer = farming.growthTimerMap.get(plot);
-                if (timer) farming.renderQueue.growthTime.add(timer);
-              }
-            }
+            this._queueFarmRender(farming, plot);
           } else {
             logger.warn(`[FARM] Recipe not found: ${p.plantedRecipeId}`);
             // Fallback: set state directly
@@ -1900,10 +1841,7 @@ class Sync {
         } else if (p.plantedRecipeId && p.state >= 2 && plot.state >= 2) {
           // Both have a crop growing — just update the remaining time
           // if the sender has a different recipe or the plot was reset
-          let recipe = null;
-          if (game.farming.actions) {
-            recipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
-          }
+          const recipe = this._farmRecipe(p.plantedRecipeId);
           if (recipe && plot.plantedRecipe !== recipe) {
             // Different recipe — update it
             plot.plantedRecipe = recipe;
@@ -1912,19 +1850,7 @@ class Sync {
           }
           // If the receiver has no timer but the sender does, create one
           if (p.state === 2 && farming.growthTimerMap && !farming.growthTimerMap.get(plot) && farming.createGrowthTimer) {
-            let intervalMs = p.remainingTimeMs || 0;
-            if (intervalMs <= 0 && farming.modifyInterval && recipe && recipe.baseInterval) {
-              try { intervalMs = farming.modifyInterval(recipe.baseInterval, recipe); }
-              catch { intervalMs = recipe.baseInterval; }
-            }
-            if (intervalMs > 0) {
-              try {
-                farming.createGrowthTimer([plot], intervalMs);
-                logger.info(`[FARM] Created missing growth timer for ${p.id}, interval=${intervalMs}ms`);
-              } catch (e) {
-                logger.warn(`[FARM] Failed to create missing growth timer: ${e.message}`);
-              }
-            }
+            this._ensureGrowthTimer(farming, plot, recipe, p.remainingTimeMs, 'missing growth timer');
           }
         } else {
           // Handle harvest, destroy, clear dead, etc.
@@ -1966,10 +1892,7 @@ class Sync {
             if (p.plantedRecipeId !== undefined) {
               // FarmingRecipe is a MasteryAction in game.farming.actions,
               // not an Item — don't fall back to game.items.
-              let plantedRecipe = null;
-              if (p.plantedRecipeId && game.farming.actions) {
-                plantedRecipe = game.farming.actions.getObjectByID(p.plantedRecipeId);
-              }
+              const plantedRecipe = this._farmRecipe(p.plantedRecipeId);
               plot.plantedRecipe = plantedRecipe || undefined;
             }
             if (typeof p.growthTime === 'number') plot.growthTime = p.growthTime;
@@ -1977,23 +1900,10 @@ class Sync {
 
           // Remove growth timer if the plot is no longer growing
           if (p.state !== 2 && farming.growthTimerMap) {
-            const timer = farming.growthTimerMap.get(plot);
-            if (timer) {
-              try { timer.stop(); } catch { /* noop */ }
-              if (farming.growthTimers && farming.growthTimers.delete) {
-                try { farming.growthTimers.delete(timer); } catch { /* noop */ }
-              }
-              farming.growthTimerMap.delete(plot);
-            }
+            this._stopGrowthTimer(farming, plot);
           }
           // Queue render updates
-          if (farming.renderQueue) {
-            if (farming.renderQueue.growthState) farming.renderQueue.growthState.add(plot);
-            if (farming.renderQueue.growthTime) {
-              const timer = farming.growthTimerMap.get(plot);
-              if (timer) farming.renderQueue.growthTime.add(timer);
-            }
-          }
+          this._queueFarmRender(farming, plot);
           logger.info(`[FARM] State update: ${p.id} ${oldState}→${p.state}`);
         }
 
@@ -2034,10 +1944,7 @@ class Sync {
         // Sync selected recipe
         if (p.selectedRecipeId !== undefined) {
           // FarmingRecipe is a MasteryAction in farming.actions, not an Item.
-          let selectedRecipe = null;
-          if (p.selectedRecipeId && farming.actions) {
-            selectedRecipe = farming.actions.getObjectByID(p.selectedRecipeId);
-          }
+          const selectedRecipe = this._farmRecipe(p.selectedRecipeId);
           plot.selectedRecipe = p.selectedRecipeId ? selectedRecipe : undefined;
         }
 
@@ -2054,8 +1961,7 @@ class Sync {
       if (farming.renderSelectedSeed) farming.renderSelectedSeed();
       if (farming.renderPlotVisibility) farming.renderPlotVisibility();
       if (farming.renderPlotUnlockQuantities) farming.renderPlotUnlockQuantities();
-    } catch (e) { logger.error('applyFarming failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Agility sync (obstacles, pillars, blueprints) -------------------
@@ -2101,82 +2007,88 @@ class Sync {
   _sendAgility() {
     const ag = game.agility;
     if (!ag) return;
-    const courses = [];
-    for (const [realm, course] of ag.courses) {
-      const obstacles = {};
-      for (const [tier, ob] of course.builtObstacles) obstacles[tier] = ob ? ob.id : null;
-      const pillars = {};
-      for (const [tier, pi] of course.builtPillars) pillars[tier] = pi ? pi.id : null;
-      // Blueprints: { name, obstacles: {tier: id}, pillars: {tier: id} }
-      const blueprints = [];
-      if (course.blueprints) for (const [slot, bp] of course.blueprints) {
-        const bpObstacles = {};
-        if (bp.obstacles) for (const [tier, ob] of bp.obstacles) bpObstacles[tier] = ob ? ob.id : null;
-        const bpPillars = {};
-        if (bp.pillars) for (const [tier, pi] of bp.pillars) bpPillars[tier] = pi ? pi.id : null;
-        blueprints.push({ slot, name: bp.name || '', obstacles: bpObstacles, pillars: bpPillars });
-      }
-      courses.push({ realmId: realm.id, obstacles, pillars, blueprints });
-    }
     // obstacleBuildCount: how many times each obstacle has been built
     const buildCounts = [];
     if (ag.obstacleBuildCount) for (const [ob, count] of ag.obstacleBuildCount) {
       buildCounts.push({ id: ob.id, count });
     }
-    this.transport.send({ t: Msg.AGILITY, courses, activeObstacle: ag.currentlyActiveObstacle, buildCounts });
+    this.transport.send({ t: Msg.AGILITY, courses: this._serializeAgilityCourses(), activeObstacle: ag.currentlyActiveObstacle, buildCounts });
+  }
+
+  _serializeAgilityCourses() {
+    const ag = game.agility;
+    const courses = [];
+    for (const [realm, course] of ag.courses) {
+      const obstacles = this._mapIdsToObj(course.builtObstacles);
+      const pillars = this._mapIdsToObj(course.builtPillars);
+      // Blueprints: { name, obstacles: {tier: id}, pillars: {tier: id} }
+      const blueprints = [];
+      if (course.blueprints) for (const [slot, bp] of course.blueprints) {
+        const bpObstacles = bp.obstacles ? this._mapIdsToObj(bp.obstacles) : {};
+        const bpPillars = bp.pillars ? this._mapIdsToObj(bp.pillars) : {};
+        blueprints.push({ slot, name: bp.name || '', obstacles: bpObstacles, pillars: bpPillars });
+      }
+      courses.push({ realmId: realm.id, obstacles, pillars, blueprints });
+    }
+    return courses;
+  }
+
+  _mapIdsToObj(map) {
+    const obj = {};
+    for (const [tier, o] of map) obj[tier] = o ? o.id : null;
+    return obj;
+  }
+
+  _idsToMap(entries, registry) {
+    const map = new Map();
+    for (const [tier, id] of Object.entries(entries || {})) {
+      if (id) {
+        const obj = registry && registry.getObjectByID(id);
+        if (obj) map.set(Number(tier), obj);
+      }
+    }
+    return map;
+  }
+
+  // Mirror a wire {tier: id} map into a built-obstacle/pillar Map. `label`
+  // is { name } for the not-found warning; `label.setLog` (obstacles only)
+  // enables the per-tier info log.
+  _syncBuiltMap(wireMap, registry, builtMap, label) {
+    for (const [tier, id] of Object.entries(wireMap)) {
+      const tierNum = Number(tier);
+      const current = builtMap.get(tierNum);
+      const currentId = current ? current.id : null;
+      if (id === currentId) continue; // already in sync
+      if (id) {
+        // AgilityObstacle/AgilityPillar are MasteryActions in ag.actions/ag.pillars, not Items.
+        const obj = registry && registry.getObjectByID(id);
+        if (!obj) { logger.warn(`[AGILITY] ${label.name} not found: ${id}`); continue; }
+        // Direct set — don't call buildObstacle()/buildPillar() because:
+        // 1. buildObstacle(obstacle) takes only 1 param (not course+tier)
+        // 2. It would consume resources (spectator shouldn't pay again)
+        // 3. We want to replicate exact state, not trigger build side-effects
+        builtMap.set(tierNum, obj);
+        if (label.setLog) logger.info(`[AGILITY] Set ${label.setLog} ${id} at tier ${tierNum}`);
+      } else {
+        // Remove obstacle/pillar at this tier
+        builtMap.delete(tierNum);
+      }
+    }
   }
 
   _applyAgility(msg) {
     const ag = game.agility;
     if (!ag || !msg.courses) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyAgility', () => {
       for (const c of msg.courses) {
         const realm = game.realms.getObjectByID(c.realmId);
         if (!realm) continue;
         const course = ag.courses.get(realm);
         if (!course) continue;
 
-        // Sync obstacles — try buildObstacle first, fall back to direct set
-        for (const [tier, obId] of Object.entries(c.obstacles)) {
-          const tierNum = Number(tier);
-          const currentOb = course.builtObstacles.get(tierNum);
-          const currentId = currentOb ? currentOb.id : null;
-          if (obId === currentId) continue; // already in sync
-
-          if (obId) {
-            // AgilityObstacle is a MasteryAction in ag.actions, not an Item.
-            const ob = ag.actions && ag.actions.getObjectByID(obId);
-            if (!ob) { logger.warn(`[AGILITY] Obstacle not found: ${obId}`); continue; }
-            // Direct set the obstacle — don't call buildObstacle() because:
-            // 1. buildObstacle(obstacle) takes only 1 param (not course+tier)
-            // 2. It would consume resources (spectator shouldn't pay again)
-            // 3. We want to replicate exact state, not trigger build side-effects
-            course.builtObstacles.set(tierNum, ob);
-            logger.info(`[AGILITY] Set obstacle ${obId} at tier ${tierNum}`);
-          } else {
-            // Remove obstacle at this tier
-            course.builtObstacles.delete(tierNum);
-          }
-        }
-
-        // Sync pillars
-        for (const [tier, piId] of Object.entries(c.pillars)) {
-          const tierNum = Number(tier);
-          const currentPi = course.builtPillars.get(tierNum);
-          const currentId = currentPi ? currentPi.id : null;
-          if (piId === currentId) continue;
-
-          if (piId) {
-            // AgilityPillar is a MasteryAction in ag.pillars, not an Item.
-            const pi = ag.pillars && ag.pillars.getObjectByID(piId);
-            if (!pi) { logger.warn(`[AGILITY] Pillar not found: ${piId}`); continue; }
-            // Direct set — same reasoning as obstacles above
-            course.builtPillars.set(tierNum, pi);
-          } else {
-            course.builtPillars.delete(tierNum);
-          }
-        }
+        // Sync obstacles/pillars — direct set (see _syncBuiltMap)
+        this._syncBuiltMap(c.obstacles, ag.actions, course.builtObstacles, { name: 'Obstacle', setLog: 'obstacle' });
+        this._syncBuiltMap(c.pillars, ag.pillars, course.builtPillars, { name: 'Pillar' });
       }
 
       // Only set active obstacle if there's actually an obstacle built at that tier
@@ -2204,20 +2116,8 @@ class Sync {
         const course = ag.courses.get(realm);
         if (!course || !course.blueprints) continue;
         for (const bp of c.blueprints) {
-          const bpObstacles = new Map();
-          for (const [tier, obId] of Object.entries(bp.obstacles || {})) {
-            if (obId) {
-              const ob = ag.actions && ag.actions.getObjectByID(obId);
-              if (ob) bpObstacles.set(Number(tier), ob);
-            }
-          }
-          const bpPillars = new Map();
-          for (const [tier, piId] of Object.entries(bp.pillars || {})) {
-            if (piId) {
-              const pi = ag.pillars && ag.pillars.getObjectByID(piId);
-              if (pi) bpPillars.set(Number(tier), pi);
-            }
-          }
+          const bpObstacles = this._idsToMap(bp.obstacles, ag.actions);
+          const bpPillars = this._idsToMap(bp.pillars, ag.pillars);
           course.blueprints.set(bp.slot, { name: bp.name, obstacles: bpObstacles, pillars: bpPillars });
         }
       }
@@ -2235,8 +2135,7 @@ class Sync {
       if (ag.render) ag.render();
       if (ag.renderBuiltObstacles) ag.renderBuiltObstacles();
       if (ag.renderCourseModifiers) ag.renderCourseModifiers();
-    } catch (e) { logger.error('applyAgility failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Astrology sync (modifier upgrades) -------------------------------
@@ -2271,44 +2170,44 @@ class Sync {
   _sendAstrology() {
     const as = game.astrology;
     if (!as) return;
+    let upgrades = [];
+    try { upgrades = this._serializeAstrologyUpgrades(); } catch { /* noop */ }
+    this.transport.send({ t: Msg.ASTROLOGY, upgrades });
+  }
+
+  _serializeAstrologyUpgrades() {
+    const as = game.astrology;
     const upgrades = [];
     // Astrology has no aggregated *ModifierUpgrades arrays — the upgrade
     // state (timesBought) is stored directly on the AstrologyModifier
     // objects in each recipe's standardModifiers/uniqueModifiers/
     // abyssalModifiers arrays.
-    try {
-      if (as.actions) {
-        for (const recipe of as.actions.allObjects) {
-          for (const type of ['standardModifiers', 'uniqueModifiers', 'abyssalModifiers']) {
-            const mods = recipe[type];
-            if (!mods) continue;
-            const tName = type === 'standardModifiers' ? 'standard' : (type === 'uniqueModifiers' ? 'unique' : 'abyssal');
-            for (let i = 0; i < mods.length; i++) {
-              const m = mods[i];
-              if (m && typeof m.timesBought === 'number' && m.timesBought > 0) {
-                upgrades.push({ recipeId: recipe.id, tier: i, timesBought: m.timesBought, type: tName });
-              }
+    if (as.actions) {
+      for (const recipe of as.actions.allObjects) {
+        for (const type of ['standardModifiers', 'uniqueModifiers', 'abyssalModifiers']) {
+          const mods = recipe[type];
+          if (!mods) continue;
+          const tName = type === 'standardModifiers' ? 'standard' : (type === 'uniqueModifiers' ? 'unique' : 'abyssal');
+          for (let i = 0; i < mods.length; i++) {
+            const m = mods[i];
+            if (m && typeof m.timesBought === 'number' && m.timesBought > 0) {
+              upgrades.push({ recipeId: recipe.id, tier: i, timesBought: m.timesBought, type: tName });
             }
           }
         }
       }
-    } catch { /* noop */ }
-    this.transport.send({ t: Msg.ASTROLOGY, upgrades });
+    }
+    return upgrades;
   }
 
   _applyAstrology(msg) {
     const as = game.astrology;
     if (!as || !msg.upgrades) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyAstrology', () => {
       for (const u of msg.upgrades) {
         const recipe = as.actions.getObjectByID(u.recipeId);
         if (!recipe) continue;
         const type = u.type || 'standard';
-        // Astrology has no standardModifierUpgrades/uniqueModifierUpgrades/
-        // abyssalModifierUpgrades arrays — the upgrade state (timesBought) is
-        // stored directly on the AstrologyModifier objects in the recipe's
-        // standardModifiers/uniqueModifiers/abyssalModifiers arrays.
         const arr = type === 'standard' ? recipe.standardModifiers
           : (type === 'unique' ? recipe.uniqueModifiers : recipe.abyssalModifiers);
         if (arr && arr[u.tier]) arr[u.tier].timesBought = Math.max(arr[u.tier].timesBought || 0, u.timesBought);
@@ -2317,15 +2216,13 @@ class Sync {
       if (as.computeProvidedStats) try { as.computeProvidedStats(); } catch { /* noop */ }
       if (as.addProvidedStats) try { as.addProvidedStats(); } catch { /* noop */ }
       if (as.render) as.render();
-    } catch (e) { logger.error('applyAstrology failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   _applyAstrologySelect(msg) {
     const as = game.astrology;
     if (!as) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyAstrologySelect', () => {
       if (msg.studiedId !== undefined) {
         as.studiedConstellation = msg.studiedId ? as.actions.getObjectByID(msg.studiedId) : undefined;
       }
@@ -2334,8 +2231,7 @@ class Sync {
       }
       if (as.render) try { as.render(); } catch { /* noop */ }
       if (as.renderVisibleConstellations) try { as.renderVisibleConstellations(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyAstrologySelect failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Summoning sync (marks unlocked, selected costs) -----------------
@@ -2360,6 +2256,11 @@ class Sync {
   _sendSummoning() {
     const su = game.summoning;
     if (!su) return;
+    this.transport.send({ t: Msg.SUMMONING, ...this._serializeSummoning() });
+  }
+
+  _serializeSummoning() {
+    const su = game.summoning;
     const marks = [];
     if (su.marksUnlocked) {
       for (const [recipe, count] of su.marksUnlocked) {
@@ -2372,14 +2273,13 @@ class Sync {
         if (recipe && recipe.id) costs.push({ recipeId: recipe.id, itemId: item ? item.id : null });
       }
     }
-    this.transport.send({ t: Msg.SUMMONING, marks, costs });
+    return { marks, costs };
   }
 
   _applySummoning(msg) {
     const su = game.summoning;
     if (!su) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applySummoning', () => {
       if (msg.marks && su.marksUnlocked) {
         for (const m of msg.marks) {
           const recipe = su.actions.getObjectByID(m.recipeId);
@@ -2408,14 +2308,12 @@ class Sync {
         }
       }
       if (su.render) su.render();
-    } catch (e) { logger.error('applySummoning failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Slayer sync (task state) -----------------------------------------
   _patchSlayer() {
-    const sl = game.slayer;
-    if (!sl || !game.combat.slayerTask) return;
+    if (!game.slayer || !game.combat.slayerTask) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       this._sendSlayer();
@@ -2428,25 +2326,25 @@ class Sync {
   }
 
   _sendSlayer() {
-    const sl = game.slayer;
-    if (!sl || !game.combat.slayerTask) return;
+    if (!game.slayer || !game.combat.slayerTask) return;
+    this.transport.send({ t: Msg.SLAYER, ...this._serializeSlayerTask() });
+  }
+
+  _serializeSlayerTask() {
     const t = game.combat.slayerTask;
-    this.transport.send({
-      t: Msg.SLAYER,
+    return {
       active: t.active,
       monsterId: t.monster ? t.monster.id : null,
       killsLeft: t.killsLeft,
       extended: t.extended,
       realmId: t.realm ? t.realm.id : null,
       categoryId: t.category ? t.category.id : null,
-    });
+    };
   }
 
   _applySlayer(msg) {
-    const sl = game.slayer;
-    if (!sl || !game.combat.slayerTask) return;
-    this._applyingRemote = true;
-    try {
+    if (!game.slayer || !game.combat.slayerTask) return;
+    this._applyRemote('applySlayer', () => {
       const t = game.combat.slayerTask;
       const remoteMonster = msg.monsterId ? game.monsters.getObjectByID(msg.monsterId) : undefined;
       const isNewTask = !t.monster || !remoteMonster || t.monster.id !== remoteMonster.id;
@@ -2478,117 +2376,151 @@ class Sync {
       }
       if (t.render) t.render();
       if (t.renderTask) t.renderTask();
-    } catch (e) { logger.error('applySlayer failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Skill selections sync (cooking, woodcutting, firemaking, etc.) ---
-  _patchSkillSelections() {
-    // Cooking: selected recipes per category
+  _serializeCookingSelection() {
     const cook = game.cooking;
-    if (cook) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const recipes = [];
-        if (cook.selectedRecipes) {
-          for (const [cat, r] of cook.selectedRecipes) {
-            recipes.push({ catId: cat.id, recipeId: r ? r.id : null });
-          }
-        }
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Cooking', recipes });
-      };
-      for (const m of ['onRecipeSelectionClick', 'onActiveCookButtonClick', 'onPassiveCookButtonClick']) {
-        if (typeof Cooking.prototype[m] === 'function') this.ctx.patch(Cooking, m).after(() => send());
+    const recipes = [];
+    if (cook.selectedRecipes) {
+      for (const [cat, r] of cook.selectedRecipes) {
+        recipes.push({ catId: cat.id, recipeId: r ? r.id : null });
       }
     }
+    return { recipes };
+  }
 
+  _serializeFiremakingSelection() {
+    const fm = game.firemaking;
+    return {
+      recipeId: fm.selectedRecipe ? fm.selectedRecipe.id : null,
+      oilId: fm.selectedOil ? fm.selectedOil.id : null,
+      bonfireId: fm.litBonfireRecipe ? fm.litBonfireRecipe.id : null,
+    };
+  }
+
+  _serializeFishingSelection() {
+    const fish = game.fishing;
+    const areaFish = [];
+    if (fish.selectedAreaFish) {
+      for (const [area, f] of fish.selectedAreaFish) {
+        areaFish.push({ areaId: area.id, fishId: f ? f.id : null });
+      }
+    }
+    return { areaFish };
+  }
+
+  _serializeThievingSelection() {
+    const th = game.thieving;
+    return {
+      areaId: th.currentArea ? th.currentArea.id : null,
+      npcId: th.currentNPC ? th.currentNPC.id : null,
+    };
+  }
+
+  _serializeAltMagicSelection() {
+    const am = game.altMagic;
+    return {
+      spellId: am.selectedSpell ? am.selectedSpell.id : null,
+      smithingRecipeId: am.selectedSmithingRecipe ? am.selectedSmithingRecipe.id : null,
+      conversionItemId: am.selectedConversionItem ? am.selectedConversionItem.id : null,
+    };
+  }
+
+  _serializeFletchingSelection() {
+    const fl = game.fletching;
+    const altRecipes = [];
+    if (fl.setAltRecipes) {
+      for (const [recipe, idx] of fl.setAltRecipes) {
+        altRecipes.push({ recipeId: recipe.id, altIndex: idx });
+      }
+    }
+    return { altRecipes };
+  }
+
+  // Generic artisan skill (Herblore, Smithing, Crafting, Runecrafting, Fletching)
+  _serializeArtisanSelection(sk) {
+    // selectedRecipeInRealm: Map<Realm, Recipe>
+    const artisanRecipes = [];
+    for (const [realm, recipe] of sk.selectedRecipeInRealm) {
+      artisanRecipes.push({ realmId: realm.id, recipeId: recipe ? recipe.id : null });
+    }
+    return {
+      artisanRecipes,
+      selectedRecipeId: sk.selectedRecipe ? sk.selectedRecipe.id : null,
+    };
+  }
+
+  _serializeVeins() {
+    const hv = game.harvesting;
+    const veins = [];
+    if (hv.actions) for (const v of hv.actions.allObjects) {
+      if (typeof v.currentIntensity === 'number') veins.push({ id: v.id, intensity: v.currentIntensity, max: v.maxIntensity });
+    }
+    return veins;
+  }
+
+  _serializeHarvestingSelection() {
+    const hv = game.harvesting;
+    return {
+      veinId: hv.selectedVein ? hv.selectedVein.id : null,
+      veins: this._serializeVeins(),
+    };
+  }
+
+  _serializeArchaeology() {
+    const ar = game.archaeology;
+    const digSites = [];
+    if (ar.actions) for (const ds of ar.actions.allObjects) {
+      digSites.push({
+        id: ds.id,
+        mapIndex: ds.selectedMapIndex,
+        tools: (ds.selectedTools || []).map(t => t ? t.id : null),
+      });
+    }
+    const donatedItems = [];
+    if (ar.museum && ar.museum.donatedItems) for (const item of ar.museum.donatedItems) donatedItems.push(item.id);
+    const museumRewards = [];
+    if (ar.museum && ar.museum.rewards) for (const rw of ar.museum.rewards.allObjects) {
+      if (rw.awarded) museumRewards.push(rw.id);
+    }
+    return { digSites, donatedItems, museumRewards };
+  }
+
+  _patchSkillSelections() {
     // Woodcutting: active trees are NOT synced — tree selection is a
     // per-player UI choice. Syncing activeTrees corrupts the receiver's
     // woodcutting state (trees set without the action being started,
     // causing -Infinity tick crashes when trees are deselected).
-
-    // Firemaking: selected log, oil, bonfire
-    const fm = game.firemaking;
-    if (fm) {
+    const simpleSkills = [
+      // Cooking: selected recipes per category
+      { sk: game.cooking, Cls: Cooking, skillId: 'melvorD:Cooking', ser: () => this._serializeCookingSelection(),
+        methods: ['onRecipeSelectionClick', 'onActiveCookButtonClick', 'onPassiveCookButtonClick'] },
+      // Firemaking: selected log, oil, bonfire
+      { sk: game.firemaking, Cls: Firemaking, skillId: 'melvorD:Firemaking', ser: () => this._serializeFiremakingSelection(),
+        methods: ['selectLog', 'selectOil', 'lightBonfire', 'oilMyLog'] },
+      // Fishing: selected area fish
+      { sk: game.fishing, Cls: Fishing, skillId: 'melvorD:Fishing', ser: () => this._serializeFishingSelection(),
+        methods: ['onAreaStartButtonClick', 'onAreaFishSelection'] },
+      // Thieving: selected area/NPC
+      { sk: game.thieving, Cls: Thieving, skillId: 'melvorD:Thieving', ser: () => this._serializeThievingSelection(),
+        methods: ['onAreaHeaderClick', 'onNPCPanelSelection', 'startThieving'] },
+      // Alt Magic: selected spell, recipe, item
+      { sk: game.altMagic, Cls: AltMagic, skillId: 'melvorD:AltMagic', ser: () => this._serializeAltMagicSelection(),
+        methods: ['selectSpellOnClick', 'selectItemOnClick', 'selectBarOnClick'] },
+      // Fletching: alt recipe selection
+      { sk: game.fletching, Cls: Fletching, skillId: 'melvorD:Fletching', ser: () => this._serializeFletchingSelection(),
+        methods: ['selectAltRecipeOnClick'] },
+    ];
+    for (const { sk, Cls, skillId, ser, methods } of simpleSkills) {
+      if (!sk) continue;
       const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        this.transport.send({
-          t: Msg.SKILL_SELECT, skillId: 'melvorD:Firemaking',
-          recipeId: fm.selectedRecipe ? fm.selectedRecipe.id : null,
-          oilId: fm.selectedOil ? fm.selectedOil.id : null,
-          bonfireId: fm.litBonfireRecipe ? fm.litBonfireRecipe.id : null,
-        });
+        this._send({ t: Msg.SKILL_SELECT, skillId, ...ser() });
       };
-      for (const m of ['selectLog', 'selectOil', 'lightBonfire', 'oilMyLog']) {
-        if (typeof Firemaking.prototype[m] === 'function') this.ctx.patch(Firemaking, m).after(() => send());
+      for (const m of methods) {
+        if (typeof Cls.prototype[m] === 'function') this.ctx.patch(Cls, m).after(() => send());
       }
-    }
-
-    // Fishing: selected area fish
-    const fish = game.fishing;
-    if (fish) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const sel = [];
-        if (fish.selectedAreaFish) {
-          for (const [area, f] of fish.selectedAreaFish) {
-            sel.push({ areaId: area.id, fishId: f ? f.id : null });
-          }
-        }
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Fishing', areaFish: sel });
-      };
-      for (const m of ['onAreaStartButtonClick', 'onAreaFishSelection']) {
-        if (typeof Fishing.prototype[m] === 'function') this.ctx.patch(Fishing, m).after(() => send());
-      }
-    }
-
-    // Thieving: selected area/NPC
-    const th = game.thieving;
-    if (th) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        this.transport.send({
-          t: Msg.SKILL_SELECT, skillId: 'melvorD:Thieving',
-          areaId: th.currentArea ? th.currentArea.id : null,
-          npcId: th.currentNPC ? th.currentNPC.id : null,
-        });
-      };
-      for (const m of ['onAreaHeaderClick', 'onNPCPanelSelection', 'startThieving']) {
-        if (typeof Thieving.prototype[m] === 'function') this.ctx.patch(Thieving, m).after(() => send());
-      }
-    }
-
-    // Alt Magic: selected spell, recipe, item
-    const am = game.altMagic;
-    if (am) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        this.transport.send({
-          t: Msg.SKILL_SELECT, skillId: 'melvorD:AltMagic',
-          spellId: am.selectedSpell ? am.selectedSpell.id : null,
-          smithingRecipeId: am.selectedSmithingRecipe ? am.selectedSmithingRecipe.id : null,
-          conversionItemId: am.selectedConversionItem ? am.selectedConversionItem.id : null,
-        });
-      };
-      for (const m of ['selectSpellOnClick', 'selectItemOnClick', 'selectBarOnClick']) {
-        if (typeof AltMagic.prototype[m] === 'function') this.ctx.patch(AltMagic, m).after(() => send());
-      }
-    }
-
-    // Fletching: alt recipe selection
-    const fl = game.fletching;
-    if (fl) {
-      const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const alts = [];
-        if (fl.setAltRecipes) {
-          for (const [recipe, idx] of fl.setAltRecipes) {
-            alts.push({ recipeId: recipe.id, altIndex: idx });
-          }
-        }
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Fletching', altRecipes: alts });
-      };
-      if (typeof Fletching.prototype.selectAltRecipeOnClick === 'function') this.ctx.patch(Fletching, 'selectAltRecipeOnClick').after(() => send());
     }
 
     // Generic artisan skill recipe selection sync (Herblore, Smithing, Crafting, Runecrafting, Fletching)
@@ -2597,16 +2529,9 @@ class Sync {
       const sk = game[skillName];
       if (!sk || !sk.selectedRecipeInRealm) continue;
       const sendArtisan = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const recipes = [];
-        // selectedRecipeInRealm: Map<Realm, Recipe>
-        for (const [realm, recipe] of sk.selectedRecipeInRealm) {
-          recipes.push({ realmId: realm.id, recipeId: recipe ? recipe.id : null });
-        }
-        this.transport.send({
+        this._send({
           t: Msg.SKILL_SELECT, skillId: `melvorD:${skillName.charAt(0).toUpperCase() + skillName.slice(1)}`,
-          artisanRecipes: recipes,
-          selectedRecipeId: sk.selectedRecipe ? sk.selectedRecipe.id : null,
+          ...this._serializeArtisanSelection(sk),
         });
       };
       const proto = sk.constructor.prototype;
@@ -2621,15 +2546,9 @@ class Sync {
     const hv = game.harvesting;
     if (hv) {
       const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const veins = [];
-        if (hv.actions) for (const v of hv.actions.allObjects) {
-          if (typeof v.currentIntensity === 'number') veins.push({ id: v.id, intensity: v.currentIntensity, max: v.maxIntensity });
-        }
-        this.transport.send({
+        this._send({
           t: Msg.SKILL_SELECT, skillId: 'melvorD:Harvesting',
-          veinId: hv.selectedVein ? hv.selectedVein.id : null,
-          veins,
+          ...this._serializeHarvestingSelection(),
         });
       };
       // Throttle intensity updates — reduceVeinIntensity fires every action tick
@@ -2652,22 +2571,7 @@ class Sync {
     const ar = game.archaeology;
     if (ar) {
       const send = () => {
-        if (this._applyingRemote || !this.transport.isConnected) return;
-        const digSites = [];
-        if (ar.actions) for (const ds of ar.actions.allObjects) {
-          digSites.push({
-            id: ds.id,
-            mapIndex: ds.selectedMapIndex,
-            tools: (ds.selectedTools || []).map(t => t ? t.id : null),
-          });
-        }
-        const donated = [];
-        if (ar.museum && ar.museum.donatedItems) for (const item of ar.museum.donatedItems) donated.push(item.id);
-        const museumRewards = [];
-        if (ar.museum && ar.museum.rewards) for (const rw of ar.museum.rewards.allObjects) {
-          if (rw.awarded) museumRewards.push(rw.id);
-        }
-        this.transport.send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Archaeology', digSites, donatedItems: donated, museumRewards });
+        this._send({ t: Msg.SKILL_SELECT, skillId: 'melvorD:Archaeology', ...this._serializeArchaeology() });
       };
       for (const m of ['setMapAsActive', 'toggleTool', 'setToolAsActive', 'startDigging']) {
         if (typeof Archaeology.prototype[m] === 'function') this.ctx.patch(Archaeology, m).after(() => send());
@@ -2915,8 +2819,7 @@ class Sync {
   _applyPlayerState(msg) {
     const p = game.combat.player;
     if (!p) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyPlayerState', () => {
       // Prayer / soul points
       if (typeof msg.prayerPoints === 'number') p.prayerPoints = msg.prayerPoints;
       if (typeof msg.soulPoints === 'number') p.soulPoints = msg.soulPoints;
@@ -2965,25 +2868,17 @@ class Sync {
         if (p.render) p.render();
       }
 
-      // Attack spell
-      if (msg.attackSpellId !== undefined) {
-        if (msg.attackSpellId) {
-          const spell = game.attackSpells.getObjectByID(msg.attackSpellId);
-          if (spell && p.selectAttackSpell) p.selectAttackSpell(spell, false);
-        }
-      }
-      // Curse spell
-      if (msg.curseSpellId !== undefined) {
-        if (msg.curseSpellId) {
-          const spell = game.curseSpells.getObjectByID(msg.curseSpellId);
-          if (spell && p.toggleCurse) p.toggleCurse(spell, false);
-        }
-      }
-      // Aurora spell
-      if (msg.auroraSpellId !== undefined) {
-        if (msg.auroraSpellId) {
-          const spell = game.auroraSpells.getObjectByID(msg.auroraSpellId);
-          if (spell && p.toggleAurora) p.toggleAurora(spell, false);
+      // Attack / curse / aurora spells
+      /** @type {Array<[string, any, string]>} */
+      const spellPatches = [
+        ['attackSpellId', game.attackSpells, 'selectAttackSpell'],
+        ['curseSpellId', game.curseSpells, 'toggleCurse'],
+        ['auroraSpellId', game.auroraSpells, 'toggleAurora'],
+      ];
+      for (const [field, registry, method] of spellPatches) {
+        if (msg[field] !== undefined && msg[field]) {
+          const spell = registry.getObjectByID(msg[field]);
+          if (spell && p[method]) p[method](spell, false);
         }
       }
 
@@ -3003,8 +2898,7 @@ class Sync {
         p.renderQueue.auroraSelection = true;
       }
       if (p.render) p.render();
-    } catch (e) { logger.error('applyPlayerState failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Combat area completion sync --------------------------------------
@@ -3028,27 +2922,7 @@ class Sync {
   _sendCombatAreas() {
     const cm = game.combat;
     if (!cm) return;
-    const completions = [];
-    // Dungeons — stored in cm.dungeonCompletion (Map<Dungeon, number>)
-    if (cm.dungeonCompletion) {
-      for (const [d, count] of cm.dungeonCompletion) completions.push({ id: d.id, count, kind: 'dungeon' });
-    }
-    // Abyss depths — AbyssDepth.timesCompleted is a save-state field on each depth
-    if (game.abyssDepths) {
-      for (const depth of game.abyssDepths.allObjects) {
-        if (depth && typeof depth.timesCompleted === 'number') {
-          completions.push({ id: depth.id, count: depth.timesCompleted, kind: 'abyssDepth' });
-        }
-      }
-    }
-    // Strongholds — Stronghold.timesCompleted is a save-state field on each stronghold
-    if (game.strongholds) {
-      for (const sh of game.strongholds.allObjects) {
-        if (sh && typeof sh.timesCompleted === 'number') {
-          completions.push({ id: sh.id, count: sh.timesCompleted, kind: 'stronghold' });
-        }
-      }
-    }
+    const completions = this._serializeCombatAreas();
     // Also sync the current stronghold tier and area progress so the peer
     // sees the same combat location state.
     const extra = {};
@@ -3057,22 +2931,41 @@ class Sync {
     this.transport.send({ t: Msg.COMBAT_AREA, completions, ...extra });
   }
 
+  _serializeCombatAreas() {
+    const cm = game.combat;
+    const completions = [];
+    // Dungeons — stored in cm.dungeonCompletion (Map<Dungeon, number>)
+    if (cm.dungeonCompletion) {
+      for (const [d, count] of cm.dungeonCompletion) completions.push({ id: d.id, count, kind: 'dungeon' });
+    }
+    // Abyss depths / Strongholds — timesCompleted is a save-state field on each object
+    /** @type {Array<[any, string]>} */
+    const completionRegistries = [[game.abyssDepths, 'abyssDepth'], [game.strongholds, 'stronghold']];
+    for (const [registry, kind] of completionRegistries) {
+      if (registry) {
+        for (const obj of registry.allObjects) {
+          if (obj && typeof obj.timesCompleted === 'number') {
+            completions.push({ id: obj.id, count: obj.timesCompleted, kind });
+          }
+        }
+      }
+    }
+    return completions;
+  }
+
   _applyCombatArea(msg) {
     const cm = game.combat;
     if (!cm || !msg.completions) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCombatArea', () => {
       for (const c of msg.completions) {
         const kind = c.kind || 'dungeon';
         if (kind === 'dungeon') {
           const d = game.dungeons.getObjectByID(c.id);
           if (d && cm.dungeonCompletion) cm.dungeonCompletion.set(d, Math.max(cm.dungeonCompletion.get(d) || 0, c.count));
-        } else if (kind === 'abyssDepth') {
-          const depth = game.abyssDepths && game.abyssDepths.getObjectByID(c.id);
-          if (depth) depth.timesCompleted = Math.max(depth.timesCompleted || 0, c.count);
-        } else if (kind === 'stronghold') {
-          const sh = game.strongholds && game.strongholds.getObjectByID(c.id);
-          if (sh) sh.timesCompleted = Math.max(sh.timesCompleted || 0, c.count);
+        } else if (kind === 'abyssDepth' || kind === 'stronghold') {
+          const registry = kind === 'abyssDepth' ? game.abyssDepths : game.strongholds;
+          const obj = registry && registry.getObjectByID(c.id);
+          if (obj) obj.timesCompleted = Math.max(obj.timesCompleted || 0, c.count);
         }
       }
       // Sync stronghold tier + area progress.
@@ -3084,8 +2977,7 @@ class Sync {
       }
       if (cm.render) try { cm.render(); } catch { /* noop */ }
       if (cm.renderCompletionCount) try { cm.renderCompletionCount(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyCombatArea failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Combat Event system sync (Into the Mist, Spider Lair, etc.) ------
@@ -3108,8 +3000,12 @@ class Sync {
   _sendCombatEventState() {
     const cm = game.combat;
     if (!cm) return;
+    this.transport.send({ t: Msg.COMBAT_EVENT_STATE, ...this._serializeCombatEventState() });
+  }
+
+  _serializeCombatEventState() {
+    const cm = game.combat;
     const data = {
-      t: Msg.COMBAT_EVENT_STATE,
       activeEventId: cm.activeEvent ? cm.activeEvent.id : null,
       eventProgress: cm.eventProgress,
       eventDungeonLength: cm.eventDungeonLength,
@@ -3124,14 +3020,13 @@ class Sync {
         if (area && area.id) data.activeEventAreas.push({ areaId: area.id, count });
       }
     }
-    this.transport.send(data);
+    return data;
   }
 
   _applyCombatEventState(msg) {
     const cm = game.combat;
     if (!cm) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCombatEventState', () => {
       if (msg.activeEventId !== undefined) {
         if (msg.activeEventId === null) {
           cm.activeEvent = undefined;
@@ -3171,17 +3066,54 @@ class Sync {
       }
       if (cm.renderEventMenu) try { cm.renderEventMenu(); } catch { /* noop */ }
       if (cm.renderEventAreas) try { cm.renderEventAreas(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyCombatEventState failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Combat event sync (damage, healing, monster selection) ------------
+  // Wrap proto methods that add loot/currency: snapshot `diffFn.before()`,
+  // run the original, then `diffFn.after(before)` broadcasts the delta.
+  // `skipWhenPeer: true` mirrors the "skip when spectating" early return.
+  _wrapLootDiff(proto, methods, diffFn) {
+    const sync = this;
+    for (const m of methods) {
+      if (typeof proto[m] !== 'function') continue;
+      const orig = proto[m];
+      proto[m] = function (...args) {
+        if (diffFn.skipWhenPeer && sync._combatOwner === 'peer') return; // skip when spectating
+        const before = diffFn.before();
+        try { orig.apply(this, args); } catch (e) { /* skip */ }
+        diffFn.after(before);
+      };
+    }
+  }
+
+  // Replace a CombatManager method with a guarded version that never throws:
+  // optional spectating/invalid-arg skip, then try/catch around the original.
+  /**
+   * @param {any} Proto class whose prototype method gets replaced
+   * @param {string} m method name
+   * @param {{ skipWhenPeer?: boolean, skipLog?: string | null, skipIf?: null | ((...args: any[]) => boolean), label?: string }} [opts]
+   */
+  _safeOverride(Proto, m, { skipWhenPeer = false, skipLog = null, skipIf = null, label = m } = {}) {
+    if (typeof Proto.prototype[m] !== 'function') return;
+    const orig = Proto.prototype[m];
+    const sync = this;
+    Proto.prototype[m] = function (...args) {
+      if (skipWhenPeer && sync._combatOwner === 'peer') {
+        if (skipLog) logger.info(skipLog);
+        return;
+      }
+      if (skipIf && skipIf(...args)) return;
+      try { return orig.apply(this, args); }
+      catch (e) { logger.warn(`${label} caught: ${e.message}`); }
+    };
+  }
+
   _patchCombatEvents() {
-    const cm = game.combat;
-    if (!cm) return;
+    if (!game.combat) return;
     const sync = this;
 
-    // Throttle: send at most every 100ms to avoid flooding
+    // Throttle: send at most every 80ms to avoid flooding
     let lastSend = 0;
     const sendCombatEvent = (data) => {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
@@ -3319,11 +3251,9 @@ class Sync {
     }
 
     // Patch dropEnemyCurrency — sync currency drops to spectator
-    if (typeof CombatManager.prototype.dropEnemyCurrency === 'function') {
-      const origDropCurrency = CombatManager.prototype.dropEnemyCurrency;
-      CombatManager.prototype.dropEnemyCurrency = function (monster) {
-        const gpBefore = game.gp ? game.gp.amount : 0;
-        try { origDropCurrency.call(this, monster); } catch (e) { /* skip */ }
+    this._wrapLootDiff(CombatManager.prototype, ['dropEnemyCurrency'], {
+      before: () => (game.gp ? game.gp.amount : 0),
+      after: (gpBefore) => {
         // If we're the attacker, sync currency gained
         if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
           const gpAfter = game.gp ? game.gp.amount : 0;
@@ -3332,33 +3262,32 @@ class Sync {
             sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: 'melvorD:GP', quantity: gpGained });
           }
         }
-      };
-    }
+      },
+    });
 
     // Patch dropEnemyBones, dropBarrierDust, dropSignetHalfB, dropBirthdayPresent
     // These add items directly to bank (not via CombatLoot), so sync them.
-    for (const m of ['dropEnemyBones', 'dropBarrierDust', 'dropSignetHalfB', 'dropBirthdayPresent']) {
-      if (typeof CombatManager.prototype[m] === 'function') {
-        const orig = CombatManager.prototype[m];
-        CombatManager.prototype[m] = function (...args) {
-          if (sync._combatOwner === 'peer') return; // skip when spectating
-          const bankBefore = new Map();
-          try { for (const [item, bi] of game.bank.items) bankBefore.set(item.id, bi.quantity); } catch { /* skip */ }
-          try { orig.apply(this, args); } catch (e) { /* skip */ }
-          // Sync any items that were added
-          if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
-            try {
-              for (const [item, bi] of game.bank.items) {
-                const before = bankBefore.get(item.id) || 0;
-                if (bi.quantity > before) {
-                  sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: item.id, quantity: bi.quantity - before });
-                }
+    this._wrapLootDiff(CombatManager.prototype, ['dropEnemyBones', 'dropBarrierDust', 'dropSignetHalfB', 'dropBirthdayPresent'], {
+      skipWhenPeer: true,
+      before: () => {
+        const bankBefore = new Map();
+        try { for (const [item, bi] of game.bank.items) bankBefore.set(item.id, bi.quantity); } catch { /* skip */ }
+        return bankBefore;
+      },
+      after: (bankBefore) => {
+        // Sync any items that were added
+        if (sync._combatOwner === 'me' && !sync._applyingRemote && sync.transport.isConnected) {
+          try {
+            for (const [item, bi] of game.bank.items) {
+              const before = bankBefore.get(item.id) || 0;
+              if (bi.quantity > before) {
+                sync.transport.send({ t: Msg.COMBAT_LOOT, itemId: item.id, quantity: bi.quantity - before });
               }
-            } catch { /* skip */ }
-          }
-        };
-      }
-    }
+            }
+          } catch { /* skip */ }
+        }
+      },
+    });
 
     // Note: When spectating (_combatOwner === 'peer'), the local game still
     // runs combat ticks. The spectator's player attacks are neutralized
@@ -3388,44 +3317,27 @@ class Sync {
 
     // Patch rewardSlayerTaskCurrency — prevent crash when slayer task category
     // is undefined (happens when monster was selected remotely)
-    if (typeof CombatManager.prototype.rewardSlayerTaskCurrency === 'function') {
-      const orig = CombatManager.prototype.rewardSlayerTaskCurrency;
-      CombatManager.prototype.rewardSlayerTaskCurrency = function (category) {
-        if (!category || !category.currencyRewards) return; // skip if invalid
-        try { return orig.call(this, category); }
-        catch (e) { logger.warn(`rewardSlayerTaskCurrency caught: ${e.message}`); }
-      };
-    }
+    this._safeOverride(CombatManager, 'rewardSlayerTaskCurrency', {
+      skipIf: (category) => !category || !category.currencyRewards, // skip if invalid
+      label: 'rewardSlayerTaskCurrency',
+    });
 
     // Also patch rewardForEnemyDeath — when spectating, skip local loot
     // generation entirely. The spectator only gets loot via COMBAT_LOOT
     // sync messages from the attacker. This prevents double items.
-    if (typeof CombatManager.prototype.rewardForEnemyDeath === 'function') {
-      const orig2 = CombatManager.prototype.rewardForEnemyDeath;
-      CombatManager.prototype.rewardForEnemyDeath = function (monster, area) {
-        // Skip all local rewards when spectating
-        if (sync._combatOwner === 'peer') {
-          logger.info(`[COMBAT] Spectator: skipping local rewardForEnemyDeath`);
-          return;
-        }
-        try { return orig2.call(this, monster, area); }
-        catch (e) { logger.warn(`rewardForEnemyDeath caught: ${e.message}`); }
-      };
-    }
+    this._safeOverride(CombatManager, 'rewardForEnemyDeath', {
+      skipWhenPeer: true,
+      skipLog: '[COMBAT] Spectator: skipping local rewardForEnemyDeath',
+      label: 'rewardForEnemyDeath',
+    });
 
     // Patch loadNextEnemy — prevent crash when area/monster not selected
     // AND skip when spectating (attacker handles enemy spawning)
-    if (typeof CombatManager.prototype.loadNextEnemy === 'function') {
-      const orig3 = CombatManager.prototype.loadNextEnemy;
-      CombatManager.prototype.loadNextEnemy = function () {
-        if (sync._combatOwner === 'peer') {
-          logger.info(`[COMBAT] Spectator: skipping loadNextEnemy`);
-          return;
-        }
-        try { return orig3.call(this); }
-        catch (e) { logger.warn(`loadNextEnemy caught: ${e.message}`); }
-      };
-    }
+    this._safeOverride(CombatManager, 'loadNextEnemy', {
+      skipWhenPeer: true,
+      skipLog: '[COMBAT] Spectator: skipping loadNextEnemy',
+      label: 'loadNextEnemy',
+    });
 
     // Note: When spectating (_combatOwner === 'peer'), the spectator's combat
     // is NOT started (we don't call selectMonster). The spectator can do other
@@ -3470,8 +3382,7 @@ class Sync {
   _applyCombatEvent(msg) {
     const cm = game.combat;
     if (!cm) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCombatEvent', () => {
       if (msg.kind === 'state') {
         // State sync — just update HP, don't re-select monster
         // Monster selection is handled by COMBAT_CLAIM, not state sync
@@ -3485,42 +3396,25 @@ class Sync {
           cm.player.hitpoints = msg.playerHp;
         }
         this._renderCombat();
-      } else if (msg.kind === 'damage') {
+      } else if (msg.kind === 'damage' || msg.kind === 'heal') {
         const target = msg.target === 'enemy' ? cm.enemy : cm.player;
         if (!target) return;
+        // Damage clamps at 0; healing clamps at max hitpoints.
+        const isHeal = msg.kind === 'heal';
+        const clamp = isHeal
+          ? (hp) => Math.min(target.stats ? target.stats.maxHitpoints : hp, hp + msg.amount)
+          : (hp) => Math.max(0, hp - msg.amount);
         // Apply damage directly to hitpoints
         if (msg.hp !== undefined) {
           target.hitpoints = msg.hp;
         } else {
-          target.hitpoints = Math.max(0, target.hitpoints - msg.amount);
+          target.hitpoints = clamp(target.hitpoints);
         }
         // Show damage splash for visual feedback
         if (msg.amount > 0 && target.splashManager && target.splashManager.add) {
           try {
             target.splashManager.add({
-              source: msg.source || 'Attack',
-              amount: msg.amount,
-              xOffset: 0,
-            });
-          } catch (e) { /* skip splash */ }
-        }
-        if (target.renderQueue) {
-          target.renderQueue.hitpoints = true;
-          target.renderQueue.damageSplash = true;
-        }
-        this._renderCombat();
-      } else if (msg.kind === 'heal') {
-        const target = msg.target === 'enemy' ? cm.enemy : cm.player;
-        if (!target) return;
-        if (msg.hp !== undefined) {
-          target.hitpoints = msg.hp;
-        } else {
-          target.hitpoints = Math.min(target.stats ? target.stats.maxHitpoints : target.hitpoints, target.hitpoints + msg.amount);
-        }
-        if (msg.amount > 0 && target.splashManager && target.splashManager.add) {
-          try {
-            target.splashManager.add({
-              source: 'Heal',
+              source: isHeal ? 'Heal' : (msg.source || 'Attack'),
               amount: msg.amount,
               xOffset: 0,
             });
@@ -3546,16 +3440,20 @@ class Sync {
         if (savedLoot && cm.loot) {
           if (!cm.loot.drops || cm.loot.drops.length < savedLoot.length) {
             cm.loot.drops = savedLoot;
-            if (cm.loot.renderRequired !== undefined) cm.loot.renderRequired = true;
-            if (cm.loot.render) cm.loot.render();
+            this._flagLootForRender(cm.loot);
             logger.info(`[COMBAT] Restored ${savedLoot.length} loot items after stop`);
           }
         }
         this._combatOwner = null;
         this._renderCombat();
       }
-    } catch (e) { logger.error('applyCombatEvent failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
+  }
+
+  /** Flag a combat loot container for re-render (shared by loot sync + stop-restore). */
+  _flagLootForRender(loot) {
+    if (loot.renderRequired !== undefined) loot.renderRequired = true;
+    if (loot.render) loot.render();
   }
 
   _renderCombat() {
@@ -3605,8 +3503,7 @@ class Sync {
     // The spectator sees the enemy image/HP but their combat doesn't run.
     // The attacker's damage events update the enemy HP visually.
     if (msg.monsterId) {
-      this._applyingRemote = true;
-      try {
+      this._applyRemote('applyCombatClaim', () => {
         const monster = game.monsters.getObjectByID(msg.monsterId);
         if (monster && cm.enemy) {
           const currentId = cm.enemy.monster ? cm.enemy.monster.id : null;
@@ -3635,8 +3532,7 @@ class Sync {
             logger.info(`[COMBAT] Spectator: monster already selected, hp=${cm.enemy.hitpoints}`);
           }
         }
-      } catch (e) { logger.warn(`[COMBAT] claim set up enemy failed: ${e.message}`); }
-      finally { this._applyingRemote = false; }
+      }, { save: false, level: 'warn' });
     }
     this._renderCombat();
   }
@@ -3658,32 +3554,27 @@ class Sync {
     // our own Currency/Bank/CombatLoot patches and echo a phantom
     // delta/qty message back to the sender (which would double-count the
     // GP/items on the attacker's side).
-    this._applyingRemote = true;
-    try {
-      // Handle GP (gold coins) — game.gp is a Currency, use .add()
-      if (msg.itemId === 'melvorD:GP' && game.gp !== undefined) {
-        if (typeof game.gp.add === 'function') game.gp.add(msg.quantity);
-        return;
-      }
-      // Handle Slayer Coins — game.slayerCoins is a Currency, use .add()
-      if (msg.itemId === 'melvorD:SlayerCoins' && game.slayerCoins !== undefined) {
-        if (typeof game.slayerCoins.add === 'function') game.slayerCoins.add(msg.quantity);
-        return;
+    this._applyRemote('applyCombatLoot', () => {
+      // Handle currencies (GP, Slayer Coins) — these are Currency objects, use .add()
+      for (const [currencyId, getCurrency] of [['melvorD:GP', () => game.gp], ['melvorD:SlayerCoins', () => game.slayerCoins]]) {
+        const currency = getCurrency();
+        if (msg.itemId === currencyId && currency !== undefined) {
+          if (typeof currency.add === 'function') currency.add(msg.quantity);
+          return;
+        }
       }
       // Handle items — add to combat loot so player can collect
       const item = game.items.getObjectByID(msg.itemId);
       if (item && cm.loot) {
         cm.loot.add(item, msg.quantity);
-        if (cm.loot.renderRequired !== undefined) cm.loot.renderRequired = true;
-        if (cm.loot.render) cm.loot.render();
+        this._flagLootForRender(cm.loot);
         logger.info(`[COMBAT] Added loot to container: ${msg.itemId} x${msg.quantity}`);
       } else if (item && game.bank && game.bank.addItem) {
         // Fallback: add directly to bank
         game.bank.addItem(item, msg.quantity, false, true, false, false, 'Co-op Combat');
         logger.info(`[COMBAT] Added loot to bank: ${msg.itemId} x${msg.quantity}`);
       }
-    } catch (e) { logger.warn(`[COMBAT] Loot sync failed: ${e.message}`); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    }, { level: 'warn' });
   }
 
   // ---- Ancient relics sync ----------------------------------------------
@@ -3691,19 +3582,7 @@ class Sync {
     if (!game.ancientRelics) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const relics = [];
-      // AncientRelicSet objects are stored per-skill: skill.ancientRelicSets (Map<Realm, AncientRelicSet>)
-      for (const skill of game.skills.allObjects) {
-        if (!skill.ancientRelicSets) continue;
-        for (const [realm, set] of skill.ancientRelicSets) {
-          if (set.foundRelics) {
-            for (const [relic, count] of set.foundRelics) {
-              relics.push({ skillId: skill.id, realmId: realm.id, relicId: relic.id, count });
-            }
-          }
-        }
-      }
-      this.transport.send({ t: Msg.ANCIENT_RELIC, relics });
+      this.transport.send({ t: Msg.ANCIENT_RELIC, relics: this._serializeAncientRelics() });
     };
     // Patch addRelic on the prototype (once, not per-instance)
     if (typeof AncientRelicSet !== 'undefined' && typeof AncientRelicSet.prototype.addRelic === 'function') {
@@ -3711,10 +3590,25 @@ class Sync {
     }
   }
 
+  _serializeAncientRelics() {
+    const relics = [];
+    // AncientRelicSet objects are stored per-skill: skill.ancientRelicSets (Map<Realm, AncientRelicSet>)
+    for (const skill of game.skills.allObjects) {
+      if (!skill.ancientRelicSets) continue;
+      for (const [realm, set] of skill.ancientRelicSets) {
+        if (set.foundRelics) {
+          for (const [relic, count] of set.foundRelics) {
+            relics.push({ skillId: skill.id, realmId: realm.id, relicId: relic.id, count });
+          }
+        }
+      }
+    }
+    return relics;
+  }
+
   _applyAncientRelic(msg) {
     if (!game.ancientRelics || !msg.relics) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyAncientRelic', () => {
       for (const r of msg.relics) {
         // Find the AncientRelicSet by skill + realm
         const skill = game.skills.getObjectByID(r.skillId);
@@ -3727,8 +3621,7 @@ class Sync {
         const relic = game.ancientRelics.getObjectByID(r.relicId);
         if (relic) set.foundRelics.set(relic, Math.max(set.foundRelics.get(relic) || 0, r.count));
       }
-    } catch (e) { logger.error('applyAncientRelic failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Skill tree sync --------------------------------------------------
@@ -3736,17 +3629,7 @@ class Sync {
     // Skill trees are per-skill, not global. Iterate all skills.
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const trees = [];
-      for (const skill of game.skills.allObjects) {
-        if (skill.skillTrees) {
-          for (const tree of skill.skillTrees.allObjects) {
-            const nodes = [];
-            if (tree.unlockedNodes) for (const n of tree.unlockedNodes) nodes.push(n.id);
-            trees.push({ skillId: skill.id, treeId: tree.id, points: tree._points, nodes });
-          }
-        }
-      }
-      this.transport.send({ t: Msg.SKILL_TREE, trees });
+      this.transport.send({ t: Msg.SKILL_TREE, trees: this._serializeSkillTrees() });
     };
     // Patch SkillTree prototype methods once (not per-tree in a loop)
     if (typeof SkillTree !== 'undefined' && SkillTree.prototype) {
@@ -3758,10 +3641,23 @@ class Sync {
     }
   }
 
+  _serializeSkillTrees() {
+    const trees = [];
+    for (const skill of game.skills.allObjects) {
+      if (skill.skillTrees) {
+        for (const tree of skill.skillTrees.allObjects) {
+          const nodes = [];
+          if (tree.unlockedNodes) for (const n of tree.unlockedNodes) nodes.push(n.id);
+          trees.push({ skillId: skill.id, treeId: tree.id, points: tree._points, nodes });
+        }
+      }
+    }
+    return trees;
+  }
+
   _applySkillTree(msg) {
     if (!msg.trees) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applySkillTree', () => {
       for (const t of msg.trees) {
         const skill = game.skills.getObjectByID(t.skillId);
         if (!skill || !skill.skillTrees) continue;
@@ -3777,8 +3673,7 @@ class Sync {
           }
         }
       }
-    } catch (e) { logger.error('applySkillTree failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Township sync ----------------------------------------------------
@@ -3810,22 +3705,24 @@ class Sync {
       }
     }
     // Township-level methods
-    for (const m of ['repairAllBuildings', 'repairAllBuildingsInCurrentBiome',
-                     'repairAllBuildingsFromStorageType', 'selectWorship', 'updateConvertType']) {
-      if (typeof Township.prototype[m] === 'function') this.ctx.patch(Township, m).after(() => sendImmediate());
+    if (typeof Township !== 'undefined') {
+      for (const m of ['repairAllBuildings', 'repairAllBuildingsInCurrentBiome',
+                       'repairAllBuildingsFromStorageType', 'selectWorship', 'updateConvertType']) {
+        if (typeof Township.prototype[m] === 'function') this.ctx.patch(Township, m).after(() => sendImmediate());
+      }
     }
-    if (tw.tasks && typeof tw.tasks.completeTask === 'function') {
+    if (typeof TownshipTasks !== 'undefined' && tw.tasks && typeof tw.tasks.completeTask === 'function') {
       this.ctx.patch(TownshipTasks, 'completeTask').after(() => sendImmediate());
     }
     // passiveTick fires every game tick — throttle to 5s intervals
-    if (tw.passiveTick) {
+    if (typeof Township !== 'undefined' && tw.passiveTick) {
       this.ctx.patch(Township, 'passiveTick').after(() => send());
     }
   }
 
-  _sendTownship() {
+  _serializeTownship() {
     const tw = game.township;
-    if (!tw) return;
+    if (!tw) return null;
     const biomes = [];
     if (tw.biomes) for (const biome of tw.biomes.allObjects) {
       const buildings = {};
@@ -3861,22 +3758,26 @@ class Sync {
       townData.soulStorage = td.soulStorage;
       townData.abyssalWaveTicksRemaining = td.abyssalWaveTicksRemaining;
     }
-    this.transport.send({
-      t: Msg.TOWNSHIP,
+    return {
       biomes,
       resources,
       totalTicks: tw.totalTicks,
       legacyTicks: tw.legacyTicks,
       townData,
       worshipInSelectionId: tw.worshipInSelection ? tw.worshipInSelection.id : null,
-    });
+    };
+  }
+
+  _sendTownship() {
+    const payload = this._serializeTownship();
+    if (!payload) return;
+    this.transport.send({ t: Msg.TOWNSHIP, ...payload });
   }
 
   _applyTownship(msg) {
     const tw = game.township;
     if (!tw) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyTownship', () => {
       if (msg.biomes) for (const b of msg.biomes) {
         const biome = tw.biomes.getObjectByID(b.id);
         if (!biome || !biome.buildingsBuilt) continue;
@@ -3935,8 +3836,7 @@ class Sync {
         tw.worshipInSelection = msg.worshipInSelectionId ? (tw.worships && tw.worships.getObjectByID(msg.worshipInSelectionId)) : undefined;
       }
       if (tw.render) tw.render();
-    } catch (e) { logger.error('applyTownship failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Clue Hunt sync ---------------------------------------------------
@@ -3944,24 +3844,32 @@ class Sync {
     if (!game.clueHunt) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const ch = game.clueHunt;
-      const steps = (ch.clueProgress || []).map(s => ({
-        id: s.id, progress: s.progress, required: s.required, complete: s.complete,
-      }));
-      this.transport.send({ t: Msg.CLUE_HUNT, steps, currentStep: ch.currentStep });
+      const payload = this._serializeClueHunt();
+      if (!payload) return;
+      this.transport.send({ t: Msg.CLUE_HUNT, ...payload });
     };
     // Patch any method that advances clue progress
-    for (const m of ['startClueHunt', 'giveReward', 'updateClue1Progress', 'updateClue2Progress', 'updateClue3Progress', 'updateClue4Progress', 'updateClue5Progress', 'updateClue6Progress']) {
-      if (typeof ClueHunt.prototype[m] === 'function') {
-        this.ctx.patch(ClueHunt, m).after(() => send());
+    if (typeof ClueHunt !== 'undefined') {
+      for (const m of ['startClueHunt', 'giveReward', 'updateClue1Progress', 'updateClue2Progress', 'updateClue3Progress', 'updateClue4Progress', 'updateClue5Progress', 'updateClue6Progress']) {
+        if (typeof ClueHunt.prototype[m] === 'function') {
+          this.ctx.patch(ClueHunt, m).after(() => send());
+        }
       }
     }
   }
 
+  _serializeClueHunt() {
+    const ch = game.clueHunt;
+    if (!ch) return null;
+    const steps = (ch.clueProgress || []).map(s => ({
+      id: s.id, progress: s.progress, required: s.required, complete: s.complete,
+    }));
+    return { steps, currentStep: ch.currentStep };
+  }
+
   _applyClueHunt(msg) {
     if (!game.clueHunt || !msg.steps) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyClueHunt', () => {
       const ch = game.clueHunt;
       if (ch.clueProgress) {
         for (let i = 0; i < msg.steps.length && i < ch.clueProgress.length; i++) {
@@ -3974,8 +3882,7 @@ class Sync {
         }
       }
       if (typeof msg.currentStep === 'number') ch.currentStep = msg.currentStep;
-    } catch (e) { logger.error('applyClueHunt failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Corruption sync --------------------------------------------------
@@ -3984,25 +3891,30 @@ class Sync {
     if (!co) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const rows = [];
-      // CorruptionEffectTableRow has no .id — send only the effect id.
-      if (co.corruptionEffects && co.corruptionEffects.unlockedRows) {
-        for (const row of co.corruptionEffects.unlockedRows) {
-          rows.push({ effectId: row.effect ? row.effect.id : null });
-        }
-      }
-      this.transport.send({ t: Msg.CORRUPTION, rows });
+      this.transport.send({ t: Msg.CORRUPTION, rows: this._serializeCorruptionRows() });
     };
-    if (co.corruptionEffects && typeof co.corruptionEffects.unlockRow === 'function') {
+    if (typeof CorruptionEffectTable !== 'undefined' && co.corruptionEffects && typeof co.corruptionEffects.unlockRow === 'function') {
       this.ctx.patch(CorruptionEffectTable, 'unlockRow').after(() => send());
     }
+  }
+
+  _serializeCorruptionRows() {
+    const co = game.corruption;
+    if (!co) return [];
+    const rows = [];
+    // CorruptionEffectTableRow has no .id — send only the effect id.
+    if (co.corruptionEffects && co.corruptionEffects.unlockedRows) {
+      for (const row of co.corruptionEffects.unlockedRows) {
+        rows.push({ effectId: row.effect ? row.effect.id : null });
+      }
+    }
+    return rows;
   }
 
   _applyCorruption(msg) {
     const co = game.corruption;
     if (!co || !co.corruptionEffects || !msg.rows) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCorruption', () => {
       // CorruptionEffectTableRow has no .id — match by effect.id.
       // Unlock rows that are unlocked on the remote side.
       const table = co.corruptionEffects;
@@ -4019,8 +3931,7 @@ class Sync {
           }
         }
       }
-    } catch (e) { logger.error('applyCorruption failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Raid sync (Golbin raids) -----------------------------------------
@@ -4029,48 +3940,12 @@ class Sync {
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
       const r = game.golbinRaid;
-      const history = (r.history || []).map(h => ({
-        wave: h.wave, coins: h.raidCoinsEarned, timestamp: h.timestamp,
-      }));
+      const history = this._serializeRaidHistory();
       // Live raid loadout: equipment, food, passives, modifiers, state.
-      const loadout = {};
-      if (r.player) {
-        const p = r.player;
-        loadout.equipment = {};
-        if (p.equipment && p.equipment.equippedItems) {
-          // equippedItems is Record<string, EquippedItem>; EquippedItem has .item and .quantity
-          for (const [slotId, eqItem] of Object.entries(p.equipment.equippedItems)) {
-            if (eqItem && eqItem.item && !eqItem.isEmpty) {
-              loadout.equipment[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
-            }
-          }
-        }
-        loadout.food = null;
-        if (p.food && p.food.currentSlot && p.food.currentSlot.item) {
-          loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
-        }
-      }
-      loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
-      loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
-      loadout.state = r.state;
-      loadout.killCount = r.killCount;
-      loadout.posModsSelected = r.posModsSelected;
-      loadout.negModsSelected = r.negModsSelected;
-      loadout.isPaused = r.isPaused;
-      loadout.isFightingITMBoss = r.isFightingITMBoss;
+      const loadout = this._serializeRaidLoadout();
       // Item selection state (when choosing items during raid)
-      const itemSelection = {};
-      if (r.itemSelection) {
-        for (const [cat, items] of Object.entries(r.itemSelection)) {
-          itemSelection[cat] = items ? items.map(it => it ? it.id : null) : [];
-        }
-      }
-      const exclusiveItemSelection = {};
-      if (r.exclusiveItemSelection) {
-        for (const [cat, items] of Object.entries(r.exclusiveItemSelection)) {
-          exclusiveItemSelection[cat] = items ? items.map(it => it ? it.id : null) : [];
-        }
-      }
+      const itemSelection = this._serializeRaidSelection('itemSelection');
+      const exclusiveItemSelection = this._serializeRaidSelection('exclusiveItemSelection');
       this.transport.send({
         t: Msg.RAID,
         wave: r.wave,
@@ -4087,9 +3962,11 @@ class Sync {
         randomModifiersBeingSelected: (r.randomModifiersBeingSelected || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value })),
       });
     };
-    for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'continueRaid', 'equipItemCallback', 'addFoodCallback', 'selectRandomModifier', 'rerollPassiveCallback', 'pause', 'unpause']) {
-      if (typeof RaidManager.prototype[m] === 'function') {
-        this.ctx.patch(RaidManager, m).after(() => send());
+    if (typeof RaidManager !== 'undefined') {
+      for (const m of ['startRaid', 'skipWave', 'changeDifficulty', 'continueRaid', 'equipItemCallback', 'addFoodCallback', 'selectRandomModifier', 'rerollPassiveCallback', 'pause', 'unpause']) {
+        if (typeof RaidManager.prototype[m] === 'function') {
+          this.ctx.patch(RaidManager, m).after(() => send());
+        }
       }
     }
     // Also patch RaidPlayer equip methods
@@ -4102,10 +3979,81 @@ class Sync {
     }
   }
 
+  /** Raid history wire entries: { wave, coins, timestamp }. limit=undefined → full history. */
+  _serializeRaidHistory(limit) {
+    const r = game.golbinRaid;
+    const history = (r && r.history) || [];
+    const slice = limit === undefined ? history : history.slice(-limit);
+    return slice.map(h => ({
+      wave: h.wave, coins: h.raidCoinsEarned, timestamp: h.timestamp,
+    }));
+  }
+
+  /** Live raid loadout: equipment, food, passives, modifiers, state. */
+  _serializeRaidLoadout() {
+    const r = game.golbinRaid;
+    const loadout = {};
+    if (!r) return loadout;
+    if (r.player) {
+      const p = r.player;
+      loadout.equipment = {};
+      if (p.equipment && p.equipment.equippedItems) {
+        // equippedItems is Record<string, EquippedItem>; EquippedItem has .item and .quantity
+        for (const [slotId, eqItem] of Object.entries(p.equipment.equippedItems)) {
+          if (eqItem && eqItem.item && !eqItem.isEmpty) {
+            loadout.equipment[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
+          }
+        }
+      }
+      loadout.food = null;
+      if (p.food && p.food.currentSlot && p.food.currentSlot.item) {
+        loadout.food = { itemId: p.food.currentSlot.item.id, qty: p.food.currentSlot.quantity };
+      }
+    }
+    loadout.randomPlayerModifiers = (r.randomPlayerModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
+    loadout.randomEnemyModifiers = (r.randomEnemyModifiers || []).map(m => ({ id: m.modifier?.id || m.id, value: m.value }));
+    loadout.state = r.state;
+    loadout.killCount = r.killCount;
+    loadout.posModsSelected = r.posModsSelected;
+    loadout.negModsSelected = r.negModsSelected;
+    loadout.isPaused = r.isPaused;
+    loadout.isFightingITMBoss = r.isFightingITMBoss;
+    return loadout;
+  }
+
+  /** Serialize a raid item-selection map ({ category: Item[] } → { category: itemId[] }). */
+  _serializeRaidSelection(field) {
+    const out = {};
+    const r = game.golbinRaid;
+    const selection = r ? r[field] : null;
+    if (selection) {
+      for (const [cat, items] of Object.entries(selection)) {
+        out[cat] = items ? items.map(it => it ? it.id : null) : [];
+      }
+    }
+    return out;
+  }
+
+  /** Rehydrate a raid item-selection map from wire ids back into Items. */
+  _rehydrateRaidSelection(r, field, wire) {
+    if (wire && r[field]) {
+      for (const [cat, ids] of Object.entries(wire)) {
+        r[field][cat] = ids.map(id => id ? game.items.getObjectByID(id) : null).filter(Boolean);
+      }
+    }
+  }
+
+  /** Rehydrate a wire modifier list [{ id, value }] into ModifierValue[] ({ modifier, value }). */
+  _rehydrateModifiers(arr) {
+    return arr.map(m => {
+      const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
+      return modifier ? { modifier, value: m.value } : null;
+    }).filter(Boolean);
+  }
+
   _applyRaid(msg) {
     if (!game.golbinRaid) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyRaid', () => {
       const r = game.golbinRaid;
       if (typeof msg.wave === 'number') r.wave = msg.wave;
       if (typeof msg.waveProgress === 'number') r.waveProgress = msg.waveProgress;
@@ -4179,41 +4127,23 @@ class Sync {
         // Modifiers — set directly (these are runtime-only during a raid)
         // ModifierValue has { modifier, value }, not { id, value }.
         if (lo.randomPlayerModifiers) {
-          r.randomPlayerModifiers = lo.randomPlayerModifiers.map(m => {
-            const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-            return modifier ? { modifier, value: m.value } : null;
-          }).filter(Boolean);
+          r.randomPlayerModifiers = this._rehydrateModifiers(lo.randomPlayerModifiers);
         }
         if (lo.randomEnemyModifiers) {
-          r.randomEnemyModifiers = lo.randomEnemyModifiers.map(m => {
-            const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-            return modifier ? { modifier, value: m.value } : null;
-          }).filter(Boolean);
+          r.randomEnemyModifiers = this._rehydrateModifiers(lo.randomEnemyModifiers);
         }
         if (r.render) try { r.render(); } catch { /* noop */ }
       }
       // Item selection state (for raid item choosing UI)
-      if (msg.itemSelection && r.itemSelection) {
-        for (const [cat, ids] of Object.entries(msg.itemSelection)) {
-          r.itemSelection[cat] = ids.map(id => id ? game.items.getObjectByID(id) : null).filter(Boolean);
-        }
-      }
-      if (msg.exclusiveItemSelection && r.exclusiveItemSelection) {
-        for (const [cat, ids] of Object.entries(msg.exclusiveItemSelection)) {
-          r.exclusiveItemSelection[cat] = ids.map(id => id ? game.items.getObjectByID(id) : null).filter(Boolean);
-        }
-      }
+      this._rehydrateRaidSelection(r, 'itemSelection', msg.itemSelection);
+      this._rehydrateRaidSelection(r, 'exclusiveItemSelection', msg.exclusiveItemSelection);
       if (msg.itemCategoryBeingSelected !== undefined) r.itemCategoryBeingSelected = msg.itemCategoryBeingSelected;
       if (typeof msg.isSelectingPositiveModifier === 'boolean') r.isSelectingPositiveModifier = msg.isSelectingPositiveModifier;
       if (msg.randomModifiersBeingSelected) {
         // randomModifiersBeingSelected is ModifierValue[] ({ modifier, value })
-        r.randomModifiersBeingSelected = msg.randomModifiersBeingSelected.map(m => {
-          const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(m.id);
-          return modifier ? { modifier, value: m.value } : null;
-        }).filter(Boolean);
+        r.randomModifiersBeingSelected = this._rehydrateModifiers(msg.randomModifiersBeingSelected);
       }
-    } catch (e) { logger.error('applyRaid failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Fishing Contest sync ---------------------------------------------
@@ -4222,38 +4152,46 @@ class Sync {
     if (!fc) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const results = (fc.playerResults || []).map(r => ({
-        length: r.length || 0, weight: r.weight || 0,
-      }));
-      const leaderboard = (fc.contestantLeaderboard || []).map(e => ({
-        isPlayer: !!e.isPlayer, name: e.name || '',
-        bestResult: e.bestResult ? { length: e.bestResult.length || 0, weight: e.bestResult.weight || 0 } : null,
-      }));
-      this.transport.send({
-        t: Msg.FISHING_CONTEST,
-        isActive: fc.isActive,
-        // FishingContestFish has no .id — send the underlying item id.
-        activeFishId: fc.activeFish ? (fc.activeFish.fish ? fc.activeFish.fish.id : null) : null,
-        actionsRemaining: fc.actionsRemaining,
-        currentDifficulty: fc.currentDifficulty,
-        completionTracker: fc.completionTracker ? [...fc.completionTracker] : [],
-        masteryTracker: fc.masteryTracker ? [...fc.masteryTracker] : [],
-        results,
-        leaderboard,
-      });
+      const payload = this._serializeFishingContest();
+      if (!payload) return;
+      this.transport.send({ t: Msg.FISHING_CONTEST, ...payload });
     };
-    for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'onFishingAction', 'peformPlayerFishingContestAction', 'finalizeFishingContest', 'generateNewFishingContestLeaderboard', 'updateBestFishResultForPlayer', 'updateBestFishResultForContestant']) {
-      if (typeof FishingContest.prototype[m] === 'function') {
-        this.ctx.patch(FishingContest, m).after(() => send());
+    if (typeof FishingContest !== 'undefined') {
+      for (const m of ['startFishingContest', 'stopFishingContest', 'setFishingContestDifficulty', 'onFishingAction', 'peformPlayerFishingContestAction', 'finalizeFishingContest', 'generateNewFishingContestLeaderboard', 'updateBestFishResultForPlayer', 'updateBestFishResultForContestant']) {
+        if (typeof FishingContest.prototype[m] === 'function') {
+          this.ctx.patch(FishingContest, m).after(() => send());
+        }
       }
     }
+  }
+
+  _serializeFishingContest() {
+    const fc = game.fishing && game.fishing.contest;
+    if (!fc) return null;
+    const results = (fc.playerResults || []).map(r => ({
+      length: r.length || 0, weight: r.weight || 0,
+    }));
+    const leaderboard = (fc.contestantLeaderboard || []).map(e => ({
+      isPlayer: !!e.isPlayer, name: e.name || '',
+      bestResult: e.bestResult ? { length: e.bestResult.length || 0, weight: e.bestResult.weight || 0 } : null,
+    }));
+    return {
+      isActive: fc.isActive,
+      // FishingContestFish has no .id — send the underlying item id.
+      activeFishId: fc.activeFish ? (fc.activeFish.fish ? fc.activeFish.fish.id : null) : null,
+      actionsRemaining: fc.actionsRemaining,
+      currentDifficulty: fc.currentDifficulty,
+      completionTracker: fc.completionTracker ? [...fc.completionTracker] : [],
+      masteryTracker: fc.masteryTracker ? [...fc.masteryTracker] : [],
+      results,
+      leaderboard,
+    };
   }
 
   _applyFishingContest(msg) {
     const fc = game.fishing?.contest;
     if (!fc) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyFishingContest', () => {
       fc.isActive = !!msg.isActive;
       // activeFish is a FishingContestFish (not an Item). Find the matching
       // one in fc.availableFish by the underlying item id.
@@ -4305,8 +4243,7 @@ class Sync {
         fc.renderQueue.remainingActions = true;
       }
       if (fc.render) try { fc.render(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyFishingContest failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Township Tasks sync ----------------------------------------------
@@ -4340,10 +4277,11 @@ class Sync {
         casual,
       });
     };
-    if (tw.tasks && typeof tw.tasks.completeTask === 'function') {
+    if (typeof TownshipTasks !== 'undefined' && tw.tasks && typeof tw.tasks.completeTask === 'function') {
+      // completeTask is also patched by _patchTownship (fires first, sending TOWNSHIP).
       this.ctx.patch(TownshipTasks, 'completeTask').after(() => send());
     }
-    if (tw.casualTasks) {
+    if (typeof TownshipCasualTasks !== 'undefined' && tw.casualTasks) {
       for (const m of ['completeTask', 'skipTask', 'addNewDailyTask']) {
         if (typeof tw.casualTasks[m] === 'function') {
           this.ctx.patch(TownshipCasualTasks, m).after(() => send());
@@ -4355,8 +4293,7 @@ class Sync {
   _applyTownshipTasks(msg) {
     const tw = game.township;
     if (!tw) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyTownshipTasks', () => {
       if (msg.completed && tw.tasks && tw.tasks.completedTasks) {
         for (const tid of msg.completed) {
           // tw.tasks is TownshipTasks; the task registry is tw.tasks.tasks
@@ -4383,8 +4320,7 @@ class Sync {
           }
         }
       }
-    } catch (e) { logger.error('applyTownshipTasks failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Cartography sync -------------------------------------------------
@@ -4410,41 +4346,45 @@ class Sync {
       }, 0);
     };
 
-    // Patch survey, discovery, travel, and paper methods
+    // Patch survey, discovery, travel, and paper methods.
     // Includes createNewMapForDigSite — the actual method that creates a
     // dig site map (createMapOnClick only opens the modal).
-    for (const m of ['discoverPOI', 'selectPaperRecipeOnClick', 'autoSurveyOnClick',
-                     'travelOnClick', 'surveyOnClick', 'startAutoSurvey',
-                     'startSurveyQueue', 'movePlayer', 'onHexTap',
-                     'makePaperOnClick', 'startMakingPaper',
-                     'createMapOnClick', 'startMapUpgradeOnClick',
-                     'startUpgradingMap', 'selectDigSiteOnClick',
-                     'selectDigSiteMapOnClick', 'deleteDigSiteMapOnClick',
-                     'selectRefinementOnClick', 'unlockFastTravelOnClick',
-                     'goToWorldMapOnClick', 'goToPlayerOnClick',
-                     'createNewMapForDigSite', 'destroyDigSiteMap']) {
-      if (typeof Cartography.prototype[m] === 'function') {
-        this.ctx.patch(Cartography, m).after(() => send());
-      }
-    }
-
-    // Also patch surveyHex and onHexFullSurvey for survey progress.
+    // The second half (surveyHex … unsurveyWholeMap) covers survey progress.
     // NOTE: 'action' is called every tick during surveying — don't patch
     // it directly as that would send cartography data every tick (huge
-    // payload). Instead, throttle via the periodic state sync.
-    for (const m of ['surveyHex', 'onHexFullSurvey', 'onHexMastery',
-                     'surveyAuto', 'surveyActionQueue',
-                     'useDigSiteMapCharges', 'mapUpgradeAction',
-                     'paperMakingAction', 'unsurveyWholeMap']) {
-      if (typeof Cartography.prototype[m] === 'function') {
-        this.ctx.patch(Cartography, m).after(() => send());
+    // payload). The patched methods below are throttled by the setTimeout
+    // batch in send() alone.
+    if (typeof Cartography !== 'undefined') {
+      for (const m of ['discoverPOI', 'selectPaperRecipeOnClick', 'autoSurveyOnClick',
+                       'travelOnClick', 'surveyOnClick', 'startAutoSurvey',
+                       'startSurveyQueue', 'movePlayer', 'onHexTap',
+                       'makePaperOnClick', 'startMakingPaper',
+                       'createMapOnClick', 'startMapUpgradeOnClick',
+                       'startUpgradingMap', 'selectDigSiteOnClick',
+                       'selectDigSiteMapOnClick', 'deleteDigSiteMapOnClick',
+                       'selectRefinementOnClick', 'unlockFastTravelOnClick',
+                       'goToWorldMapOnClick', 'goToPlayerOnClick',
+                       'createNewMapForDigSite', 'destroyDigSiteMap',
+                       'surveyHex', 'onHexFullSurvey', 'onHexMastery',
+                       'surveyAuto', 'surveyActionQueue',
+                       'useDigSiteMapCharges', 'mapUpgradeAction',
+                       'paperMakingAction', 'unsurveyWholeMap']) {
+        if (typeof Cartography.prototype[m] === 'function') {
+          this.ctx.patch(Cartography, m).after(() => send());
+        }
       }
     }
   }
 
   _sendCartography() {
+    const payload = this._serializeCartography();
+    if (!payload) return;
+    this.transport.send({ t: Msg.CARTOGRAPHY, ...payload });
+  }
+
+  _serializeCartography() {
     const ca = game.cartography;
-    if (!ca) return;
+    if (!ca) return null;
     const maps = [];
     if (ca.worldMaps) {
       for (const wm of ca.worldMaps.allObjects) {
@@ -4491,15 +4431,14 @@ class Sync {
         maps.push(mapData);
       }
     }
-    this.transport.send({
-      t: Msg.CARTOGRAPHY,
+    return {
       maps,
       activeMapId: ca.activeMap ? ca.activeMap.id : null,
       paperRecipeId: ca.selectedPaperRecipe ? ca.selectedPaperRecipe.id : null,
       selectedMapUpgradeDigsiteId: ca.selectedMapUpgradeDigsite ? ca.selectedMapUpgradeDigsite.id : null,
       // Dig site maps (tier, upgrade actions, charges, refinements)
       digSiteMaps: this._serializeDigSiteMaps(),
-    });
+    };
   }
 
   _serializeDigSiteMaps() {
@@ -4528,11 +4467,7 @@ class Sync {
   _applyCartography(msg) {
     const ca = game.cartography;
     if (!ca) return;
-    const msgSize = JSON.stringify(msg).length;
-    const t0 = Date.now();
-    logger.info('[CARTO] _applyCartography start, msg size:', msgSize, 'digSiteMaps:', msg.digSiteMaps ? msg.digSiteMaps.length : 0);
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCartography', () => {
       if (msg.maps && ca.worldMaps) {
         for (const mData of msg.maps) {
           const wm = ca.worldMaps.getObjectByID(mData.id);
@@ -4698,10 +4633,7 @@ class Sync {
                 }
                 // Refinements — replace if remote has more
                 if (remote.refinements && remote.refinements.length > (local.refinements || []).length) {
-                  local.refinements = remote.refinements.map(r => {
-                    const modifier = game.modifierRegistry && game.modifierRegistry.getObjectByID(r.id);
-                    return modifier ? { modifier, value: r.value } : null;
-                  }).filter(Boolean);
+                  local.refinements = this._rehydrateModifiers(remote.refinements);
                 }
                 // Artefact values — take max per size to preserve best drops
                 if (remote.artefactValues && local.artefactValues) {
@@ -4721,12 +4653,7 @@ class Sync {
       // (re-renders the entire hex map) and can freeze the game. The render
       // queue entries we set above will be processed by the game's normal
       // render loop on the next tick.
-    } catch (e) { logger.error('[CARTO] applyCartography failed', e); }
-    finally {
-      this._applyingRemote = false;
-      this._scheduleSave();
-      logger.info('[CARTO] _applyCartography done in', Date.now() - t0, 'ms');
-    }
+    });
   }
 
   // ---- Stats sync -------------------------------------------------------
@@ -4740,52 +4667,17 @@ class Sync {
     if (!game.stats) return;
     // Build a map from tracker instance -> tracker name for quick lookup
     const trackerNames = new Map();
-    const namedTrackerKeys = [
-      'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
-      'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
-      'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
-      'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
-      'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
-      'General', 'Combat', 'GolbinRaid', 'Shop',
-    ];
-    for (const key of namedTrackerKeys) {
+    for (const key of STATS_TRACKER_KEYS) {
       if (game.stats[key]) trackerNames.set(game.stats[key], key);
     }
     // MappedStatTrackers (Items, Monsters) — track separately
-    const mappedTrackerKeys = ['Items', 'Monsters'];
-    for (const key of mappedTrackerKeys) {
+    for (const key of STATS_MAPPED_TRACKER_KEYS) {
       if (game.stats[key]) trackerNames.set(game.stats[key], key);
     }
 
-    const serializeAll = () => {
-      const data = {};
-      // Named StatTrackers
-      for (const key of namedTrackerKeys) {
-        const tracker = game.stats[key];
-        if (!tracker || !tracker.stats) continue;
-        const entries = {};
-        for (const [statId, val] of tracker.stats) entries[statId] = val;
-        data[key] = entries;
-      }
-      // MappedStatTrackers (Items, Monsters) — keyed by object ID
-      for (const key of mappedTrackerKeys) {
-        const mst = game.stats[key];
-        if (!mst || !mst.statsMap) continue;
-        const mapped = {};
-        for (const [obj, tracker] of mst.statsMap) {
-          if (!tracker || !tracker.stats) continue;
-          const entries = {};
-          for (const [statId, val] of tracker.stats) entries[statId] = val;
-          if (obj && obj.id) mapped[obj.id] = entries;
-        }
-        data[key] = mapped;
-      }
-      return data;
-    };
-
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      this.transport.send({ t: Msg.STATS, stats: serializeAll() });
+      this.transport.send({ t: Msg.STATS, stats: this._serializeStats() });
     };
     // Throttle — stats change very frequently during active play
     let lastStatsSend = 0;
@@ -4813,32 +4705,54 @@ class Sync {
     }
   }
 
+  _serializeStats() {
+    const data = {};
+    // Named StatTrackers
+    for (const key of STATS_TRACKER_KEYS) {
+      const tracker = game.stats[key];
+      if (!tracker || !tracker.stats) continue;
+      const entries = {};
+      for (const [statId, val] of tracker.stats) entries[statId] = val;
+      data[key] = entries;
+    }
+    // MappedStatTrackers (Items, Monsters) — keyed by object ID
+    for (const key of STATS_MAPPED_TRACKER_KEYS) {
+      const mst = game.stats[key];
+      if (!mst || !mst.statsMap) continue;
+      const mapped = {};
+      for (const [obj, tracker] of mst.statsMap) {
+        if (!tracker || !tracker.stats) continue;
+        const entries = {};
+        for (const [statId, val] of tracker.stats) entries[statId] = val;
+        if (obj && obj.id) mapped[obj.id] = entries;
+      }
+      data[key] = mapped;
+    }
+    return data;
+  }
+
+  /** Merge wire stat entries into a StatTracker (higher value wins). */
+  _mergeStatTracker(tracker, entries) {
+    for (const [statId, val] of Object.entries(entries)) {
+      const numKey = Number(statId);
+      const k = isNaN(numKey) ? statId : numKey;
+      // Use Math.max to avoid overwriting higher stat values with stale lower ones
+      const current = tracker.stats.get(k) || 0;
+      tracker.stats.set(k, Math.max(current, val));
+    }
+  }
+
   _applyStats(msg) {
     if (!game.stats || !msg.stats) return;
-    this._applyingRemote = true;
-    try {
-      const namedTrackerKeys = [
-        'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
-        'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
-        'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
-        'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
-        'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
-        'General', 'Combat', 'GolbinRaid', 'Shop',
-      ];
-      for (const key of namedTrackerKeys) {
+    this._applyRemote('applyStats', () => {
+      for (const key of STATS_TRACKER_KEYS) {
         const tracker = game.stats[key];
         const remoteData = msg.stats[key];
         if (!tracker || !tracker.stats || !remoteData) continue;
-        for (const [statId, val] of Object.entries(remoteData)) {
-          const numKey = Number(statId);
-          const k = isNaN(numKey) ? statId : numKey;
-          // Use Math.max to avoid overwriting higher stat values with stale lower ones
-          const current = tracker.stats.get(k) || 0;
-          tracker.stats.set(k, Math.max(current, val));
-        }
+        this._mergeStatTracker(tracker, remoteData);
       }
       // MappedStatTrackers (Items, Monsters)
-      for (const key of ['Items', 'Monsters']) {
+      for (const key of STATS_MAPPED_TRACKER_KEYS) {
         const mst = game.stats[key];
         const remoteMapped = msg.stats[key];
         if (!mst || !mst.statsMap || !remoteMapped) continue;
@@ -4850,17 +4764,11 @@ class Sync {
           if (!obj) continue;
           const tracker = mst.statsMap.get(obj);
           if (!tracker || !tracker.stats) continue;
-          for (const [statId, val] of Object.entries(entries)) {
-            const numKey = Number(statId);
-            const k = isNaN(numKey) ? statId : numKey;
-            const current = tracker.stats.get(k) || 0;
-            tracker.stats.set(k, Math.max(current, val));
-          }
+          this._mergeStatTracker(tracker, entries);
         }
       }
       if (game.stats.renderMutatedStats) try { game.stats.renderMutatedStats(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyStats failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Skill level cap increases sync -----------------------------------
@@ -4873,15 +4781,14 @@ class Sync {
       this._sendLevelCaps();
     };
     for (const m of ['purchaseSkillLevelCaps', 'purchaseAbyssalSkillLevelCaps', 'increaseSkillLevelCaps', 'selectRandomLevelCapIncrease']) {
-      if (typeof Game.prototype[m] === 'function') {
+      if (typeof Game !== 'undefined' && typeof Game.prototype[m] === 'function') {
         this.ctx.patch(Game, m).after(() => send());
       }
     }
   }
 
-  _sendLevelCaps() {
+  _serializeLevelCaps() {
     const data = {
-      t: Msg.LEVEL_CAP,
       levelCapIncreasesBought: game._levelCapIncreasesBought,
       abyssalLevelCapIncreasesBought: game._abyssalLevelCapIncreasesBought,
       active: [],
@@ -4899,12 +4806,15 @@ class Sync {
         if (cap && cap.id) data.beingSelected.push(cap.id);
       }
     }
-    this.transport.send(data);
+    return data;
+  }
+
+  _sendLevelCaps() {
+    this.transport.send({ t: Msg.LEVEL_CAP, ...this._serializeLevelCaps() });
   }
 
   _applyLevelCaps(msg) {
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyLevelCaps', () => {
       // Only increase, never decrease — preventing wiping abyssal unlocks.
       if (typeof msg.levelCapIncreasesBought === 'number') {
         game._levelCapIncreasesBought = Math.max(game._levelCapIncreasesBought || 0, msg.levelCapIncreasesBought);
@@ -4930,8 +4840,7 @@ class Sync {
       if (typeof game.validateRandomLevelCapIncreases === 'function') {
         try { game.validateRandomLevelCapIncreases(); } catch { /* noop */ }
       }
-    } catch (e) { logger.error('applyLevelCaps failed', e); }
-    finally { this._applyingRemote = false; this._scheduleSave(); }
+    });
   }
 
   // ---- Game state sync (tickTimestamp, merchantsPermitRead, pause) ------
@@ -4941,27 +4850,27 @@ class Sync {
       this._sendGameState();
     };
     // Pause/unpause — Game has pauseActiveSkill/unpauseActiveSkill (not pause/unpause)
-    if (typeof Game.prototype.pauseActiveSkill === 'function') this.ctx.patch(Game, 'pauseActiveSkill').after(() => send());
-    if (typeof Game.prototype.unpauseActiveSkill === 'function') this.ctx.patch(Game, 'unpauseActiveSkill').after(() => send());
+    if (typeof Game !== 'undefined' && typeof Game.prototype.pauseActiveSkill === 'function') this.ctx.patch(Game, 'pauseActiveSkill').after(() => send());
+    if (typeof Game !== 'undefined' && typeof Game.prototype.unpauseActiveSkill === 'function') this.ctx.patch(Game, 'unpauseActiveSkill').after(() => send());
     // merchantsPermitRead is a direct boolean property — no setter method to patch.
     // It's synced via snapshot only (one-time flag, rarely changes).
-    // Periodic tickTimestamp sync (so offline progress baseline matches)
-    // — send every 60s via the action tick loop instead of patching internal tick.
   }
 
-  _sendGameState() {
-    this.transport.send({
-      t: Msg.GAME_STATE,
+  _serializeGameState() {
+    return {
       tickTimestamp: game.tickTimestamp,
       merchantsPermitRead: game.merchantsPermitRead,
       isPaused: game._isPaused,
       visibleCompletion: game.completion ? game.completion.visibleCompletion : undefined,
-    });
+    };
+  }
+
+  _sendGameState() {
+    this.transport.send({ t: Msg.GAME_STATE, ...this._serializeGameState() });
   }
 
   _applyGameState(msg) {
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyGameState', () => {
       if (typeof msg.tickTimestamp === 'number') game.tickTimestamp = msg.tickTimestamp;
       if (typeof msg.merchantsPermitRead === 'boolean') game.merchantsPermitRead = msg.merchantsPermitRead;
       if (typeof msg.isPaused === 'boolean') {
@@ -4978,8 +4887,7 @@ class Sync {
       if (msg.visibleCompletion !== undefined && game.completion) {
         try { game.completion.setVisibleCompletion(msg.visibleCompletion); } catch { /* noop */ }
       }
-    } catch (e) { logger.error('applyGameState failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Lore books read sync ---------------------------------------------
@@ -4989,13 +4897,13 @@ class Sync {
       if (this._applyingRemote || !this.transport.isConnected) return;
       this._sendLore();
     };
-    if (typeof Lore.prototype.readLore === 'function') this.ctx.patch(Lore, 'readLore').after(() => send());
-    if (typeof Lore.prototype.updateLoreBookUnlocks === 'function') this.ctx.patch(Lore, 'updateLoreBookUnlocks').after(() => send());
+    if (typeof Lore !== 'undefined' && typeof Lore.prototype.readLore === 'function') this.ctx.patch(Lore, 'readLore').after(() => send());
+    if (typeof Lore !== 'undefined' && typeof Lore.prototype.updateLoreBookUnlocks === 'function') this.ctx.patch(Lore, 'updateLoreBookUnlocks').after(() => send());
   }
 
-  _sendLore() {
+  _serializeLoreRead() {
     const lore = game.lore;
-    if (!lore) return;
+    if (!lore) return [];
     const read = [];
     if (lore.books) for (const book of lore.books.allObjects) {
       // LoreBook has no public read-state field in the DTS; the game tracks
@@ -5008,13 +4916,18 @@ class Sync {
       }
       if (isRead) read.push(book.id);
     }
-    this.transport.send({ t: Msg.LORE, read });
+    return read;
+  }
+
+  _sendLore() {
+    const lore = game.lore;
+    if (!lore) return;
+    this.transport.send({ t: Msg.LORE, read: this._serializeLoreRead() });
   }
 
   _applyLore(msg) {
     if (!game.lore || !msg.read) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyLore', () => {
       // LoreBook has no public read-state field. readLore() opens the book
       // viewer modal, which spams the UI if called for every book. Instead,
       // just disable the read button visually (matching what readLore does
@@ -5030,8 +4943,7 @@ class Sync {
         }
       }
       if (game.lore.render) try { game.lore.render(); } catch { /* noop */ }
-    } catch (e) { logger.error('applyLore failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Realm selection sync ----------------------------------------------
@@ -5042,19 +4954,17 @@ class Sync {
       if (!game.currentRealm) return;
       this.transport.send({ t: Msg.REALM, realmId: game.currentRealm.id });
     };
-    this.ctx.patch(Game, 'selectRealm').after(() => send());
+    if (typeof Game !== 'undefined') this.ctx.patch(Game, 'selectRealm').after(() => send());
   }
 
   _applyRealmSelection(msg) {
     if (!msg.realmId || !game.realms) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyRealmSelection', () => {
       const realm = game.realms.getObjectByID(msg.realmId);
       if (realm && game.currentRealm !== realm && typeof game.selectRealm === 'function') {
         game.selectRealm(realm);
       }
-    } catch (e) { logger.error('applyRealmSelection failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Slayer task category completions sync -----------------------------
@@ -5066,13 +4976,8 @@ class Sync {
     if (!game.combat || !game.combat.slayerTask) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const cats = [];
-      try {
-        const task = game.combat.slayerTask;
-        if (task.categories) for (const cat of task.categories.allObjects) {
-          cats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
-        }
-      } catch { /* noop */ }
+      let cats = [];
+      try { cats = this._serializeSlayerCategories(); } catch { /* noop */ }
       this.transport.send({ t: Msg.SLAYER_CAT, cats });
     };
     // Piggyback on SlayerTask methods that are called when tasks complete
@@ -5085,10 +4990,18 @@ class Sync {
     }
   }
 
+  _serializeSlayerCategories() {
+    const cats = [];
+    const task = game.combat.slayerTask;
+    if (task.categories) for (const cat of task.categories.allObjects) {
+      cats.push({ catId: cat.id, tasksCompleted: cat.tasksCompleted || 0 });
+    }
+    return cats;
+  }
+
   _applySlayerCategories(msg) {
     if (!msg.cats || !game.combat || !game.combat.slayerTask) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applySlayerCategories', () => {
       const task = game.combat.slayerTask;
       if (!task.categories) return;
       for (const c of msg.cats) {
@@ -5097,8 +5010,7 @@ class Sync {
           cat.tasksCompleted = Math.max(cat.tasksCompleted || 0, c.tasksCompleted);
         }
       }
-    } catch (e) { logger.error('applySlayerCategories failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Cooking stockpile sync --------------------------------------------
@@ -5106,12 +5018,8 @@ class Sync {
     if (!game.cooking || !game.cooking.stockpileItems) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const stockpiles = [];
-      try {
-        for (const [cat, iq] of game.cooking.stockpileItems) {
-          stockpiles.push({ catId: cat.id, itemId: iq.item ? iq.item.id : null, qty: iq.quantity || 0 });
-        }
-      } catch { /* noop */ }
+      let stockpiles = [];
+      try { stockpiles = this._serializeCookingStockpiles(); } catch { /* noop */ }
       this.transport.send({ t: Msg.COOKING_STOCKPILE, stockpiles });
     };
     // Patch methods that modify stockpiles
@@ -5124,10 +5032,17 @@ class Sync {
     }
   }
 
+  _serializeCookingStockpiles() {
+    const stockpiles = [];
+    for (const [cat, iq] of game.cooking.stockpileItems) {
+      stockpiles.push({ catId: cat.id, itemId: iq.item ? iq.item.id : null, qty: iq.quantity || 0 });
+    }
+    return stockpiles;
+  }
+
   _applyCookingStockpile(msg) {
     if (!msg.stockpiles || !game.cooking || !game.cooking.stockpileItems) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyCookingStockpile', () => {
       for (const sp of msg.stockpiles) {
         const cat = game.cooking.categories.getObjectByID(sp.catId);
         if (!cat) continue;
@@ -5141,8 +5056,7 @@ class Sync {
           }
         }
       }
-    } catch (e) { logger.error('applyCookingStockpile failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Equipment set count sync ------------------------------------------
@@ -5163,8 +5077,7 @@ class Sync {
 
   _applyEquipSetCount(msg) {
     if (typeof msg.count !== 'number' || !game.combat || !game.combat.player) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyEquipSetCount', () => {
       // numEquipSets is a getter computed from shop modifiers, not a
       // settable property. Call updateEquipmentSets() to recompute from
       // the (already synced) shop upgrade count.
@@ -5172,8 +5085,7 @@ class Sync {
       if (msg.count > current && typeof game.combat.player.updateEquipmentSets === 'function') {
         try { game.combat.player.updateEquipmentSets(); } catch { /* skip */ }
       }
-    } catch (e) { logger.error('applyEquipSetCount failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   // ---- Game settings sync (gameplay-affecting only) ----------------------
@@ -5181,21 +5093,7 @@ class Sync {
     if (!game.settings) return;
     const send = () => {
       if (this._applyingRemote || !this.transport.isConnected) return;
-      const s = game.settings;
-      this.transport.send({
-        t: Msg.SETTINGS,
-        settings: {
-          continueIfBankFull: s.continueIfBankFull,
-          continueThievingOnStun: s.continueThievingOnStun,
-          autoRestartDungeon: s.autoRestartDungeon,
-          enableAutoSlayer: s.enableAutoSlayer,
-          enableAutoEquipFood: s.enableAutoEquipFood,
-          enableAutoSwapFood: s.enableAutoSwapFood,
-          enablePerfectCooking: s.enablePerfectCooking,
-          enablePermaCorruption: s.enablePermaCorruption,
-          enableOfflineCombat: s.enableOfflineCombat,
-        },
-      });
+      this.transport.send({ t: Msg.SETTINGS, settings: this._serializeSettings() });
     };
     // Patch the Settings class methods that change settings
     if (typeof Settings !== 'undefined' && Settings.prototype) {
@@ -5207,46 +5105,46 @@ class Sync {
     }
   }
 
+  _serializeSettings() {
+    const s = game.settings;
+    const settings = {};
+    for (const key of SETTINGS_BOOL_KEYS) settings[key] = s[key];
+    return settings;
+  }
+
   _applyGameSettings(msg) {
     if (!msg.settings || !game.settings) return;
-    this._applyingRemote = true;
-    try {
+    this._applyRemote('applyGameSettings', () => {
       const s = game.settings;
       const m = msg.settings;
       // Settings are getter-only properties on the Settings class.
       // Use setTogglesChecked() to actually change them (it sets the
       // internal backing field and updates the UI checkbox).
-      const boolKeys = [
-        'continueIfBankFull', 'continueThievingOnStun', 'autoRestartDungeon',
-        'enableAutoSlayer', 'enableAutoEquipFood', 'enableAutoSwapFood',
-        'enablePerfectCooking', 'enablePermaCorruption', 'enableOfflineCombat',
-      ];
-      for (const key of boolKeys) {
+      for (const key of SETTINGS_BOOL_KEYS) {
         if (typeof m[key] === 'boolean') {
           try { s.setTogglesChecked(key, m[key]); } catch { /* skip */ }
         }
       }
-    } catch (e) { logger.error('applyGameSettings failed', e); }
-    finally { this._applyingRemote = false; }
+    }, { save: false });
   }
 
   _patchActionStartStop() {
     // Patch game.stopActiveAction and game.clearActiveAction to broadcast stops.
-    this.ctx.patch(Game, 'stopActiveAction').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.ACTION_STOP });
-    });
-    this.ctx.patch(Game, 'clearActiveAction').after(function () {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({ t: Msg.ACTION_STOP });
-    });
+    if (typeof Game !== 'undefined') {
+      for (const m of ['stopActiveAction', 'clearActiveAction']) {
+        this.ctx.patch(Game, m).after(function () {
+          if (sync._applyingRemote || !sync.transport.isConnected) return;
+          sync.transport.send({ t: Msg.ACTION_STOP });
+        });
+      }
+    }
   }
 
   _startProgressBroadcaster() {
     // Every 500ms, if we have an active action, broadcast the timer progress
     // so the other player's panel progress bar moves in sync.
     this._progressTimer = setInterval(() => {
-      if (!this.transport.isConnected || this._applyingRemote) return;
+      if (!this._canSend()) return;
       const active = game.activeAction;
       if (!active) return;
       try {
@@ -5337,41 +5235,6 @@ class Sync {
     } catch (e) { logger.warn('applyActionStart failed', e); }
   }
 
-  // Find the specific progress bar for the action being performed.
-  _findActionProgressBar(skill, container, recipeId) {
-    try {
-      // Mining: use the global rockMenus map to find the specific rock's
-      // miningProgress bar (NOT hpProgress).
-      if (skill.id === 'melvorD:Mining' && typeof rockMenus !== 'undefined') {
-        for (const [rock, el] of rockMenus) {
-          if (recipeId && rock.id === recipeId) {
-            if (el && el.miningProgress) return el.miningProgress;
-          }
-        }
-        if (skill.activeProgressRock) {
-          const el = rockMenus.get(skill.activeProgressRock);
-          if (el && el.miningProgress) return el.miningProgress;
-        }
-      }
-
-      // Most skills have a menu object with a progressBar property.
-      const menuProps = ['menu', '_menu', 'actionMenu'];
-      for (const prop of menuProps) {
-        if (skill[prop] && skill[prop].progressBar) return skill[prop].progressBar;
-      }
-
-      // Fallback: find the first progress-bar in the container that is NOT
-      // an HP bar or inside a rock element.
-      const bars = container.querySelectorAll('progress-bar');
-      for (const bar of bars) {
-        if (bar.currentStyle === 'bg-danger') continue;
-        if (bar.closest('mining-rock-element')) continue;
-        if (bar.animateProgress || bar.animateProgressFromTimer) return bar;
-      }
-    } catch (e) { /* noop */ }
-    return null;
-  }
-
   _applyActionStop(msg) {
     // Just clear the panel's mini progress bar. Don't touch any game
     // objects — calling skill.stopActiveProgressBar() or similar methods
@@ -5389,7 +5252,7 @@ class Sync {
     // XP, mastery, and other state are already synced in real-time via
     // individual patches. This is just a safety net for currencies.
     this._stateSyncTimer = setInterval(() => {
-      if (!this.transport.isConnected || this._applyingRemote) return;
+      if (!this._canSend()) return;
       try {
         if (game.currencies) for (const c of game.currencies.allObjects) {
           this.transport.send({ t: Msg.CURRENCY, currencyId: c.id, qty: c._amount });
@@ -5866,15 +5729,7 @@ class Sync {
     if (game.stats) {
       const statsData = {};
       try {
-        const namedKeys = [
-          'Woodcutting', 'Fishing', 'Firemaking', 'Cooking', 'Mining', 'Smithing',
-          'Attack', 'Strength', 'Defence', 'Hitpoints', 'Thieving', 'Farming',
-          'Ranged', 'Fletching', 'Crafting', 'Runecrafting', 'Magic', 'Prayer',
-          'Slayer', 'Herblore', 'Agility', 'Summoning', 'Astrology', 'Township',
-          'Archaeology', 'Cartography', 'Corruption', 'Harvesting',
-          'General', 'Combat', 'GolbinRaid', 'Shop',
-        ];
-        for (const key of namedKeys) {
+        for (const key of STATS_TRACKER_KEYS) {
           const tracker = game.stats[key];
           if (!tracker || !tracker.stats) continue;
           const entries = {};
@@ -5882,7 +5737,7 @@ class Sync {
           statsData[key] = entries;
         }
         // MappedStatTrackers
-        for (const key of ['Items', 'Monsters']) {
+        for (const key of STATS_MAPPED_TRACKER_KEYS) {
           const mst = game.stats[key];
           if (!mst || !mst.statsMap) continue;
           const mapped = {};
@@ -6763,12 +6618,7 @@ class Sync {
         try {
           const s = game.settings;
           // Settings are getter-only; use setTogglesChecked to change them.
-          const boolKeys = [
-            'continueIfBankFull', 'continueThievingOnStun', 'autoRestartDungeon',
-            'enableAutoSlayer', 'enableAutoEquipFood', 'enableAutoSwapFood',
-            'enablePerfectCooking', 'enablePermaCorruption', 'enableOfflineCombat',
-          ];
-          for (const key of boolKeys) {
+          for (const key of SETTINGS_BOOL_KEYS) {
             if (typeof msg.settings[key] === 'boolean') {
               try { s.setTogglesChecked(key, msg.settings[key]); } catch { /* skip */ }
             }
@@ -7435,6 +7285,17 @@ function formatAction(claim) {
   return skillName;
 }
 
+// Trigger a browser download of a text file (Blob → object URL → anchor click).
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // Show text in a modal overlay so the user can manually select+copy it.
 // This works even in cross-origin iframes where the Clipboard API is blocked.
 function showTextModal(title, text, opts = {}) {
@@ -7497,15 +7358,7 @@ function showTextModal(title, text, opts = {}) {
   // Add a download button for save strings (which can be very long).
   if (opts.download) {
     const dlBtn = makeBtn('Download file', '#1f2937', '#34d399');
-    dlBtn.addEventListener('click', () => {
-      const blob = new Blob([text], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = opts.download;
-      a.click();
-      URL.revokeObjectURL(url);
-    });
+    dlBtn.addEventListener('click', () => downloadText(opts.download, text));
     btnRow.insertBefore(dlBtn, closeBtn);
   }
 
@@ -7749,13 +7602,7 @@ class Panel {
       const text = exportLog();
       // Try downloading directly; if that fails (iframe), show in modal.
       try {
-        const blob = new Blob([text], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'realMP-log.txt';
-        a.click();
-        URL.revokeObjectURL(url);
+        downloadText('realMP-log.txt', text);
         logger.info('Log file downloaded (' + text.length + ' bytes)');
       } catch (err) {
         logger.warn('Log download failed, showing in modal:', err);
@@ -7791,12 +7638,10 @@ class Panel {
     });
     this.transport.on('send_save', () => {
       this._showRow('saveSyncRow');
-      const $ = (s) => this.$(s);
       $('saveSyncRow').textContent = 'Sending save to peer...';
     });
     this.transport.on('save_sync', () => {
       this._showRow('saveSyncRow');
-      const $ = (s) => this.$(s);
       $('saveSyncRow').textContent = 'Loading host save...';
     });
     this.transport.on('error', (e) => {
@@ -7807,68 +7652,43 @@ class Panel {
 
     // Listen for remote action progress updates.
     if (this.sync && this.sync.onRemoteAction) {
-      this.sync.onRemoteAction((remote) => {
-        const $ = (s) => this.$(s);
-        const bar = $('remoteProgressBar');
-        const fill = $('remoteProgressFill');
-        const recipesEl = $('remoteRecipes');
-        if (!bar || !fill) return;
-        if (remote) {
-          bar.hidden = false;
-          fill.style.width = (remote.progress * 100).toFixed(1) + '%';
-          // Apply skill-specific color class
-          fill.className = 'rmp-fake-bar-fill ' + this._skillColorClass(remote.skillId, 'remote');
-          // Show recipe chips (e.g. tree names for woodcutting)
-          if (recipesEl) {
-            const recipes = remote.recipes || [];
-            if (recipes.length > 0) {
-              recipesEl.hidden = false;
-              recipesEl.innerHTML = recipes.map(r =>
-                `<span class="rmp-recipe-chip">${this._esc(r.name || r.id)}</span>`
-              ).join('');
-            } else {
-              recipesEl.hidden = true;
-              recipesEl.innerHTML = '';
-            }
-          }
-        } else {
-          bar.hidden = true;
-          fill.style.width = '0%';
-          if (recipesEl) { recipesEl.hidden = true; recipesEl.innerHTML = ''; }
-        }
-      });
+      this.sync.onRemoteAction((r) => this._renderProgress('remote', r));
     }
 
     // Listen for local action progress updates.
     if (this.sync && this.sync.onLocalAction) {
-      this.sync.onLocalAction((local) => {
-        const $ = (s) => this.$(s);
-        const bar = $('localProgressBar');
-        const fill = $('localProgressFill');
-        const recipesEl = $('localRecipes');
-        if (!bar || !fill) return;
-        if (local) {
-          bar.hidden = false;
-          fill.style.width = (local.progress * 100).toFixed(1) + '%';
-          fill.className = 'rmp-fake-bar-fill ' + this._skillColorClass(local.skillId, 'local');
-          if (recipesEl) {
-            const recipes = local.recipes || [];
-            if (recipes.length > 0) {
-              recipesEl.hidden = false;
-              recipesEl.innerHTML = recipes.map(r =>
-                `<span class="rmp-recipe-chip">${this._esc(r.name || r.id)}</span>`
-              ).join('');
-            } else {
-              recipesEl.hidden = true;
-              recipesEl.innerHTML = '';
-            }
-          }
+      this.sync.onLocalAction((l) => this._renderProgress('local', l));
+    }
+  }
+
+  // Render an action progress bar + recipe chips for one side ('local'|'remote').
+  _renderProgress(side, data) {
+    const bar = this.$(`${side}ProgressBar`);
+    const fill = this.$(`${side}ProgressFill`);
+    const recipesEl = this.$(`${side}Recipes`);
+    if (!bar || !fill) return;
+    if (data) {
+      bar.hidden = false;
+      fill.style.width = (data.progress * 100).toFixed(1) + '%';
+      // Apply skill-specific color class
+      fill.className = 'rmp-fake-bar-fill ' + this._skillColorClass(data.skillId, side);
+      // Show recipe chips (e.g. tree names for woodcutting)
+      if (recipesEl) {
+        const recipes = data.recipes || [];
+        if (recipes.length > 0) {
+          recipesEl.hidden = false;
+          recipesEl.innerHTML = recipes.map(r =>
+            `<span class="rmp-recipe-chip">${this._esc(r.name || r.id)}</span>`
+          ).join('');
         } else {
-          bar.hidden = true;
-          fill.style.width = '0%';
-          if (recipesEl) { recipesEl.hidden = true; recipesEl.innerHTML = ''; }
+          recipesEl.hidden = true;
+          recipesEl.innerHTML = '';
         }
-      });
+      }
+    } else {
+      bar.hidden = true;
+      fill.style.width = '0%';
+      if (recipesEl) { recipesEl.hidden = true; recipesEl.innerHTML = ''; }
     }
   }
 
