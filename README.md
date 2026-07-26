@@ -36,14 +36,6 @@ connection.
 8. The peer writes that value straight into the game's internal fields and
    re-renders, bypassing the modifier pipeline so progress is never counted
    twice. Both clients converge on identical state.
-
-### Action lock
-
-A "current action" watcher reports which skill each player is training and
-warns in the UI when both pick the same skill (since that would duplicate
-effort rather than parallelise it). An action-lock system tracks who is
-training what and shows advisory conflict warnings in the panel.
-
 ---
 
 ## What gets synced
