@@ -2054,12 +2054,16 @@ class Sync {
   _sendAgility() {
     const ag = game.agility;
     if (!ag) return;
-    // obstacleBuildCount: how many times each obstacle has been built
+    this.transport.send({ t: Msg.AGILITY, courses: this._serializeAgilityCourses(), activeObstacle: ag.currentlyActiveObstacle, buildCounts: this._serializeObstacleBuildCounts() });
+  }
+
+  // obstacleBuildCount: how many times each obstacle has been built
+  _serializeObstacleBuildCounts() {
     const buildCounts = [];
-    if (ag.obstacleBuildCount) for (const [ob, count] of ag.obstacleBuildCount) {
+    if (game.agility && game.agility.obstacleBuildCount) for (const [ob, count] of game.agility.obstacleBuildCount) {
       buildCounts.push({ id: ob.id, count });
     }
-    this.transport.send({ t: Msg.AGILITY, courses: this._serializeAgilityCourses(), activeObstacle: ag.currentlyActiveObstacle, buildCounts });
+    return buildCounts;
   }
 
   _serializeAgilityCourses() {
@@ -2278,7 +2282,7 @@ class Sync {
       }
       if (as.render) try { as.render(); } catch { /* noop */ }
       if (as.renderVisibleConstellations) try { as.renderVisibleConstellations(); } catch { /* noop */ }
-    }, { save: false });
+    });
   }
 
   // ---- Summoning sync (marks unlocked, selected costs) -----------------
@@ -2863,18 +2867,32 @@ class Sync {
     if (data.selectedRecipeId) s.selectedRecipe = s.actions.getObjectByID(data.selectedRecipeId);
   }
 
-  // Harvesting selection + vein intensities. NOTE: OVERWRITE semantics shared
-  // by the live SKILL_SELECT handler and the snapshot skillSelects block —
-  // deliberately different from the snapshot's separate harvestingVeins block
-  // (which skips the locally-harvested vein and max-merges maxIntensity).
-  // Do not unify the two; see _applySnapshot.
+  // Harvesting selection + vein intensities.
   _applyHarvestingSelection(data) {
     const s = game.harvesting;
     if (!s) return;
     if (data.veinId) s.selectedVein = s.actions.getObjectByID(data.veinId);
-    if (data.veins) for (const v of data.veins) {
+    if (data.veins) this._applyVeinStates(data.veins);
+  }
+
+  // Vein intensity is shared state, but a live packet can be ~2s stale, so
+  // never overwrite the vein the local player is actively draining
+  // (skip-local), and max-merge the monotonic maxIntensity. Shared by the
+  // live SKILL_SELECT handler and the snapshot harvestingVeins block.
+  _applyVeinStates(veins) {
+    const s = game.harvesting;
+    if (!s) return;
+    let localVeinId = null;
+    try {
+      if (s.selectedVein && s.selectedVein.id) localVeinId = s.selectedVein.id;
+      else if (s.activeProgressVein && s.activeProgressVein.id) localVeinId = s.activeProgressVein.id;
+    } catch { /* noop */ }
+    for (const v of veins) {
+      if (localVeinId && v.id === localVeinId) continue;
       const vein = s.actions.getObjectByID(v.id);
-      if (vein) { vein.currentIntensity = v.intensity; vein.maxIntensity = v.max; }
+      if (!vein) continue;
+      if (typeof v.intensity === 'number') vein.currentIntensity = v.intensity;
+      if (typeof v.max === 'number') vein.maxIntensity = Math.max(vein.maxIntensity || 0, v.max);
     }
   }
 
@@ -5008,7 +5026,11 @@ class Sync {
   _applyGameState(msg) {
     this._applyRemote('applyGameState', () => {
       if (typeof msg.tickTimestamp === 'number') game.tickTimestamp = msg.tickTimestamp;
-      if (typeof msg.merchantsPermitRead === 'boolean') game.merchantsPermitRead = msg.merchantsPermitRead;
+      if (typeof msg.merchantsPermitRead === 'boolean') {
+        game.merchantsPermitRead = msg.merchantsPermitRead;
+        // Mirror the game's own read path (Bank.readItemOnClick): refresh shop costs.
+        if (msg.merchantsPermitRead && game.shop && game.shop.renderQueue) game.shop.renderQueue.costs = true;
+      }
       if (typeof msg.isPaused === 'boolean') {
         // Use the game's pauseActiveSkill/unpauseActiveSkill methods if available
         // to keep UI in sync. Fall back to direct boolean set.
@@ -5540,9 +5562,9 @@ class Sync {
     }
     if (mastery.length > 0) snapshot.mastery = mastery;
 
-    // Agility courses (buildCounts deliberately omitted — snapshot omits, sender sends)
+    // Agility courses + build counts (full sender shape — joiner converges immediately)
     if (game.agility) {
-      snapshot.agility = { courses: this._serializeAgilityCourses(), activeObstacle: game.agility.currentlyActiveObstacle };
+      snapshot.agility = { courses: this._serializeAgilityCourses(), activeObstacle: game.agility.currentlyActiveObstacle, buildCounts: this._serializeObstacleBuildCounts() };
     }
 
     // Astrology upgrades (+ snapshot-only studied/explored selection)
@@ -5579,24 +5601,10 @@ class Sync {
       }
     }
 
-    // Township
-    // Deliberate subset of _serializeTownship() (no efficiency/townData/worship; ticks coerced) — do not unify.
+    // Township (full shape: biomes, resources, ticks, efficiency, townData,
+    // worship selection) — the joiner converges immediately, no 5s wait.
     if (game.township) {
-      const tw = game.township;
-      const townshipData = { biomes: [], resources: {}, totalTicks: 0, legacyTicks: 0 };
-      try {
-        if (tw.biomes) for (const biome of tw.biomes.allObjects) {
-          const buildings = {};
-          if (biome.buildingsBuilt) for (const [b, count] of biome.buildingsBuilt) buildings[b.id] = count;
-          townshipData.biomes.push({ id: biome.id, buildings });
-        }
-        if (tw.resources) for (const r of tw.resources.allObjects) {
-          townshipData.resources[r.id] = { amount: r._amount, cap: r._cap };
-        }
-        townshipData.totalTicks = tw.totalTicks || 0;
-        townshipData.legacyTicks = tw.legacyTicks || 0;
-      } catch { /* noop */ }
-      snapshot.township = townshipData;
+      snapshot.township = this._serializeTownship();
     }
 
     // Cartography (attach only on success — skip-on-throw)
@@ -5730,14 +5738,13 @@ class Sync {
         if (!sk || !sk.selectedRecipeInRealm) continue;
         skillSelects[skillName] = this._serializeArtisanSelection(sk);
       }
-      // Harvesting
+      // Harvesting — selection only; vein state travels once via the
+      // top-level harvestingVeins key (skip-local + max-merge apply).
       if (game.harvesting) {
-        skillSelects.harvesting = this._serializeHarvestingSelection();
+        skillSelects.harvesting = { veinId: game.harvesting.selectedVein ? game.harvesting.selectedVein.id : null };
       }
-      // Archaeology — same object as snapshot.archaeology (serialized once above)
-      if (archData) {
-        skillSelects.archaeology = archData;
-      }
+      // Archaeology travels once via the top-level archaeology key — the
+      // bulk apply is idempotent, so a second copy here was pure wire bloat.
     } catch { /* noop */ }
     if (Object.keys(skillSelects).length > 0) snapshot.skillSelects = skillSelects;
 
@@ -5825,13 +5832,14 @@ class Sync {
         }
       }
       // ---- Currencies ----
+      // Same semantics as the live absolute path (_applyCurrency): trust the
+      // sender's value clamped at 0 — currency legitimately decreases, and a
+      // max-merge here would resurrect currency the sender already spent.
       for (const c of (msg.currencies || [])) {
         const cur = this._currencyById(c.id);
-        if (!cur) continue;
-        // Use max to avoid resetting currencies to 0 if the snapshot has
-        // stale data or the receiver has earned more since the snapshot.
-        const newAmt = Math.max(cur._amount || 0, c.qty || 0);
-        cur._amount = newAmt;
+        if (!cur || typeof c.qty !== 'number') continue;
+        if (cur.set) cur.set(Math.max(0, c.qty));
+        else cur._amount = Math.max(0, c.qty);
         if (cur.renderAmount) cur.renderAmount();
         if (cur.onAmountChange) cur.onAmountChange();
       }
@@ -5931,7 +5939,9 @@ class Sync {
         } else {
           // Advance stages to match.
           const remoteStagesCompleted = data.stagesCompleted || 0;
-          while (t._stagesCompleted < remoteStagesCompleted && !t.complete) {
+          let safety = 0;
+          while (t._stagesCompleted < remoteStagesCompleted && !t.complete && safety < 20) {
+            safety++;
             try {
               const current = t.currentStage;
               if (current && current.complete && !current.claimed) current.setClaimed();
@@ -5946,7 +5956,7 @@ class Sync {
           if (stageData.claimed && !stage.claimed) stage.claimed = true;
           for (const taskData of (stageData.tasks || [])) {
             const task = stage.tasks.find(tt => tt.id === taskData.id);
-            if (task && typeof taskData.progress === 'number') task.progress = taskData.progress;
+            if (task && typeof taskData.progress === 'number') task.progress = Math.max(task.progress || 0, taskData.progress);
           }
         }
         if (t.renderQueue) {
@@ -5979,20 +5989,9 @@ class Sync {
         if (game.mining.renderRockHP) game.mining.renderRockHP();
         if (game.mining.renderRockStatus) game.mining.renderRockStatus();
       }
-      // Harvesting veins — skip the vein the local player is harvesting
+      // Harvesting veins — skip-local + max-merge (shared with the live path)
       if (msg.harvestingVeins && game.harvesting) {
-        let localVeinId = null;
-        try {
-          if (game.harvesting.selectedVein && game.harvesting.selectedVein.id) localVeinId = game.harvesting.selectedVein.id;
-          else if (game.harvesting.activeProgressVein && game.harvesting.activeProgressVein.id) localVeinId = game.harvesting.activeProgressVein.id;
-        } catch { /* noop */ }
-        for (const v of msg.harvestingVeins) {
-          if (localVeinId && v.id === localVeinId) continue;
-          const vein = game.harvesting.actions.getObjectByID(v.id);
-          if (!vein) continue;
-          if (typeof v.intensity === 'number') vein.currentIntensity = v.intensity;
-          if (typeof v.max === 'number') vein.maxIntensity = Math.max(vein.maxIntensity || 0, v.max);
-        }
+        this._applyVeinStates(msg.harvestingVeins);
         if (game.harvesting.renderVeinIntensity) game.harvesting.renderVeinIntensity();
         if (game.harvesting.renderVeinStatus) game.harvesting.renderVeinStatus();
       }
@@ -6093,9 +6092,10 @@ class Sync {
           if (skill.renderMasteryPool) try { skill.renderMasteryPool(); } catch { /* skip */ }
         }
       }
-      // Agility from snapshot
+      // Agility from snapshot (pass-through incl. buildCounts)
       if (msg.agility && game.agility) {
-        this._applyAgility({ courses: msg.agility.courses, activeObstacle: msg.agility.activeObstacle });
+        this._applyAgility(msg.agility);
+        this._applyingRemote = true;
       }
       // Astrology from snapshot
       if (msg.astrology && game.astrology) {
@@ -6109,18 +6109,22 @@ class Sync {
       // Summoning from snapshot
       if (msg.summoning && game.summoning) {
         this._applySummoning(msg.summoning);
+        this._applyingRemote = true;
       }
       // Slayer from snapshot
       if (msg.slayer && game.slayer) {
         this._applySlayer(msg.slayer);
+        this._applyingRemote = true;
       }
       // Township from snapshot
       if (msg.township && game.township) {
         this._applyTownship(msg.township);
+        this._applyingRemote = true;
       }
       // Cartography from snapshot
       if (msg.cartography && game.cartography) {
         this._applyCartography(msg.cartography);
+        this._applyingRemote = true;
       }
       // Archaeology from snapshot
       if (msg.archaeology && game.archaeology) {
@@ -6133,18 +6137,22 @@ class Sync {
       // Clue hunt from snapshot
       if (msg.clueHunt && game.clueHunt) {
         this._applyClueHunt(msg.clueHunt);
+        this._applyingRemote = true;
       }
       // Corruption from snapshot
       if (msg.corruption && game.corruption) {
         this._applyCorruption(msg.corruption);
+        this._applyingRemote = true;
       }
       // Raid from snapshot
       if (msg.raid && game.golbinRaid) {
         this._applyRaid(msg.raid);
+        this._applyingRemote = true;
       }
       // Fishing contest from snapshot
       if (msg.fishContest && game.fishing && game.fishing.contest) {
         this._applyFishingContest(msg.fishContest);
+        this._applyingRemote = true;
       }
       // Stats from snapshot
       if (msg.stats && game.stats) {
@@ -6169,10 +6177,12 @@ class Sync {
       // Ancient relics from snapshot
       if (msg.ancientRelics) {
         this._applyAncientRelic({ relics: msg.ancientRelics });
+        this._applyingRemote = true;
       }
       // Skill trees from snapshot
       if (msg.skillTrees) {
         this._applySkillTree({ trees: msg.skillTrees });
+        this._applyingRemote = true;
       }
       // Skill selections from snapshot
       if (msg.skillSelects) {
@@ -6206,10 +6216,6 @@ class Sync {
           }
           // Harvesting
           if (ss.harvesting && game.harvesting && canSync('harvesting')) this._applyHarvestingSelection(ss.harvesting);
-          // Archaeology
-          if (ss.archaeology && game.archaeology) {
-            this._applyArchaeologyBulk(ss.archaeology, { requireDonatedItems: false });
-          }
         } catch (e) { logger.warn('applySkillSelects snapshot failed', e); }
       }
       // Current realm from snapshot
@@ -6239,7 +6245,12 @@ class Sync {
             const cat = game.cooking.categories.getObjectByID(sp.catId);
             if (!cat) continue;
             const item = sp.itemId ? game.items.getObjectByID(sp.itemId) : null;
-            if (item) game.cooking.stockpileItems.set(cat, { item, quantity: sp.qty });
+            // Max-merge like the live path (_applyCookingStockpile) — a stale
+            // snapshot must never shrink a stockpile.
+            if (item) {
+              const curSp = game.cooking.stockpileItems.get(cat);
+              if (!curSp || sp.qty > (curSp.quantity || 0)) game.cooking.stockpileItems.set(cat, { item, quantity: sp.qty });
+            }
           }
         } catch { /* noop */ }
       }
