@@ -165,7 +165,8 @@ default public relay is provided.
 
 > The bundled default relay is a temporary Cloudflare tunnel — fine for
 > testing, but it can move or disappear. For anything serious, self-host a
-> relay and paste its URL into the panel (the URL persists in localStorage).
+> relay (see **Running your own relay server** below) and paste its URL into
+> the panel (the URL persists in localStorage).
 
 Features:
 - **Ping/pong** heartbeat every 10s with real RTT latency display
@@ -180,6 +181,232 @@ Features:
 - **Re-entrancy guard** (`_applyingRemote` flag) prevents recursive sync loops
   during remote application
 - **Auto-save** — debounced save 5s after state changes
+
+---
+
+## Running your own relay server (recommended)
+
+The mod needs a tiny WebSocket relay so the two players can find each other
+and exchange messages. The relay is dumb by design: it pairs the first two
+connected players and shuttles messages between them. It cannot play the game,
+but it **does see all traffic** (including the save sync) — another reason to
+run your own instead of trusting a stranger's.
+
+The whole setup takes ~5 minutes, is free, and requires no account and no
+router changes.
+
+### Step 1 — Install Node.js
+
+1. Go to <https://nodejs.org> and download the **LTS** version.
+2. Run the installer with default options (Windows: keep *Add to PATH* checked).
+3. Open a terminal (Windows: PowerShell or Command Prompt; macOS/Linux: Terminal) and verify:
+
+   ```
+   node --version
+   ```
+
+   You must see something like `v20.x.x`. If you get "not recognized", close
+   and reopen the terminal, or reinstall Node.js.
+
+### Step 2 — Create the server file
+
+1. Create a folder, e.g. `melvor-relay`, and open a terminal inside it
+   (Windows: Shift + right-click the folder → *Open in Terminal* /
+   *Open PowerShell window here*).
+2. Create a file named **exactly** `server.js`. Windows: make sure it is not
+   secretly `server.js.txt` — in Notepad use *Save as → Save as type: All files*.
+3. Paste this code and save:
+
+   ```js
+   // Simple WebSocket relay server for the Melvor Idle realMultiplayer mod.
+   //
+   // Two players connect to this server. The server pairs them and relays
+   // every message from one to the other. No WebRTC, no NAT traversal — just
+   // plain WebSocket, which works through any firewall that allows HTTPS.
+   //
+   // Usage:
+   //   node server.js [port]
+   //
+   // Default port: 8080
+
+   const { WebSocketServer } = require('ws');
+
+   const PORT = parseInt(process.argv[2] || '8080', 10);
+   const wss = new WebSocketServer({ port: PORT });
+
+   // Simple room model: first player to connect becomes the host and waits.
+   // Second player joins the same room. They get paired and messages relay.
+   let host = null;
+   let peer = null;
+
+   console.log(`[mp-server] Listening on port ${PORT}`);
+   console.log(`[mp-server] Waiting for players to connect...`);
+
+   function tryPair() {
+     if (host && peer && host.readyState === 1 && peer.readyState === 1) {
+       console.log('[mp-server] Paired! Relaying messages between host and peer.');
+       host.send(JSON.stringify({ t: 'paired', role: 'host' }));
+       peer.send(JSON.stringify({ t: 'paired', role: 'peer' }));
+     }
+   }
+
+   wss.on('connection', (ws, req) => {
+     const ip = req.socket.remoteAddress;
+     console.log(`[mp-server] New connection from ${ip}`);
+
+     if (!host) {
+       host = ws;
+       console.log('[mp-server] Assigned as HOST. Waiting for peer...');
+       ws.send(JSON.stringify({ t: 'waiting' }));
+       ws.on('message', (data) => {
+         if (peer && peer.readyState === 1) peer.send(data.toString());
+       });
+       ws.on('close', () => {
+         console.log('[mp-server] Host disconnected.');
+         host = null;
+         if (peer) { try { peer.send(JSON.stringify({ t: 'peer_left' })); } catch {} }
+       });
+     } else if (!peer) {
+       peer = ws;
+       console.log('[mp-server] Assigned as PEER. Attempting to pair...');
+       ws.on('message', (data) => {
+         if (host && host.readyState === 1) host.send(data.toString());
+       });
+       ws.on('close', () => {
+         console.log('[mp-server] Peer disconnected.');
+         peer = null;
+         if (host) { try { host.send(JSON.stringify({ t: 'peer_left' })); } catch {} }
+       });
+       tryPair();
+     } else {
+       console.log('[mp-server] Room full — rejecting extra connection.');
+       ws.send(JSON.stringify({ t: 'error', msg: 'Room is full (2 players max).' }));
+       ws.close();
+     }
+
+     ws.on('error', (err) => console.error('[mp-server] WS error:', err.message));
+   });
+
+   wss.on('error', (err) => console.error('[mp-server] Server error:', err.message));
+   ```
+
+### Step 3 — Install the one dependency
+
+In the same folder, run:
+
+```
+npm init -y
+npm install ws
+```
+
+### Step 4 — Start the relay
+
+```
+node server.js
+```
+
+Expected output:
+
+```
+[mp-server] Listening on port 8080
+[mp-server] Waiting for players to connect...
+```
+
+Keep this window open while you play. To use a different port:
+`node server.js 9000`.
+
+### Step 5 — Get your relay address
+
+Pick **one** of the options below.
+
+#### Option A — Same network / same house (LAN)
+
+Use this when both players are on the same Wi-Fi/network.
+
+1. Find your local IP:
+   - Windows: run `ipconfig`, look for **IPv4 Address** (e.g. `192.168.1.50`).
+   - macOS/Linux: run `ip addr` (or `ifconfig`), look for `192.168.x.x` or `10.x.x.x`.
+2. If Windows Firewall asks about Node.js, allow access on **Private networks**.
+3. Your relay address is:
+
+   ```
+   ws://192.168.1.50:8080
+   ```
+
+   (Replace with your actual IP; keep `ws://` and `:8080`.)
+
+#### Option B — Over the internet via Cloudflare quick tunnel (easiest)
+
+Free, no account, no port forwarding, encrypted (`wss://`).
+
+1. Download `cloudflared` from
+   <https://github.com/cloudflare/cloudflared/releases>:
+   - Windows: `cloudflared-windows-amd64.msi` (installer) or the `.exe`,
+   - macOS: `cloudflared-darwin-amd64.pkg`,
+   - Linux: the `.deb` / `.rpm` for your distro.
+2. Open a **second** terminal (keep the relay running in the first one) and run:
+
+   ```
+   cloudflared tunnel --url http://localhost:8080
+   ```
+
+   Windows, standalone exe: open a terminal in the folder where you downloaded
+   it and run `cloudflared-windows-amd64.exe tunnel --url http://localhost:8080`.
+3. The output contains a line like:
+
+   ```
+   https://some-random-words.trycloudflare.com
+   ```
+
+4. Your relay address is that URL with `https://` replaced by `wss://`:
+
+   ```
+   wss://some-random-words.trycloudflare.com
+   ```
+
+   (No port number — Cloudflare handles that.)
+
+> A quick tunnel gets a **new random address every time** you restart
+> cloudflared — keep the window open while playing, and re-share the address
+> after a restart. For a permanent address, create a free Cloudflare account
+> and set up a *named tunnel* (see Cloudflare's docs).
+
+#### Option C — Port forwarding (advanced)
+
+Forward TCP port `8080` to your PC in your router settings, then use
+`ws://<your public IP>:8080`. Note: plain `ws://` is unencrypted — prefer
+Option B unless you know what you're doing.
+
+### Step 6 — Connect both players
+
+1. Both players open the **Multiplayer** panel in the game.
+2. Paste the **exact same relay address** into the server URL field on both
+   sides, enter your names, and click **Connect**.
+3. The first to connect becomes the **host**; the host's save is synced to the
+   peer automatically.
+
+### Verify it works
+
+- The relay window prints `[mp-server] New connection from ...` and then
+  `[mp-server] Paired! Relaying messages between host and peer.`
+- The panel shows the paired state, your peer's name, and a live ping.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `node is not recognized` | Close and reopen the terminal; reinstall Node.js with *Add to PATH* checked. |
+| `EADDRINUSE` / port 8080 in use | Start on another port: `node server.js 9000`, and use that port in the URL. |
+| Friend can't connect | Both sides pasted the **exact same** URL? Relay window still open? Tunnel window still open? Correct `ws://` vs `wss://` prefix (see below)? |
+| `Room is full (2 players max)` | Someone else connected first. Restart the relay, or run your own on a different port. |
+
+**URL prefix cheat sheet**
+
+| Situation | Address format |
+|-----------|----------------|
+| Same network (LAN) | `ws://192.168.x.x:8080` |
+| Own IP / port forward | `ws://<public-ip>:8080` |
+| Cloudflare tunnel | `wss://<random-words>.trycloudflare.com` (no port) |
 
 ---
 
