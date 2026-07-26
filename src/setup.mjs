@@ -99,6 +99,7 @@ const Msg = Object.freeze({
   EQUIP_SET_COUNT: 'equip_set_count', // number of equipment set slots
   SETTINGS: 'settings',             // gameplay-affecting game settings
   MUSEUM_DONATE: 'museum_donate',   // { itemId } — 1 player donated, auto-donate for peer
+  BANK_TAB_COUNT: 'bank_tab_count', // number of bank tabs purchased
 });
 const encode = (msg) => JSON.stringify(msg);
 const decode = (data) => {
@@ -116,7 +117,7 @@ const decode = (data) => {
 // them and relays messages. This works through any firewall that allows
 // HTTPS (which is essentially all of them).
 
-const DEFAULT_SERVER = 'wss://solo-tradition-respiratory-factors.trycloudflare.com';
+const DEFAULT_SERVER = 'wss://vaccine-knowledgestorm-fundamentals-trends.trycloudflare.com';
 
 /** Get the saved server URL from localStorage, or fall back to DEFAULT_SERVER. */
 function getSavedServerUrl() {
@@ -810,8 +811,31 @@ class Sync {
       sendBankUpdate.call(this, item);
     });
 
+    // Bank tab purchases (from the shop) — sync tab count so the peer's
+    // bank has the same number of tabs available.
+    if (typeof Bank.prototype.addTabs === 'function') {
+      this.ctx.patch(Bank, 'addTabs').after(function () {
+        if (sync._applyingRemote || !sync.transport.isConnected) return;
+        sync.transport.send({ t: Msg.BANK_TAB_COUNT, count: this.tabCount });
+      });
+    }
+
     // Also patch addItemOnLoad for items loaded from save
-    logger.info('Bank patches installed: addItem, addItemByID, removeItemQuantity, removeItemQuantityByID, processItemSale');
+    logger.info('Bank patches installed: addItem, addItemByID, removeItemQuantity, removeItemQuantityByID, processItemSale, addTabs');
+  }
+
+  _applyBankTabCount(msg) {
+    if (typeof msg.count !== 'number' || !game.bank) return;
+    this._applyingRemote = true;
+    try {
+      const current = game.bank.tabCount || 0;
+      // Tab count only ever increases (purchased permanently) — apply the
+      // delta via addTabs() so the game's own logic sets up the new tab.
+      if (msg.count > current && typeof game.bank.addTabs === 'function') {
+        try { game.bank.addTabs(msg.count - current); } catch (e) { logger.warn('addTabs failed', e); }
+      }
+    } catch (e) { logger.error('applyBankTabCount failed', e); }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
   _applyBank(msg) {
@@ -849,13 +873,33 @@ class Sync {
   // ---- Currencies -------------------------------------------------------
 
   _patchCurrency() {
-    const sendCurrency = function () {
+    // Currency is synced by DELTA, not absolute value. Currency legitimately
+    // goes both up (earning) AND down (spending), unlike XP/mastery/completion
+    // counts which only ever increase. An earlier version sent the absolute
+    // new value and the receiver applied Math.max(local, remote) to avoid
+    // regressing progress — but that meant any decrease (buying a shop
+    // upgrade, paying a township repair, a raid entry fee, etc.) could never
+    // reach the peer, since Math.max always keeps the larger of the two
+    // values. The peer's currency would silently stop decreasing while the
+    // spending player's own copy went down — "gold not taken" from the
+    // peer's perspective. Sending the exact delta and applying it with
+    // `current + delta` fixes this and also commutes correctly if two
+    // deltas from both players arrive out of order.
+    const sendCurrencyDelta = function (amount) {
+      if (sync._applyingRemote || !sync.transport.isConnected) return;
+      if (!amount) return;
+      sync.transport.send({ t: Msg.CURRENCY, currencyId: this.id, delta: amount });
+    };
+    const sendCurrencySet = function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       sync.transport.send({ t: Msg.CURRENCY, currencyId: this.id, qty: this._amount });
     };
-    this.ctx.patch(Currency, 'add').after(sendCurrency);
-    this.ctx.patch(Currency, 'remove').after(sendCurrency);
-    this.ctx.patch(Currency, 'set').after(sendCurrency);
+    this.ctx.patch(Currency, 'add').after(function (_ret, amount) { sendCurrencyDelta.call(this, amount); });
+    this.ctx.patch(Currency, 'remove').after(function (_ret, amount) { sendCurrencyDelta.call(this, -amount); });
+    // set() is rare (used by our own snapshot/apply code, and possibly
+    // cheats/debug tools) — it means "this IS the definitive value", so it's
+    // still sent as an absolute qty rather than a delta.
+    this.ctx.patch(Currency, 'set').after(sendCurrencySet);
   }
 
   _applyCurrency(msg) {
@@ -863,11 +907,19 @@ class Sync {
     if (!c) return;
     this._applyingRemote = true;
     try {
-      // Use max to avoid resetting currencies to 0 from stale messages.
-      // Never go negative — ignore remote values below 0.
-      const remote = Math.max(0, msg.qty || 0);
-      const newAmt = Math.max(c._amount || 0, remote);
-      c.set(newAmt);
+      if (typeof msg.delta === 'number') {
+        // Apply the exact delta the sender applied on their end. This is
+        // commutative regardless of message arrival order and correctly
+        // propagates both gains AND spends.
+        const newAmt = Math.max(0, (c._amount || 0) + msg.delta);
+        c.set(newAmt);
+      } else if (typeof msg.qty === 'number') {
+        // Absolute set (from Currency.set(), e.g. our own periodic
+        // safety-net sync) — trust it directly. No Math.max: currency can
+        // legitimately decrease, so clamping to "never go down" would
+        // reintroduce the same bug delta-sync fixes.
+        c.set(Math.max(0, msg.qty));
+      }
       this._queueRender('currency');
     } catch (e) { logger.error('applyCurrency failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
@@ -3551,6 +3603,11 @@ class Sync {
     const cm = game.combat;
     if (!cm) return;
     logger.info(`[COMBAT] Received loot: ${msg.itemId} x${msg.quantity}`);
+    // Guard with _applyingRemote so applying this loot doesn't re-trigger
+    // our own Currency/Bank/CombatLoot patches and echo a phantom
+    // delta/qty message back to the sender (which would double-count the
+    // GP/items on the attacker's side).
+    this._applyingRemote = true;
     try {
       // Handle GP (gold coins) — game.gp is a Currency, use .add()
       if (msg.itemId === 'melvorD:GP' && game.gp !== undefined) {
@@ -3575,6 +3632,7 @@ class Sync {
         logger.info(`[COMBAT] Added loot to bank: ${msg.itemId} x${msg.quantity}`);
       }
     } catch (e) { logger.warn(`[COMBAT] Loot sync failed: ${e.message}`); }
+    finally { this._applyingRemote = false; this._scheduleSave(); }
   }
 
   // ---- Ancient relics sync ----------------------------------------------
@@ -5386,6 +5444,8 @@ class Sync {
     // Shop upgrades
     const shopUpgrades = {};
     if (game.shop) for (const [p, count] of game.shop.upgradesPurchased) shopUpgrades[p.id] = count;
+    // Bank tab count (purchased via shop)
+    const bankTabCount = game.bank ? game.bank.tabCount : undefined;
     // Tutorial
     const tutorial = this._buildTutorialState();
     // Mining rock HP
@@ -5460,7 +5520,7 @@ class Sync {
       });
     }
 
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, tutorial, rockHP, harvestingVeins, farming: farmingPlots, combat: combatState, combatEventState, potions };
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, bankTabCount, tutorial, rockHP, harvestingVeins, farming: farmingPlots, combat: combatState, combatEventState, potions };
 
     // Mastery (per-action XP + mastery pool XP per realm)
     const mastery = [];
@@ -6191,6 +6251,12 @@ class Sync {
           if (purchase) game.shop.upgradesPurchased.set(purchase, Math.max(game.shop.upgradesPurchased.get(purchase) || 0, count));
         }
         if (game.shop.computeProvidedStats) game.shop.computeProvidedStats();
+      }
+      if (typeof msg.bankTabCount === 'number' && game.bank) {
+        const curTabs = game.bank.tabCount || 0;
+        if (msg.bankTabCount > curTabs && typeof game.bank.addTabs === 'function') {
+          try { game.bank.addTabs(msg.bankTabCount - curTabs); } catch (e) { logger.warn('snapshot addTabs failed', e); }
+        }
       }
       if (msg.tutorial && game.tutorial) {
         const data = msg.tutorial;
@@ -7280,6 +7346,7 @@ class Sync {
       [Msg.SLAYER_CAT]: (m) => this._applySlayerCategories(m),
       [Msg.COOKING_STOCKPILE]: (m) => this._applyCookingStockpile(m),
       [Msg.EQUIP_SET_COUNT]: (m) => this._applyEquipSetCount(m),
+      [Msg.BANK_TAB_COUNT]: (m) => this._applyBankTabCount(m),
       [Msg.SETTINGS]: (m) => this._applyGameSettings(m),
       [Msg.STATE_REQUEST]: () => this.transport.send(this._buildSnapshot()),
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
