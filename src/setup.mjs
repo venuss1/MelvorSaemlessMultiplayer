@@ -1229,14 +1229,21 @@ class Sync {
   // ---- Shop / Upgrades --------------------------------------------------
 
   _patchShop() {
-    // Sync when a shop purchase is made.
-    this.ctx.patch(Shop, 'buyItemOnClick').after(function (_ret, purchase) {
+    // Sync when a shop purchase is made. Both buyItemOnClick and
+    // quickBuyItemOnClick are separate code paths that need patching.
+    const sendShopState = function () {
       if (sync._applyingRemote || !sync.transport.isConnected) return;
       const upgrades = {};
       for (const [p, count] of this.upgradesPurchased) {
         upgrades[p.id] = count;
       }
       sync.transport.send({ t: Msg.SHOP, upgrades });
+    };
+    this.ctx.patch(Shop, 'buyItemOnClick').after(function (_ret, _purchase) {
+      sendShopState.call(this);
+    });
+    this.ctx.patch(Shop, 'quickBuyItemOnClick').after(function (_ret, _purchase) {
+      sendShopState.call(this);
     });
   }
 
@@ -1244,6 +1251,7 @@ class Sync {
     if (!msg.upgrades || !game.shop) return;
     this._applyingRemote = true;
     try {
+      const changedPurchases = [];
       for (const [purchaseId, count] of Object.entries(msg.upgrades)) {
         const purchase = game.shop.purchases.getObjectByID(purchaseId);
         if (!purchase) continue;
@@ -1252,15 +1260,29 @@ class Sync {
         if (delta > 0) {
           // Apply the purchase delta without charging currency again.
           game.shop.upgradesPurchased.set(purchase, count);
+          changedPurchases.push(purchase);
         }
       }
       if (game.shop.computeProvidedStats) game.shop.computeProvidedStats();
+      // Update the shop's internal render queue.
       if (game.shop.renderQueue) {
         game.shop.renderQueue.requirements = true;
         game.shop.renderQueue.costs = true;
         game.shop.renderQueue.upgrades = true;
       }
       if (game.shop.render) game.shop.render();
+      // Shop.render() only processes the internal render queue — the actual
+      // DOM elements in the shop modal are managed by the global shopMenu
+      // (ShopMenu instance). Without these calls the peer's shop UI still
+      // shows the upgrade as available/unsold even though upgradesPurchased
+      // was updated and the stat effect was applied.
+      if (typeof shopMenu !== 'undefined' && shopMenu) {
+        for (const purchase of changedPurchases) {
+          try { shopMenu.updateItemPostPurchase(purchase); } catch (e) { /* shop may not be open */ }
+        }
+        try { shopMenu.updateForCostChange(); } catch (e) { /* ignore */ }
+        try { shopMenu.updateForRequirementChange(); } catch (e) { /* ignore */ }
+      }
       this._forceRender();
     } catch (e) { logger.error('applyShop failed', e); }
     finally { this._applyingRemote = false; this._scheduleSave(); }
