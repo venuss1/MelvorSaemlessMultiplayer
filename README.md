@@ -7,7 +7,7 @@ equipment, pets, shop upgrades, farming plots, agility courses, and much more)
 is mirrored onto the other player's game in real time over a WebSocket relay
 connection.
 
-> **Repo:** <https://github.com/venuss1/MelvorSaemlessMultiplayer>
+> **Repo:** <https://github.com/venuss1/melvor-idle-real-multiplayer>
 
 > **Status:** experimental. There is no official multiplayer in Melvor Idle and
 > the game engine assumes a single active action per client. This mod works
@@ -195,7 +195,7 @@ Features:
 ### Option B — Modfile / mod.io
 
 1. Download the latest `melvor_idle_realMultiplayer.zip` from the
-   [releases page](https://github.com/venuss1/MelvorSaemlessMultiplayer/releases).
+   [releases page](https://github.com/venuss1/melvor-idle-real-multiplayer/releases).
 2. In the Creator Toolkit, add the zip as a local mod, or upload it to mod.io.
 
 > The mod has no build step. The `.mjs` files are loaded directly by the game.
