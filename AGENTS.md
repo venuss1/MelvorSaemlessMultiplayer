@@ -31,9 +31,39 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
 - Each client runs only its own action; broadcasts absolute new values of any
   state change; peer writes values into internal fields (bypassing modifiers) and
   re-renders. Re-entrancy guarded by `sync._applyingRemote`.
-- Networking: PeerJS (CDN-injected UMD) -> `Transport` (host/join/send/events).
+- Networking: WebSocket relay -> `Transport` (connect/send/events). Both clients
+  connect to the same relay URL; the relay pairs the first two waiting clients
+  (first = host) and shuttles messages. Works through any firewall that allows HTTPS.
 - `ActionLock` tracks who trains what; advisory conflict warning in the UI.
 - `Panel` is an imperative floating DOM panel (top-right).
+
+### Single-file layout (src/setup.mjs, ~7.5k lines)
+The mod is ONE module on purpose — the loader cannot resolve static imports
+between mod files. Sections, in order: logger -> protocol (`Msg`) -> `Transport`
+-> `ActionLock` -> `Sync` (~90% of the file) -> `Panel` -> `setup(ctx)`.
+
+`Sync` conventions every per-system module follows:
+- `_patchX()` installs ctx.patch hooks; guarded send closures broadcast.
+- `_serializeX()` returns the exact wire payload WITHOUT the `t` field, reads
+  via `game.X` paths only, never try/catch-noop inside. Live senders and
+  `_buildSnapshot()` both compose these — one source of truth per wire shape.
+- `_applyX(msg)` runs inside `_applyRemote(label, fn, { save, level })` which
+  holds the re-entrancy guard, logs `${label} failed`, and schedules a save
+  (some systems pass `save:false` — never change a site's save flag).
+- Shared scaffolding: `_canSend()`/`_send(payload)`, `_afterEach(Cls, names, cb)`.
+- Guard-neutral apply helpers (`_applyEquipmentSets`, `_applyArchaeologyBulk`,
+  per-skill `_apply<Skill>Selection`) NEVER touch `_applyingRemote`/`_scheduleSave`
+  — `_applySnapshot` calls them with a data-dependent guard state that is
+  load-bearing (some unguarded spans intentionally echo). Do not 'fix' the
+  guard dance; do not route snapshot blocks through the wrapped `_applyX`.
+
+### Adding a newly synced system (checklist)
+1. Add the message type to `Msg` (protocol section).
+2. Write `_serializeX()` (payload sans `t`) + `_patchX()`; register in `install()`'s table.
+3. Write `_applyX(msg)`; register in `_buildHandlers()`.
+4. Add snapshot coverage: `_buildSnapshot()` composes `_serializeX()`;
+   `_applySnapshot` applies it (delegate or guard-neutral helper — see above).
+5. Verify: `node --check src/setup.mjs`, then in-game via Creator Toolkit.
 
 ## Verifying changes
 - No build. Syntax-check with node: `node --check src/setup.mjs` (per file).
@@ -42,10 +72,13 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   (Directory Link mode on Steam). Back up saves before testing.
 
 ## Conventions
-- Plain `.mjs`, ES modules, no bundler.
+- Plain `.mjs`, ES modules, no bundler. Everything runtime lives in `src/setup.mjs`.
 - All DOM/CSS class names prefixed `rmp-`.
-- Logger via `src/util/logger.mjs` (tagged `[realMP]`).
-- Wire message types centralised in `src/net/protocol.mjs` (`Msg`).
+- Logger is inlined at the top of `setup.mjs` (tagged `[realMP]`, ring buffer +
+  `exportLog()`, persisted to localStorage every 5s).
+- Wire message types centralised in `Msg` (protocol section of `setup.mjs`).
+  Relay-server control messages (`waiting`/`paired`/`peer_left`) are raw strings
+  owned by the server — do NOT move them into `Msg`.
 
 ## Git revert workflow
 - **Commit after every successful change** — each commit is a known-good revert point.

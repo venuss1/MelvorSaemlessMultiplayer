@@ -4,8 +4,8 @@ A seamless **co-op multiplayer** mod for [Melvor Idle](https://melvoridle.com).
 Two players share **one profile/save** and each train different things at the
 same time. Whatever one player earns (XP, mastery, bank items, currencies,
 equipment, pets, shop upgrades, farming plots, agility courses, and much more)
-is mirrored onto the other player's game in real time over a direct
-peer-to-peer connection.
+is mirrored onto the other player's game in real time over a WebSocket relay
+connection.
 
 > **Repo:** <https://github.com/venuss1/MelvorSaemlessMultiplayer>
 
@@ -18,15 +18,17 @@ peer-to-peer connection.
 
 ## How it works
 
-1. The **host** starts a session and shares a connection code.
-2. The other player enters the code and clicks **Connect**.
-3. The host's **full save** is sent to the peer, who writes it to slot 0 and
+1. Both players open the panel, enter the **same relay server URL** (the
+   default works) and their own name, then click **Connect**. The relay pairs
+   the first two waiting clients; the first to connect becomes the **host**.
+2. The host's **full save** is sent to the peer, who writes it to slot 0 and
    reloads — both clients now run the exact same character.
-4. After reload, the peer **auto-reconnects** to the host automatically.
-5. The host sends a **full state snapshot** (every skill, bank item, currency,
-   equipment set, pet, plot, obstacle, etc.) so both clients converge.
-6. Each player trains a different skill (e.g. one woodcuts, the other mines).
-7. The mod patches dozens of game methods (`Skill.addXP`,
+3. After reload, the peer **auto-reconnects** to the host automatically.
+4. Either side can request a **full state snapshot** (every skill, bank item,
+   currency, equipment set, pet, plot, obstacle, etc.) so both clients
+   converge.
+5. Each player trains a different skill (e.g. one woodcuts, the other mines).
+6. The mod patches dozens of game methods (`Skill.addXP`,
    `SkillWithMastery.addMasteryXP`, `Bank.addItem` / `removeItemQuantity`,
    `Currency.add/remove/set`, `Player.equipItem`, `Farming.plantPlot`,
    `Agility.buildObstacle`, `Shop.buyItemOnClick`, and many more) to broadcast
@@ -132,7 +134,9 @@ all of the above so both clients start from the same baseline.
 
 The mod adds a **floating, draggable panel** (top-right of the screen) with:
 
-- **Connection status** — host/join state, player names, ping/latency display
+- **Connection controls** — relay server URL + player name fields, connect/
+  disconnect button (URL and name persist across sessions)
+- **Connection status** — paired state, peer name, ping/latency display
 - **Progress bars** — fake progress bars showing both players' current action
   progress, color-coded per skill type to match the game's skill colors
 - **Recipe chips** — shows active recipes (e.g. multiple tree names for
@@ -149,9 +153,14 @@ The mod adds a **floating, draggable panel** (top-right of the screen) with:
 ## Networking
 
 Connectivity uses a **WebSocket relay server** with ping/pong (10s interval),
-latency tracking, and auto-reconnect after save sync. The connection is
-brokered through a relay and then relayed peer-to-peer. No server of your own
-is required for basic use; a default public relay is provided.
+latency tracking, and auto-reconnect after save sync. Both clients connect to
+the same relay URL; the relay pairs the first two waiting clients and shuttles
+messages between them. No server of your own is required for basic use; a
+default public relay is provided.
+
+> The bundled default relay is a temporary Cloudflare tunnel — fine for
+> testing, but it can move or disappear. For anything serious, self-host a
+> relay and paste its URL into the panel (the URL persists in localStorage).
 
 Features:
 - **Ping/pong** heartbeat every 10s with latency display
@@ -189,12 +198,12 @@ Features:
 
 1. Load a character.
 2. Open the **Multiplayer** panel (top-right of the screen).
-3. Enter your name.
-4. **Player A:** click **Host**, then send the displayed code to Player B.
-5. **Player B:** click **Join**, paste the code, click **Connect**.
-6. The host's save is automatically sent to the peer. The peer reloads with the
+3. Both players: enter the **same relay server URL** (the prefilled default
+   works) and your own name, then click **Connect**. The relay pairs you; the
+   first to connect becomes the host.
+4. The host's save is automatically sent to the peer. The peer reloads with the
    host's character and auto-reconnects.
-7. Each player picks a different skill and starts training. Watch the other
+5. Each player picks a different skill and starts training. Watch the other
    player's progress appear in the panel and on your skills/bank.
 
 ### Unlock All (debug)
@@ -238,20 +247,18 @@ melvor_idle_realMultiplayer/
 ├── .modignore             # files excluded when the toolkit zips the mod
 ├── assets/
 │   └── icon.svg
+├── docs/                  # offline copy of the modding wiki + game .d.ts (dev-only)
 └── src/
-    ├── setup.mjs          # entry point: all patch/apply logic (~7900 lines)
-    ├── util/
-    │   └── logger.mjs     # tagged console logger with in-memory ring buffer
-    ├── net/
-    │   ├── transport.mjs  # WebSocket relay wrapper (host/join, send, events)
-    │   └── protocol.mjs   # wire message types + (de)serialisation
-    ├── state/
-    │   ├── actionLock.mjs # who-is-training-what reservation
-    │   └── sync.mjs       # core sync class (patches, broadcast, apply)
+    ├── setup.mjs          # single-file entry point (~7.5k lines, see header)
     └── ui/
-        ├── panel.mjs      # floating connection/status panel
-        └── styles.css
+        └── styles.css     # panel styles (Panel also inlines critical styles)
 ```
+
+`setup.mjs` is intentionally one file: Melvor's mod loader cannot resolve
+static `import` paths between mod resource files, so the logger, wire protocol
+(`Msg`), WebSocket `Transport`, `ActionLock`, the `Sync` engine (all
+patch/serialize/apply logic), the floating `Panel`, and the `setup(ctx)` entry
+all live in it, in that order, behind clear section banners.
 
 ## Dev / type checking (optional)
 
