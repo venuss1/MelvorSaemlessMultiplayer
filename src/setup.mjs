@@ -96,6 +96,7 @@ const Msg = Object.freeze({
   COMBAT_LOOT: 'combat_loot',       // { drops: [{itemId, qty}], currency: {gp, sc, ...} }
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
+  JOIN_INFO: 'join_info',           // peer -> host: character key + game age; host decides push vs reconcile
   UNLOCK_ALL: 'unlock_all',
   LEVEL_CAP: 'level_cap',           // skill level cap increases purchased
   GAME_STATE: 'game_state',         // merchantsPermitRead, pause, completion, etc.
@@ -253,10 +254,9 @@ class Transport {
           logger.info('Paired! Role =', this._myRole);
           this._startPing();
           this._emit('open');
-          // Host automatically sends its save to the peer.
-          if (this._myRole === 'host') {
-            this._emit('send_save');
-          }
+          // NOTE: the host no longer pushes its save blindly here — the
+          // peer's JOIN_INFO drives the push-vs-reconcile decision
+          // (Sync._applyJoinInfo).
           return;
         }
         if (msg.t === 'peer_left') {
@@ -264,7 +264,7 @@ class Transport {
           this._paired = false;
           this._peerName = '';
           this._stopPing();
-          this._emit('close');
+          this._emit('close', 'peer_left');
           return;
         }
         if (msg.t === 'error' && msg.msg) {
@@ -307,9 +307,9 @@ class Transport {
       ws.onclose = (event) => {
         clearTimeout(timeout);
         logger.info('WebSocket closed, code =', event.code, 'reason =', event.reason);
-        const wasPaired = this._paired;
+        const wasLive = this._paired || this._connected;
         this._resetConnection();
-        if (wasPaired) this._emit('close');
+        if (wasLive) this._emit('close', 'socket');
       };
     });
   }
@@ -380,9 +380,14 @@ class Transport {
     this._resetConnection();
     try { this.ws && this.ws.close(); } catch { /* noop */ }
     this.ws = null;
-    this._emit('close');
+    this._emit('close', 'manual');
   }
 }
+
+// Join fast path: if the peer's in-game age differs from the host's by less
+// than this, both saves are treated as converged and no join snapshot is
+// sent. tickTimestamp is in-game milliseconds; 2 min covers save-write skew.
+const JOIN_SLACK_MS = 120000;
 
 // ============================================================================
 // ACTION LOCK
@@ -517,6 +522,7 @@ class Sync {
   install() {
     if (this._installed) { logger.info('Sync already installed, skipping'); return; }
     this._installed = true;
+    this._initCharKey();
     logger.info('========== [MP] INSTALLING SYNC PATCHES ==========');
     const patches = [
       ['XP', '_patchXP'],
@@ -5449,6 +5455,65 @@ class Sync {
 
   // ---- Full snapshot ----------------------------------------------------
 
+  // ---- Join handshake (smart rejoin) ---------------------------------------
+  // The peer never plays solo — the host is always the authority and its
+  // state is always >= the peer's. So the join decision is one-sided: the
+  // peer identifies its character, the host decides push-save vs reconcile.
+
+  // Character identity key: a UUID stamped into characterStorage on first
+  // load. characterStorage travels INSIDE the save, so a peer that loaded
+  // our save carries the same key — that's how the host recognises "same
+  // shared character" and skips the save push. Saves stamped before this
+  // feature exist get fresh (mismatching) keys on both sides, so the first
+  // pairing after updating does one final save push; afterwards they match.
+  _initCharKey() {
+    try {
+      let key = this.ctx.characterStorage.getItem('rmp_uuid');
+      if (!key) {
+        key = (typeof crypto !== 'undefined' && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+        this.ctx.characterStorage.setItem('rmp_uuid', key);
+        logger.info('[JOIN] Stamped new character key:', key);
+      }
+      this._charKey = key;
+    } catch (e) { logger.warn('char key init failed', e); }
+  }
+
+  _sendJoinInfo() {
+    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0 });
+  }
+
+  _applyJoinInfo(msg) {
+    if (this.transport.role !== 'host') return; // only the authority decides
+    if (!msg.key || msg.key !== this._charKey) {
+      logger.info('[JOIN] Peer has a foreign character — pushing save');
+      this.transport._emit('send_save');
+      return;
+    }
+    const drift = (game.tickTimestamp || 0) - (typeof msg.tick === 'number' ? msg.tick : 0);
+    logger.info(`[JOIN] Same character (key match). Tick drift: ${drift}`);
+    if (Math.abs(drift) <= JOIN_SLACK_MS) {
+      // Within slack both saves hold the same converged state — no save, no
+      // snapshot. This is the fast path for quick reconnects.
+      logger.info('[JOIN] States converged — instant connect, no snapshot');
+      return;
+    }
+    if (drift < 0) {
+      // The JOIN_INFO sender is AHEAD of us — relay roles flipped after a
+      // double reconnect (we hold the stale state despite being relay-host).
+      // Pull their state as an absolute reconcile instead of pushing ours.
+      logger.info('[JOIN] Peer is ahead (role flip) — requesting absolute join snapshot');
+      this.transport.send({ t: Msg.STATE_REQUEST, join: true });
+      return;
+    }
+    logger.info('[JOIN] Reconciling peer with absolute join snapshot');
+    const snap = this._buildSnapshot();
+    snap.join = true;
+    snap.absoluteBank = true;
+    this.transport.send(snap);
+  }
+
   requestSnapshot() { this.transport.send({ t: Msg.STATE_REQUEST }); }
 
   _buildSnapshot() {
@@ -5781,6 +5846,23 @@ class Sync {
         }
       }
       // ---- Bank ----
+      // Join reconcile (authority snapshot): make the bank EXACTLY match the
+      // snapshot — remove/reduce anything the authority doesn't have. The
+      // peer never plays solo, so any local excess is a phantom from a stale
+      // save (e.g. items sold/consumed since), never real earnings.
+      if (msg.join && msg.absoluteBank) {
+        const snapQty = new Map();
+        for (const b of (msg.bank || [])) { const it = this._itemById(b.id); if (it && it.name) snapQty.set(it, b.qty); }
+        let removed = 0;
+        for (const [item, bi] of game.bank.items) {
+          const cur = bi ? bi.quantity : 0;
+          const target = snapQty.get(item) || 0;
+          if (cur > target) {
+            try { game.bank.removeItemQuantity(item, cur - target, false); removed += cur - target; } catch (e) { /* skip */ }
+          }
+        }
+        if (removed > 0) logger.info(`[JOIN] Reconcile removed ${removed} phantom bank item(s)`);
+      }
       for (const b of (msg.bank || [])) {
         const item = this._itemById(b.id);
         if (!item || !item.name) continue; // skip invalid/dummy items
@@ -6815,8 +6897,15 @@ class Sync {
       [Msg.EQUIP_SET_COUNT]: (m) => this._applyEquipSetCount(m),
       [Msg.BANK_TAB_COUNT]: (m) => this._applyBankTabCount(m),
       [Msg.SETTINGS]: (m) => this._applyGameSettings(m),
-      [Msg.STATE_REQUEST]: () => this.transport.send(this._buildSnapshot()),
+      [Msg.STATE_REQUEST]: (m) => {
+        const snap = this._buildSnapshot();
+        // Join-time pull: the requester wants an absolute reconcile (bank
+        // removals included), not the usual additive-only heal.
+        if (m && m.join) { snap.join = true; snap.absoluteBank = true; }
+        this.transport.send(snap);
+      },
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
+      [Msg.JOIN_INFO]: (m) => this._applyJoinInfo(m),
       [Msg.UNLOCK_ALL]: () => this._unlockAll(),
     };
   }
@@ -6954,6 +7043,8 @@ class Panel {
     this._consoleLines = [];    // session prints (kept across log re-renders)
     this._consoleHistory = [];  // eval input history (ArrowUp/Down)
     this._consoleHistIdx = -1;
+    this._manualDisconnect = false; // explicit Disconnect — suppresses auto-reconnect
+    this._reconnectAttempts = 0;    // backoff counter, reset on successful open
   }
 
   mount() {
@@ -7158,6 +7249,7 @@ class Panel {
       // Persist the server URL and name so they survive reloads.
       saveServerUrl(serverUrl);
       saveName(name);
+      this._manualDisconnect = false; // explicit connect re-arms auto-reconnect
       $('connectBtn').disabled = true;
       $('connectBtn').textContent = 'Connecting...';
       try {
@@ -7176,6 +7268,7 @@ class Panel {
     });
 
     $('disconnectBtn').addEventListener('click', () => {
+      this._manualDisconnect = true; // don't auto-reconnect after an explicit leave
       if (this.transport.isConnected) {
         // Return our gear to the shared bank so the peer can use it, then leave.
         try { this.sync._unequipAllToBank(); } catch (e) { logger.warn('leave unequip failed', e); }
@@ -7221,21 +7314,22 @@ class Panel {
       this._showRow('connectedRow');
       this._hideRow('waitingRow');
       this._hideRow('saveSyncRow');
+      this._reconnectAttempts = 0; // successful connect resets the backoff
       if (this.transport.role === 'peer') {
-        logger.info('[MP] We are peer — requesting state snapshot from host');
-        this.sync.requestSnapshot();
+        logger.info('[MP] We are peer — join info sent, waiting for host decision');
       } else {
-        logger.info('[MP] We are host — waiting for peer to connect, will send save');
+        logger.info('[MP] We are host — waiting for peer join info');
       }
       this._refresh();
     });
-    this.transport.on('close', () => {
-      logger.info('========== [MP] CONNECTION CLOSED ==========');
+    this.transport.on('close', (reason) => {
+      logger.info('========== [MP] CONNECTION CLOSED ==========', reason || '');
       this._hideRow('connectedRow');
       this._hideRow('waitingRow');
       this._hideRow('saveSyncRow');
       this.actionLock.reset();
       this._refresh();
+      this._maybeReconnect(reason);
     });
     this.transport.on('send_save', () => {
       this._showRow('saveSyncRow');
@@ -7449,6 +7543,28 @@ class Panel {
   _showRow(name) { const el = this.$(name); if (el) el.hidden = false; }
   _hideRow(name) { const el = this.$(name); if (el) el.hidden = true; }
 
+  // Auto-reconnect after OUR socket drops unexpectedly (relay/tunnel hiccup).
+  // Never on manual Disconnect, never on 'peer_left' — when the other player
+  // leaves, the relay keeps our slot/role reserved, so the returning player
+  // simply reconnects into the complementary slot and roles stay correct.
+  _maybeReconnect(reason) {
+    if (reason !== 'socket' || this._manualDisconnect) return;
+    const serverUrl = getSavedServerUrl();
+    const name = getSavedName();
+    if (!serverUrl) return;
+    const delays = [2000, 5000, 15000];
+    const attempt = this._reconnectAttempts || 0;
+    if (attempt >= delays.length) { logger.warn('[MP] Auto-reconnect gave up after ' + delays.length + ' attempts'); return; }
+    this._reconnectAttempts = attempt + 1;
+    const delay = delays[attempt];
+    logger.info(`[MP] Connection dropped — auto-reconnecting in ${delay / 1000}s (attempt ${attempt + 1}/${delays.length})`);
+    setTimeout(() => {
+      if (this.transport.isConnected || this._manualDisconnect) return;
+      this.transport.connect(serverUrl, name)
+        .catch((e) => { logger.warn('[MP] Reconnect failed:', e && e.message); this._maybeReconnect('socket'); });
+    }, delay);
+  }
+
   _refreshStatus() {
     if (!this.root) return;
     const $ = (s) => this.$(s);
@@ -7505,6 +7621,15 @@ export function setup(ctx) {
   // Route incoming messages — action claims are dispatched to the ActionLock
   // by Sync.handle's table, everything else to the matching _applyX.
   transport.on('message', (msg) => syncInstance.handle(msg));
+
+  // Join handshake: on pairing, the peer identifies its character (key +
+  // in-game age) so the host can decide push-save vs reconcile vs instant
+  // connect. Registered at mod load so it fires before panel handlers.
+  transport.on('open', () => {
+    if (transport.role === 'peer') {
+      try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
+    }
+  });
 
   // Ghost-gear strip on join. If our last leave was CLEAN (unequip ran and
   // was synced while paired — flagged in localStorage), any gear our local

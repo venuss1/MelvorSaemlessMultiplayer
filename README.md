@@ -22,9 +22,14 @@ connection. **Equipment is the one exception** — it is per-player (see
 1. Both players open the panel, enter the **same relay server URL** (the
    default works) and their own name, then click **Connect**. The relay pairs
    the first two waiting clients; the first to connect becomes the **host**.
-2. The host's **full save** is sent to the peer, who writes it to slot 0 and
-   reloads — both clients now run the exact same character.
-3. After reload, the peer **auto-reconnects** to the host automatically.
+2. On the **first-ever pairing**, the host's full save is sent to the peer,
+   who writes it to slot 0 and reloads — both clients now run the exact same
+   character. The save carries a mod-stamped character key.
+3. **Later connects skip the save copy entirely**: the peer sends its
+   character key + in-game age; matching keys mean same character, so the
+   host just reconciles any drift with an absolute state snapshot — no
+   reload, no trip back to the menu. Dropped connections auto-reconnect
+   with backoff.
 4. Either side can request a **full state snapshot** (every skill, bank item,
    currency, pet, plot, obstacle, etc.) so both clients
    converge.

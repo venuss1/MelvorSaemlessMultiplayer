@@ -55,6 +55,18 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   (first = host) and shuttles messages. Works through any firewall that allows HTTPS.
 - `ActionLock` tracks who trains what; advisory conflict warning in the UI.
 - `Panel` is an imperative floating DOM panel (top-right).
+- **Join handshake (smart rejoin):** the peer never plays solo — the host is
+  always the authority. On 'open' the peer sends `JOIN_INFO {key, tick}`; the
+  key is a UUID in `characterStorage` (travels INSIDE the save, propagating to
+  the peer on save-sync). Host decides: key mismatch -> push save (foreign
+  character, the reload path); `|tick drift| <= JOIN_SLACK_MS` -> nothing
+  (instant connect); drift > slack -> absolute join snapshot
+  (`join`/`absoluteBank` — bank set EXACTLY, phantoms removed; a peer that
+  never plays solo can only hold stale excess); drift < -slack (relay role
+  flip after a double reconnect) -> pull via `STATE_REQUEST {join:true}`.
+  Transport close carries a reason (`manual`/`peer_left`/`socket`); the panel
+  auto-reconnects only on `socket` with [2s, 5s, 15s] backoff — the relay
+  keeps a leaver's slot reserved, so roles never change on reconnect.
 - **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
   pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
   (synced), so the pool stays consistent with no equipment messages at all.
