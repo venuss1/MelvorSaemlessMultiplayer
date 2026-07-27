@@ -401,7 +401,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 5;
+const MOD_VERSION = 6;
 
 // ============================================================================
 // ACTION LOCK
@@ -5514,11 +5514,7 @@ class Sync {
 
   _sendJoinInfo() {
     if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
-    // The peer asks for the full save once per game launch (first join after
-    // relaunch); reconnects within the same page session reconcile instead.
-    // Only the relay-peer may ask — the relay-host never accepts a push.
-    const needSave = !this._saveLoadedThisSession && this.transport.role === 'peer';
-    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION, needSave });
+    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION });
   }
 
   _applyJoinInfo(msg) {
@@ -5535,20 +5531,6 @@ class Sync {
       logger.warn('[JOIN] Peer is on a FOREIGN character — game-state sync blocked until they load our save');
     }
     if (this.transport.role !== 'host') return; // only the authority decides
-    // Peer just launched and asked for the full save — hand it over, no
-    // similarity checks. Only guard: if the requester is somehow AHEAD of us
-    // (relay role flip), our save is the stale one — pull theirs instead.
-    if (msg.needSave) {
-      const aheadDrift = (game.tickTimestamp || 0) - (typeof msg.tick === 'number' ? msg.tick : 0);
-      if (aheadDrift < -JOIN_SLACK_MS) {
-        logger.info('[JOIN] Peer needs save but is AHEAD (role flip) — pulling their state instead');
-        this.transport.send({ t: Msg.STATE_REQUEST, join: true });
-      } else {
-        logger.info('[JOIN] Peer requested the full save (first join after relaunch) — pushing');
-        this.transport._emit('send_save');
-      }
-      return;
-    }
     if (!msg.key || msg.key !== this._charKey) {
       logger.info('[JOIN] Peer has a foreign character — pushing save');
       this.transport._emit('send_save');
@@ -7702,6 +7684,13 @@ export function setup(ctx) {
   // fires before panel handlers.
   transport.on('open', () => {
     try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
+    // Unconditional full-save push: the host hands its ENTIRE save to the
+    // peer on every pairing — no similarity checks. The peer applies it at
+    // most once per game launch (suppression in the save_sync handler);
+    // reconnects within a session ignore it and reconcile instead.
+    if (transport.role === 'host') {
+      try { transport._emit('send_save'); } catch (e) { logger.error('save push failed', e); }
+    }
     // If the peer never announces itself, it's running a pre-handshake build
     // (or worse). Stay permissive for compatibility but make it LOUD — mixed
     // builds silently half-sync, which is how foreign state once leaked in.
@@ -7778,18 +7767,20 @@ export function setup(ctx) {
     const desc = header ? `\n\nCharacter: ${header.name} — total level ${header.level}, ${header.gp} GP` : '';
     const ok = confirm(
       'Multiplayer: Load the host\'s save now?' + desc +
-      '\n\nYour current character is replaced IN PLACE — no reload, no menu trip. Be out of combat before accepting.' +
+      `\n\nThis OVERWRITES the character in your current slot (slot ${slot + 1}) and reloads the game to load it.` +
       '\n\nClick OK to load.'
     );
     if (!ok) { logger.info('User declined save sync'); return; }
     try {
-      // Import into the CURRENT slot and reload. In-place decoding was
-      // tried and abandoned: the game's post-load bootstrap (updateWindow ->
-      // initializeStatTables, ShopMenu, initializeRocks, ...) is one-time
-      // boot code that throws when re-run in a live page. The reload path is
-      // the only game-supported save swap — but fully unattended: after the
-      // reload the mod auto-boots this slot (onCharacterSelectionLoaded) and
-      // auto-reconnects, so there is no menu interaction at all.
+      logger.info(`[SAVE] Accepted. Target slot ${slot}; current occupant: ${game.characterName || '?'} (total level ${game.completion?.skillLevelProgress?.currentCount?.getSum?.() ?? '?'})`);
+      // ANTI-CLOBBER: freeze ALL saving before touching the slot. Without
+      // this, the CURRENT (about-to-be-discarded) character's autosave can
+      // fire in the import->reload window and overwrite the host save we
+      // just wrote — the peer then boots their old character and the save
+      // looks like it never arrived. blockCorruptSaving is the game's own
+      // kill-switch in saveData().
+      try { blockCorruptSaving = true; } catch { /* noop */ }
+      try { game._isSaveScheduled = false; } catch { /* noop */ }
       try {
         sessionStorage.setItem('rmp_autoconnect', JSON.stringify({
           server: transport._serverUrl || '',
@@ -7798,7 +7789,7 @@ export function setup(ctx) {
           slot,
         }));
       } catch { /* noop */ }
-      logger.info(`Importing host save into current slot (${slot})...`);
+      logger.info(`[SAVE] Importing host save into current slot (${slot})...`);
       let imported = false;
       if (typeof importSaveToSlot === 'function') {
         try { imported = await importSaveToSlot(saveString, slot); }
@@ -7810,42 +7801,54 @@ export function setup(ctx) {
         imported = true;
       }
       if (!imported) {
-        logger.error('Host save failed validation — NOT written, your save is untouched');
+        logger.error('[SAVE] Host save failed validation — NOT written, your save is untouched');
+        try { blockCorruptSaving = false; } catch { /* noop */ }
         alert('Multiplayer: the host save failed to validate.\n\nYour save was NOT touched.');
         return;
       }
-      logger.info('Save written, reloading to load it...');
+      logger.info('[SAVE] Written. Reloading to load it...');
       skipLeaveUnequip = true; // don't strip+broadcast the discarded character's gear
-      setTimeout(() => { window.location.reload(); }, 500);
+      setTimeout(() => { window.location.reload(); }, 250);
     } catch (e) {
-      logger.error('save_sync handling failed', e);
+      logger.error('[SAVE] save_sync handling failed', e);
+      try { blockCorruptSaving = false; } catch { /* noop */ }
       alert('Multiplayer: failed to load the host save (' + ((e && e.message) || e) + ').\n\nYour save was NOT touched.');
     }
   });
 
   // After a save-import reload the game lands on the character select
   // screen — auto-boot the imported slot so the whole handoff is unattended
-  // (no menu trip, no manual slot click).
+  // (no menu trip, no manual slot click). Retried: the char-select UI and
+  // the isLoadingSave flag may need a moment before loadLocalSave sticks.
   ctx.onCharacterSelectionLoaded(() => {
     try {
       const auto = sessionStorage.getItem('rmp_autoconnect');
       if (!auto) return;
       const { slot } = JSON.parse(auto);
       const target = (typeof slot === 'number' && slot >= 0) ? slot : 0;
-      logger.info(`Auto-booting imported save in slot ${target}...`);
-      // Give the character-select UI a moment to finish its own init.
-      setTimeout(() => {
+      let attempts = 0;
+      const tryBoot = () => {
+        attempts++;
         try {
+          if (typeof characterSelected !== 'undefined' && characterSelected) return; // already in
+          if (typeof isLoadingSave !== 'undefined' && isLoadingSave) {
+            logger.info(`[SAVE] Auto-boot: a save is already loading (attempt ${attempts})`);
+            return;
+          }
+          logger.info(`[SAVE] Auto-booting imported save in slot ${target} (attempt ${attempts})...`);
           if (typeof loadLocalSave === 'function') loadLocalSave(target);
-          else logger.error('loadLocalSave unavailable — click your slot manually');
-        } catch (e) { logger.error('auto-boot into slot failed — click your slot manually', e); }
-      }, 500);
+          else logger.error('[SAVE] loadLocalSave unavailable — click your slot manually');
+        } catch (e) { logger.error('[SAVE] auto-boot failed — click your slot manually', e); }
+      };
+      setTimeout(tryBoot, 500);
+      setTimeout(tryBoot, 1500);
+      setTimeout(tryBoot, 3000);
     } catch (e) { logger.warn('character-select auto-boot failed', e); }
   });
 
   // Install patches after character loads.
   ctx.onCharacterLoaded(() => {
-    logger.info('Character loaded, installing sync patches');
+    logger.info(`Character loaded: "${game.characterName || '?'}" — installing sync patches`);
     try { syncInstance.install(); }
     catch (e) { logger.error('sync.install() failed', e); }
   });

@@ -71,18 +71,17 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   a key-mismatched peer are dropped in BOTH directions (`_gateWire` inside
   `Transport.send` and `Sync.handle`) — a foreign character can never mutate
   our state (a fresh peer's absolute 0-GP broadcast once deleted the host's
-  Save handoff: the peer requests the full save once per game launch
-  (`needSave` in JOIN_INFO, relay-peer only); the host pushes
-  `{save, saveLen, header}`; the peer refuses truncated saves, confirms with
-  the save's name/level/GP, imports into the CURRENT slot via
-  `importSaveToSlot`, reloads, and the mod auto-boots that slot
-  (`loadLocalSave` on `onCharacterSelectionLoaded`, from `rmp_autoconnect`)
-  then auto-reconnects — unattended, no menu clicks. (In-place decoding via
-  `game.decode` was tried and abandoned: the game's post-load bootstrap —
-  `updateWindow` -> `initializeStatTables` et al — is one-time boot code
-  that throws on re-run; the reload path is the only game-supported save
-  swap.) `skipLeaveUnequip` guards the import reload so the discarded
-  character's gear isn't broadcast.
+  Save handoff: the host pushes its ENTIRE save on every pairing, no
+  similarity checks (`send_save` on 'open', relay-host only); the peer
+  applies it at most once per game launch, reconnects ignore it and
+  reconcile. Accept path: `blockCorruptSaving = true` FIRST (otherwise the
+  discarded character's autosave fires in the import->reload window and
+  clobbers the just-written host save — the peer boots their old character
+  and the save 'never arrived'), then `importSaveToSlot` on the CURRENT
+  slot, reload in 250ms, auto-boot via `loadLocalSave` (500/1500/3000ms
+  retries) from `rmp_autoconnect`, auto-reconnect. In-place decoding via
+  `game.decode` was tried and abandoned (one-time boot code throws on
+  re-run). `skipLeaveUnequip` guards the import reload.
   arrives (empty/mismatched key = foreign, all blocked); permissive only
   before any handshake (legacy peer). `_initCharKey` retries lazily —
   characterStorage throws before onCharacterLoaded. `MOD_VERSION` rides
