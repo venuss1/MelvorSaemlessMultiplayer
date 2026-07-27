@@ -75,7 +75,13 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   truncated/invalid saves outright and imports into the CURRENT slot
   (`currentCharacter`, never hardcoded slot 0 — wrong-slot writes made the
   loaded save look "wiped") via `importSaveToSlot`, after a confirm dialog
-  showing the save's name/level/GP.
+  showing the save's name/level/GP. The gate is STRICT once any JOIN_INFO
+  arrives (empty/mismatched key = foreign, all blocked); permissive only
+  before any handshake (legacy peer). `_initCharKey` retries lazily —
+  characterStorage throws before onCharacterLoaded. `MOD_VERSION` rides
+  JOIN_INFO — bump it on every protocol/join-behavior change; mismatches and
+  missing handshakes (5s) raise a red panel warning. Import reloads set
+  `skipLeaveUnequip` so the discarded character's gear isn't broadcast.
 - **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
   pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
   (synced), so the pool stays consistent with no equipment messages at all.
