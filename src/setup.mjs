@@ -401,7 +401,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 7;
+const MOD_VERSION = 8;
 
 // Short printable form of a character key for gate logs.
 function shortKey(k) { return k ? String(k).slice(0, 8) : 'none'; }
@@ -5477,30 +5477,31 @@ class Sync {
   // state is always >= the peer's. So the join decision is one-sided: the
   // peer identifies its character, the host decides push-save vs reconcile.
 
-  // Character identity key: a UUID stamped into characterStorage on first
-  // load. characterStorage travels INSIDE the save, so a peer that loaded
-  // our save carries the same key — that's how the host recognises "same
-  // shared character" and skips the save push. Saves stamped before this
-  // feature exist get fresh (mismatching) keys on both sides, so the first
-  // pairing after updating does one final save push; afterwards they match.
+  // Character identity is derived from the save's OWN core fields — never
+  // from characterStorage. Root cause of the foreign-key blackout: the game
+  // stores mod characterStorage keyed by numeric mod id; directory-linked
+  // dev mods get id -1 (mod.js), which the save encoder writes as a Uint32
+  // and the decoder then fails to find on load — storage was silently
+  // discarded on EVERY reload, so stamped UUIDs never persisted, keys never
+  // matched, and the gate locked both players out.
+  // characterName + AccountCreationDate are encoded in the save itself and
+  // travel with it (including to the peer on save handoff).
   _initCharKey() {
-    // The send gate must exist even if storage is unavailable yet — an
+    // The send gate must exist even if identity is unavailable yet — an
     // ungated sender is how foreign state leaks to the peer.
     if (!this.transport._sendGate) this.transport._sendGate = (m) => this._gateWire(m.t);
     if (this._charKey) return;
     try {
-      let key = this.ctx.characterStorage.getItem('rmp_uuid');
-      if (!key) {
-        key = (typeof crypto !== 'undefined' && crypto.randomUUID)
-          ? crypto.randomUUID()
-          : 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2);
-        this.ctx.characterStorage.setItem('rmp_uuid', key);
-        logger.info('[JOIN] Stamped new character key:', key);
-      }
-      this._charKey = key;
+      const name = game.characterName || '';
+      let created = 0;
+      try {
+        if (game.stats && game.stats.General && typeof GeneralStats !== 'undefined') {
+          created = game.stats.General.get(GeneralStats.AccountCreationDate) || 0;
+        }
+      } catch { /* noop */ }
+      this._charKey = created ? `${name}|${created}` : name;
+      if (!this._charKey) logger.warn('[JOIN] character identity unavailable (name not set yet)');
     } catch (e) {
-      // characterStorage throws before onCharacterLoaded — the early
-      // install() fallback hits this; retried lazily by join send/receive.
       logger.warn('char key init failed (will retry)', e && e.message);
     }
   }

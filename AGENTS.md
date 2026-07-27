@@ -56,9 +56,14 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
 - `ActionLock` tracks who trains what; advisory conflict warning in the UI.
 - `Panel` is an imperative floating DOM panel (top-right).
 - **Join handshake (smart rejoin):** the peer never plays solo — the host is
-  always the authority. On 'open' the peer sends `JOIN_INFO {key, tick}`; the
-  key is a UUID in `characterStorage` (travels INSIDE the save, propagating to
-  the peer on save-sync). Host decides: key mismatch -> push save (foreign
+  always the authority. On 'open' both sides send `JOIN_INFO {key, tick, v}`;
+  the key is derived from the save's OWN fields (`characterName` +
+  AccountCreationDate stat) — NOT `characterStorage`: the game keys mod
+  storage by numeric mod id, directory-linked dev mods get id -1, and the
+  save encoder/decoder (Uint32 round-trip) silently drops it on load, so
+  storage-stamped UUIDs never survived a reload (root cause of the
+  foreign-key blackout). Save-intrinsic fields travel with the save,
+  including to the peer on handoff. Host decides: key mismatch -> push save (foreign
   character, the reload path); `|tick drift| <= JOIN_SLACK_MS` -> nothing
   (instant connect); drift > slack -> absolute join snapshot
   (`join`/`absoluteBank` — bank set EXACTLY, phantoms removed; a peer that
