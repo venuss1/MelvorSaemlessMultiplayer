@@ -401,7 +401,10 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 6;
+const MOD_VERSION = 7;
+
+// Short printable form of a character key for gate logs.
+function shortKey(k) { return k ? String(k).slice(0, 8) : 'none'; }
 
 // ============================================================================
 // ACTION LOCK
@@ -5528,14 +5531,15 @@ class Sync {
       this.transport._emit('version_mismatch', { mine: MOD_VERSION, theirs: msg.v || 0 });
     }
     if (this._peerCharKey !== this._charKey) {
-      logger.warn('[JOIN] Peer is on a FOREIGN character — game-state sync blocked until they load our save');
+      logger.warn(`[JOIN] Peer is on a FOREIGN character (mine=${shortKey(this._charKey)}, peer=${shortKey(this._peerCharKey)}) — game-state sync blocked until they load our save`);
     }
     if (this.transport.role !== 'host') return; // only the authority decides
     if (!msg.key || msg.key !== this._charKey) {
-      logger.info('[JOIN] Peer has a foreign character — pushing save');
+      logger.info(`[JOIN] Peer key ${msg.key ? 'MISMATCH' : 'MISSING'} (mine=${shortKey(this._charKey)}, peer=${shortKey(msg.key)}) — pushing full save`);
       this.transport._emit('send_save');
       return;
     }
+    logger.info(`[JOIN] Key match (${shortKey(this._charKey)}) — no save push, reconciling`);
     const drift = (game.tickTimestamp || 0) - (typeof msg.tick === 'number' ? msg.tick : 0);
     logger.info(`[JOIN] Same character (key match). Tick drift: ${drift}`);
     if (Math.abs(drift) <= JOIN_SLACK_MS) {
@@ -7684,13 +7688,10 @@ export function setup(ctx) {
   // fires before panel handlers.
   transport.on('open', () => {
     try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
-    // Unconditional full-save push: the host hands its ENTIRE save to the
-    // peer on every pairing — no similarity checks. The peer applies it at
-    // most once per game launch (suppression in the save_sync handler);
-    // reconnects within a session ignore it and reconcile instead.
-    if (transport.role === 'host') {
-      try { transport._emit('send_save'); } catch (e) { logger.error('save push failed', e); }
-    }
+    // NOTE: the host pushes its save ONLY when the peer's JOIN_INFO shows a
+    // missing/foreign character key (Sync._applyJoinInfo). Pushing on every
+    // open floods the socket with repeated save frames (sync appears dead)
+    // and spams the peer with load-save confirms (perma-asking).
     // If the peer never announces itself, it's running a pre-handshake build
     // (or worse). Stay permissive for compatibility but make it LOUD — mixed
     // builds silently half-sync, which is how foreign state once leaked in.
@@ -7843,6 +7844,12 @@ export function setup(ctx) {
       setTimeout(tryBoot, 500);
       setTimeout(tryBoot, 1500);
       setTimeout(tryBoot, 3000);
+      setTimeout(() => {
+        try {
+          if (typeof characterSelected !== 'undefined' && characterSelected) return;
+          logger.error(`[SAVE] Auto-boot did not start a character — CLICK SLOT ${target + 1} MANUALLY (the imported save is there)`);
+        } catch { /* noop */ }
+      }, 5000);
     } catch (e) { logger.warn('character-select auto-boot failed', e); }
   });
 
