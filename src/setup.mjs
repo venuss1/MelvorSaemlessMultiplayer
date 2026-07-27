@@ -6028,11 +6028,17 @@ class Sync {
           for (const a of (ms.actions || [])) {
             const action = skill.actions && skill.actions.getObjectByID(a.actionId);
             if (!action) continue;
+            // Load mastery for EVERY action the sender has — including ones
+            // this client never trained locally (no actionMastery entry).
+            // addMasteryXP creates the entry, recomputes the level, and
+            // applies mastery modifiers/unlocks; the old direct field write
+            // both skipped missing entries and left modifiers stale.
+            // _applyingRemote is held by the snapshot wrapper, so this does
+            // not echo back as MASTERY messages.
             const am = skill.actionMastery.get(action);
-            if (!am) continue;
-            if (typeof a.xp === 'number') {
-              am.xp = Math.max(am.xp || 0, a.xp);
-              am.level = exp.xpToLevel(am.xp);
+            const currentXp = am ? am.xp : 0;
+            if (typeof a.xp === 'number' && a.xp > currentXp) {
+              try { skill.addMasteryXP(action, a.xp - currentXp); } catch (e) { /* skip action */ }
             }
           }
           for (const p of (ms.pools || [])) {
