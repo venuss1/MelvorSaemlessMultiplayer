@@ -23,10 +23,10 @@ connection. **Equipment is the one exception** — it is per-player (see
    default works) and their own name, then click **Connect**. The relay pairs
    the first two waiting clients; the first to connect becomes the **host**.
 2. On the **first join after a game launch**, the peer asks for the host's
-   full save and loads it **in place** — the save is decoded straight into
-   the running game (`SaveWriter` → `game.decode` → `onSaveDataLoad`),
-   exactly what the game's own loader does after the interface is up. No
-   page reload, no trip back to the menu.
+   full save. The save is imported into the peer's **current slot** and the
+   game reloads to load it — but fully unattended: the mod auto-boots the
+   imported slot on the character-select screen and auto-reconnects. One
+   confirm, zero menu clicks.
 3. **Reconnects within the same session never re-copy**: the join handshake
    reconciles drift with an absolute state snapshot instead — instant, no
    dialogs. Dropped connections auto-reconnect with backoff.

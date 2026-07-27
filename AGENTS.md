@@ -71,16 +71,18 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   a key-mismatched peer are dropped in BOTH directions (`_gateWire` inside
   `Transport.send` and `Sync.handle`) — a foreign character can never mutate
   our state (a fresh peer's absolute 0-GP broadcast once deleted the host's
-  gold). Save handoff: the peer requests the full save once per game launch
+  Save handoff: the peer requests the full save once per game launch
   (`needSave` in JOIN_INFO, relay-peer only); the host pushes
   `{save, saveLen, header}`; the peer refuses truncated saves, confirms with
-  the save's name/level/GP, and loads it IN PLACE — `SaveWriter` decode +
-  `game.decode` + `onSaveDataLoad()` (verified against the game source:
-  `loadSaveFromString` minus `loadGameInterface`, whose HTML re-injection
-  re-registers custom elements and crashes). No reload, no menu trip; the
-  slot is persisted in the background via `importSaveToSlot` on the CURRENT
-  slot. Reload+import remains as a catch fallback (`skipLeaveUnequip` guards
-  it so the discarded character's gear isn't broadcast). The gate is STRICT once any JOIN_INFO
+  the save's name/level/GP, imports into the CURRENT slot via
+  `importSaveToSlot`, reloads, and the mod auto-boots that slot
+  (`loadLocalSave` on `onCharacterSelectionLoaded`, from `rmp_autoconnect`)
+  then auto-reconnects — unattended, no menu clicks. (In-place decoding via
+  `game.decode` was tried and abandoned: the game's post-load bootstrap —
+  `updateWindow` -> `initializeStatTables` et al — is one-time boot code
+  that throws on re-run; the reload path is the only game-supported save
+  swap.) `skipLeaveUnequip` guards the import reload so the discarded
+  character's gear isn't broadcast.
   arrives (empty/mismatched key = foreign, all blocked); permissive only
   before any handshake (legacy peer). `_initCharKey` retries lazily —
   characterStorage throws before onCharacterLoaded. `MOD_VERSION` rides

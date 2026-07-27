@@ -401,7 +401,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 4;
+const MOD_VERSION = 5;
 
 // ============================================================================
 // ACTION LOCK
@@ -7783,65 +7783,64 @@ export function setup(ctx) {
     );
     if (!ok) { logger.info('User declined save sync'); return; }
     try {
-      logger.info('========== [MP] LOADING HOST SAVE IN PLACE ==========');
-      // Mirrors loadSaveFromString MINUS loadGameInterface — that step
-      // re-registers custom elements and crashes; the interface is already
-      // up. Sequence verified against the game source (save.js, main.js,
-      // game.js): decode -> onSaveDataLoad (offline gap + UI refresh +
-      // interfaceReady; startMainLoop inside is a guarded no-op).
-      syncInstance._applyingRemote = true;
-      try {
-        const reader = new SaveWriter('Read', 1);
-        const saveVersion = reader.setDataFromSaveString(saveString);
-        if (saveVersion > currentSaveVersion) throw new Error('Invalid save version: ' + saveVersion);
-        game.decode(reader, saveVersion);
-      } finally {
-        syncInstance._applyingRemote = false;
-      }
-      await onSaveDataLoad();
-      syncInstance._saveLoadedThisSession = true;
-      // The decoded save carries the host's characterStorage — our identity
-      // key becomes the host's. Re-read it, then re-announce so both
-      // identity gates open.
-      syncInstance._charKey = undefined;
-      syncInstance._initCharKey();
-      // Strip the host's equipped gear WITHOUT bank return (they still hold it).
-      try { syncInstance._clearLocalEquipment(); } catch (e) { logger.error('clear-equip failed', e); }
-      // Persist into the current slot so the next launch boots the shared save.
-      try {
-        if (typeof importSaveToSlot === 'function') {
-          importSaveToSlot(saveString, slot)
-            .then((persisted) => logger.info('save persisted to slot ' + slot + ': ' + persisted))
-            .catch((e) => logger.warn('slot persist failed', e));
-        }
-      } catch { /* noop */ }
-      syncInstance._sendJoinInfo();
-      logger.info('========== [MP] HOST SAVE LOADED — SYNC ACTIVE ==========');
-    } catch (e) {
-      logger.error('In-place load failed, using reload fallback', e);
-      alert('In-place save load failed (' + ((e && e.message) || e) + ').\n\nFalling back to slot import + reload.');
+      // Import into the CURRENT slot and reload. In-place decoding was
+      // tried and abandoned: the game's post-load bootstrap (updateWindow ->
+      // initializeStatTables, ShopMenu, initializeRocks, ...) is one-time
+      // boot code that throws when re-run in a live page. The reload path is
+      // the only game-supported save swap — but fully unattended: after the
+      // reload the mod auto-boots this slot (onCharacterSelectionLoaded) and
+      // auto-reconnects, so there is no menu interaction at all.
       try {
         sessionStorage.setItem('rmp_autoconnect', JSON.stringify({
           server: transport._serverUrl || '',
           name: transport.myName || 'Player',
           clearEquip: true,
+          slot,
         }));
       } catch { /* noop */ }
+      logger.info(`Importing host save into current slot (${slot})...`);
       let imported = false;
       if (typeof importSaveToSlot === 'function') {
-        try { imported = await importSaveToSlot(saveString, slot); } catch (e2) { logger.warn('importSaveToSlot threw', e2); }
+        try { imported = await importSaveToSlot(saveString, slot); }
+        catch (e) { logger.warn('importSaveToSlot threw', e); }
       }
       if (!imported && typeof setSlotToSaveString === 'function') {
+        logger.warn('importSaveToSlot failed/unavailable — raw slot write fallback');
         await setSlotToSaveString(slot, saveString);
         imported = true;
       }
       if (!imported) {
+        logger.error('Host save failed validation — NOT written, your save is untouched');
         alert('Multiplayer: the host save failed to validate.\n\nYour save was NOT touched.');
         return;
       }
-      skipLeaveUnequip = true;
+      logger.info('Save written, reloading to load it...');
+      skipLeaveUnequip = true; // don't strip+broadcast the discarded character's gear
       setTimeout(() => { window.location.reload(); }, 500);
+    } catch (e) {
+      logger.error('save_sync handling failed', e);
+      alert('Multiplayer: failed to load the host save (' + ((e && e.message) || e) + ').\n\nYour save was NOT touched.');
     }
+  });
+
+  // After a save-import reload the game lands on the character select
+  // screen — auto-boot the imported slot so the whole handoff is unattended
+  // (no menu trip, no manual slot click).
+  ctx.onCharacterSelectionLoaded(() => {
+    try {
+      const auto = sessionStorage.getItem('rmp_autoconnect');
+      if (!auto) return;
+      const { slot } = JSON.parse(auto);
+      const target = (typeof slot === 'number' && slot >= 0) ? slot : 0;
+      logger.info(`Auto-booting imported save in slot ${target}...`);
+      // Give the character-select UI a moment to finish its own init.
+      setTimeout(() => {
+        try {
+          if (typeof loadLocalSave === 'function') loadLocalSave(target);
+          else logger.error('loadLocalSave unavailable — click your slot manually');
+        } catch (e) { logger.error('auto-boot into slot failed — click your slot manually', e); }
+      }, 500);
+    } catch (e) { logger.warn('character-select auto-boot failed', e); }
   });
 
   // Install patches after character loads.
