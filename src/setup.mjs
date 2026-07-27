@@ -402,7 +402,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 9;
+const MOD_VERSION = 10;
 
 // ============================================================================
 // ACTION LOCK
@@ -5481,6 +5481,11 @@ class Sync {
   // they announced SAVE_LOADED). Before any JOIN_INFO (legacy peer) stay
   // permissive — the first handshake arrives within milliseconds.
   _gateWire(t) {
+    // BATCH is a transparent envelope: it MUST pass here so its handler can
+    // unwrap it — sub-messages are then gated individually by handle().
+    // Gating the envelope itself dropped batches containing JOIN_INFO /
+    // SAVE_LOADED, deadlocking the host with 'peer not initialized'.
+    if (t === Msg.BATCH) return true;
     if (t === Msg.JOIN_INFO || t === Msg.SAVE_LOADED) return true;
     if (!this._joinInfoReceived) return true;
     // The host is inherently initialized (it IS the save source); the peer

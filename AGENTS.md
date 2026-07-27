@@ -63,6 +63,9 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   a client that hasn't been initialized from the host's save must never
   broadcast, because its stale absolute values overwrite ours (that's how
   the host's gold and logs died). The host is inherently initialized.
+  BATCH envelopes are ALWAYS gate-transparent — sub-messages are gated
+  individually after unwrapping (gating the envelope once dropped batches
+  containing JOIN_INFO, deadlocking the join as 'peer not initialized').
   (Identity keys were tried and removed: `characterStorage` is dropped on
   load for dev mods — id -1 / Uint32 encoder bug in the game — and cached
   keys went stale across character switches.)
