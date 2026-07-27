@@ -397,6 +397,12 @@ class Transport {
 // sent. tickTimestamp is in-game milliseconds; 2 min covers save-write skew.
 const JOIN_SLACK_MS = 120000;
 
+// Mod build version, exchanged in JOIN_INFO. BUMP THIS on every change to
+// the wire protocol or join/save behavior — mixed builds must be LOUD, not
+// silently half-gated (a peer on an old build once applied host currency to
+// a foreign character and wrote the host save into the wrong slot).
+const MOD_VERSION = 3;
+
 // ============================================================================
 // ACTION LOCK
 // ============================================================================
@@ -528,7 +534,7 @@ class Sync {
   }
 
   install() {
-    if (this._installed) { logger.info('Sync already installed, skipping'); return; }
+    if (this._installed) { logger.info('Sync already installed, skipping'); this._initCharKey(); return; }
     this._installed = true;
     this._initCharKey();
     logger.info('========== [MP] INSTALLING SYNC PATCHES ==========');
@@ -5475,6 +5481,10 @@ class Sync {
   // feature exist get fresh (mismatching) keys on both sides, so the first
   // pairing after updating does one final save push; afterwards they match.
   _initCharKey() {
+    // The send gate must exist even if storage is unavailable yet — an
+    // ungated sender is how foreign state leaks to the peer.
+    if (!this.transport._sendGate) this.transport._sendGate = (m) => this._gateWire(m.t);
+    if (this._charKey) return;
     try {
       let key = this.ctx.characterStorage.getItem('rmp_uuid');
       if (!key) {
@@ -5485,29 +5495,38 @@ class Sync {
         logger.info('[JOIN] Stamped new character key:', key);
       }
       this._charKey = key;
-      // Install the transport send gate: game-state messages only flow when
-      // the peer is known to run the SAME character.
-      this.transport._sendGate = (m) => this._gateWire(m.t);
-    } catch (e) { logger.warn('char key init failed', e); }
+    } catch (e) {
+      // characterStorage throws before onCharacterLoaded — the early
+      // install() fallback hits this; retried lazily by join send/receive.
+      logger.warn('char key init failed (will retry)', e && e.message);
+    }
   }
 
-  // True when a wire message may flow to/from the peer. Unknown keys (no
-  // JOIN_INFO exchanged yet) are allowed — the first JOIN_INFO arrives with
-  // the first batch, so the gate engages within milliseconds of pairing.
+  // True when a wire message may flow to/from the peer. Permissive only
+  // before ANY JOIN_INFO arrives (legacy peer without the handshake). Once
+  // the peer announces itself, an empty or mismatched key means FOREIGN —
+  // everything but the handshake is blocked.
   _gateWire(t) {
-    if (!this._charKey || !this._peerCharKey) return true;
-    if (this._peerCharKey === this._charKey) return true;
+    if (!this._joinInfoReceived) return true;
+    if (this._peerCharKey && this._charKey && this._peerCharKey === this._charKey) return true;
     return t === Msg.JOIN_INFO;
   }
 
   _sendJoinInfo() {
-    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0 });
+    if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
+    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION });
   }
 
   _applyJoinInfo(msg) {
     // Track the peer's character identity regardless of role — the send/apply
     // gates key off this. The push/reconcile DECISION stays host-only.
+    if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
+    this._joinInfoReceived = true;
     this._peerCharKey = msg.key || '';
+    if ((msg.v || 0) !== MOD_VERSION) {
+      logger.error(`[JOIN] MOD VERSION MISMATCH: you=${MOD_VERSION}, peer=${msg.v || 'unknown'} — both players MUST run the same build`);
+      this.transport._emit('version_mismatch', { mine: MOD_VERSION, theirs: msg.v || 0 });
+    }
     if (this._peerCharKey !== this._charKey) {
       logger.warn('[JOIN] Peer is on a FOREIGN character — game-state sync blocked until they load our save');
     }
@@ -7371,6 +7390,11 @@ class Panel {
       this._showRow('saveSyncRow');
       $('saveSyncRow').textContent = 'Loading host save...';
     });
+    this.transport.on('version_mismatch', ({ mine, theirs }) => {
+      this._showRow('saveSyncRow');
+      $('saveSyncRow').textContent = `⚠ MOD VERSION MISMATCH — you: v${mine}, peer: v${theirs}. Both players must update the mod!`;
+      $('saveSyncRow').style.color = '#f87171';
+    });
     this.transport.on('error', (e) => {
       $('status').textContent = 'Error';
       logger.error('transport error', e);
@@ -7660,6 +7684,15 @@ export function setup(ctx) {
   // fires before panel handlers.
   transport.on('open', () => {
     try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
+    // If the peer never announces itself, it's running a pre-handshake build
+    // (or worse). Stay permissive for compatibility but make it LOUD — mixed
+    // builds silently half-sync, which is how foreign state once leaked in.
+    setTimeout(() => {
+      if (transport.isConnected && !syncInstance._joinInfoReceived) {
+        logger.error('[JOIN] Peer sent no JOIN_INFO within 5s — outdated mod build on the other side. BOTH players must update!');
+        transport._emit('version_mismatch', { mine: MOD_VERSION, theirs: 0 });
+      }
+    }, 5000);
   });
 
   // Ghost-gear strip on join. If our last leave was CLEAN (unequip ran and
@@ -7683,6 +7716,12 @@ export function setup(ctx) {
   // Tracks that this page session exists because we accepted the host's
   // save — used to ignore the automatic re-send after the reload.
   let hostSaveLoadedThisSession = false;
+
+  // Set while reloading to import the host save: the pagehide unequip must
+  // NOT fire — it would strip the OLD (about-to-be-discarded) character's
+  // gear and broadcast those items into the host's bank, injecting items
+  // that no longer exist on our side.
+  let skipLeaveUnequip = false;
 
   // Host: send save to a foreign peer (triggered by Sync._applyJoinInfo).
   transport.on('send_save', () => {
@@ -7768,6 +7807,7 @@ export function setup(ctx) {
         return;
       }
       logger.info('Save written, reloading page...');
+      skipLeaveUnequip = true; // don't strip+broadcast the discarded character's gear
       setTimeout(() => { window.location.reload(); }, 500);
     } catch (e) {
       logger.error('save_sync handling failed', e);
@@ -7790,7 +7830,7 @@ export function setup(ctx) {
   // unload. If the browser kills the page first, the gear simply stays with
   // our save and comes back when we rejoin.
   window.addEventListener('pagehide', () => {
-    if (!transport.isConnected) return;
+    if (!transport.isConnected || skipLeaveUnequip) return;
     try { syncInstance._unequipAllToBank(); } catch { /* noop */ }
     // The returns above were synced while paired. The game's own save fires
     // on beforeunload (BEFORE this pagehide handler), so our local save will
