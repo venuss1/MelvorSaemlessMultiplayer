@@ -401,7 +401,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 3;
+const MOD_VERSION = 4;
 
 // ============================================================================
 // ACTION LOCK
@@ -5514,7 +5514,11 @@ class Sync {
 
   _sendJoinInfo() {
     if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
-    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION });
+    // The peer asks for the full save once per game launch (first join after
+    // relaunch); reconnects within the same page session reconcile instead.
+    // Only the relay-peer may ask — the relay-host never accepts a push.
+    const needSave = !this._saveLoadedThisSession && this.transport.role === 'peer';
+    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION, needSave });
   }
 
   _applyJoinInfo(msg) {
@@ -5531,6 +5535,20 @@ class Sync {
       logger.warn('[JOIN] Peer is on a FOREIGN character — game-state sync blocked until they load our save');
     }
     if (this.transport.role !== 'host') return; // only the authority decides
+    // Peer just launched and asked for the full save — hand it over, no
+    // similarity checks. Only guard: if the requester is somehow AHEAD of us
+    // (relay role flip), our save is the stale one — pull theirs instead.
+    if (msg.needSave) {
+      const aheadDrift = (game.tickTimestamp || 0) - (typeof msg.tick === 'number' ? msg.tick : 0);
+      if (aheadDrift < -JOIN_SLACK_MS) {
+        logger.info('[JOIN] Peer needs save but is AHEAD (role flip) — pulling their state instead');
+        this.transport.send({ t: Msg.STATE_REQUEST, join: true });
+      } else {
+        logger.info('[JOIN] Peer requested the full save (first join after relaunch) — pushing');
+        this.transport._emit('send_save');
+      }
+      return;
+    }
     if (!msg.key || msg.key !== this._charKey) {
       logger.info('[JOIN] Peer has a foreign character — pushing save');
       this.transport._emit('send_save');
@@ -7713,10 +7731,6 @@ export function setup(ctx) {
     try { syncInstance._clearLocalEquipment(); } catch (e) { logger.error('ghost strip failed', e); }
   });
 
-  // Tracks that this page session exists because we accepted the host's
-  // save — used to ignore the automatic re-send after the reload.
-  let hostSaveLoadedThisSession = false;
-
   // Set while reloading to import the host save: the pagehide unequip must
   // NOT fire — it would strip the OLD (about-to-be-discarded) character's
   // gear and broadcast those items into the host's bank, injecting items
@@ -7748,72 +7762,85 @@ export function setup(ctx) {
   transport.on('save_sync', async (msg) => {
     const saveString = msg && msg.save;
     if (!saveString) { logger.warn('save_sync event but no save string'); return; }
-    // The relay re-pairs (and the host re-sends its save) after every peer
-    // reconnect — including OUR OWN reload right after loading the host's
-    // save. Accepting again would reload-loop forever, so only ever load one
-    // host save per page session; ignore later pushes.
-    if (hostSaveLoadedThisSession) {
-      logger.info('Ignoring duplicate host save (already loaded one this session)');
+    // One full-save load per game launch; reconnects reconcile instead.
+    if (syncInstance._saveLoadedThisSession) {
+      logger.info('Ignoring host save (already loaded one this session)');
       return;
     }
-    // Truncation guard: a save damaged in transit must never be written.
+    // Truncation guard: a save damaged in transit must never be applied.
     if (typeof msg.saveLen === 'number' && saveString.length !== msg.saveLen) {
-      logger.error(`Save corrupted in transit: got ${saveString.length} of ${msg.saveLen} chars — NOT writing`);
+      logger.error(`Save corrupted in transit: got ${saveString.length} of ${msg.saveLen} chars — NOT applying`);
       alert('Multiplayer: the host save arrived corrupted (truncated in transit).\n\nYour save was NOT touched. Reconnect and try again.');
       return;
     }
+    const slot = (typeof currentCharacter === 'number' && currentCharacter >= 0) ? currentCharacter : 0;
+    const header = msg.header;
+    const desc = header ? `\n\nCharacter: ${header.name} — total level ${header.level}, ${header.gp} GP` : '';
+    const ok = confirm(
+      'Multiplayer: Load the host\'s save now?' + desc +
+      '\n\nYour current character is replaced IN PLACE — no reload, no menu trip. Be out of combat before accepting.' +
+      '\n\nClick OK to load.'
+    );
+    if (!ok) { logger.info('User declined save sync'); return; }
     try {
-      const header = msg.header;
-      const desc = header ? `\n\nCharacter: ${header.name} — total level ${header.level}, ${header.gp} GP` : '';
-      // Write into the slot the peer is CURRENTLY playing — not hardcoded
-      // slot 0. Writing the wrong slot is what made the loaded save appear
-      // "wiped": the host save sat untouched in slot 0 while the peer
-      // re-entered their own (fresh) slot after the reload.
-      const slot = (typeof currentCharacter === 'number' && currentCharacter >= 0) ? currentCharacter : 0;
-      const ok = confirm(
-        'Multiplayer: The host has sent you their save file.' + desc +
-        `\n\nThis will OVERWRITE the save in your current slot (slot ${slot + 1}) and reload the game.` +
-        '\n\nClick OK to continue.'
-      );
-      if (!ok) { logger.info('User declined save sync'); return; }
-
-      // Remember the server URL and name so we can auto-reconnect after reload.
+      logger.info('========== [MP] LOADING HOST SAVE IN PLACE ==========');
+      // Mirrors loadSaveFromString MINUS loadGameInterface — that step
+      // re-registers custom elements and crashes; the interface is already
+      // up. Sequence verified against the game source (save.js, main.js,
+      // game.js): decode -> onSaveDataLoad (offline gap + UI refresh +
+      // interfaceReady; startMainLoop inside is a guarded no-op).
+      syncInstance._applyingRemote = true;
+      try {
+        const reader = new SaveWriter('Read', 1);
+        const saveVersion = reader.setDataFromSaveString(saveString);
+        if (saveVersion > currentSaveVersion) throw new Error('Invalid save version: ' + saveVersion);
+        game.decode(reader, saveVersion);
+      } finally {
+        syncInstance._applyingRemote = false;
+      }
+      await onSaveDataLoad();
+      syncInstance._saveLoadedThisSession = true;
+      // The decoded save carries the host's characterStorage — our identity
+      // key becomes the host's. Re-read it, then re-announce so both
+      // identity gates open.
+      syncInstance._charKey = undefined;
+      syncInstance._initCharKey();
+      // Strip the host's equipped gear WITHOUT bank return (they still hold it).
+      try { syncInstance._clearLocalEquipment(); } catch (e) { logger.error('clear-equip failed', e); }
+      // Persist into the current slot so the next launch boots the shared save.
+      try {
+        if (typeof importSaveToSlot === 'function') {
+          importSaveToSlot(saveString, slot)
+            .then((persisted) => logger.info('save persisted to slot ' + slot + ': ' + persisted))
+            .catch((e) => logger.warn('slot persist failed', e));
+        }
+      } catch { /* noop */ }
+      syncInstance._sendJoinInfo();
+      logger.info('========== [MP] HOST SAVE LOADED — SYNC ACTIVE ==========');
+    } catch (e) {
+      logger.error('In-place load failed, using reload fallback', e);
+      alert('In-place save load failed (' + ((e && e.message) || e) + ').\n\nFalling back to slot import + reload.');
       try {
         sessionStorage.setItem('rmp_autoconnect', JSON.stringify({
           server: transport._serverUrl || '',
           name: transport.myName || 'Player',
-          // The host save we're about to load has the host's gear equipped —
-          // it must be stripped (not returned to bank) after the reload.
           clearEquip: true,
         }));
       } catch { /* noop */ }
-
-      logger.info(`Importing host save into current slot (${slot})...`);
       let imported = false;
-      // The game's own import path validates the save before writing — a
-      // corrupt string returns false instead of nuking the slot.
       if (typeof importSaveToSlot === 'function') {
-        try { imported = await importSaveToSlot(saveString, slot); }
-        catch (e) { logger.warn('importSaveToSlot threw', e); }
+        try { imported = await importSaveToSlot(saveString, slot); } catch (e2) { logger.warn('importSaveToSlot threw', e2); }
       }
       if (!imported && typeof setSlotToSaveString === 'function') {
-        logger.warn('importSaveToSlot failed/unavailable — raw slot write fallback');
         await setSlotToSaveString(slot, saveString);
         imported = true;
       }
       if (!imported) {
-        logger.error('Host save failed validation — NOT written, your save is untouched');
         alert('Multiplayer: the host save failed to validate.\n\nYour save was NOT touched.');
         return;
       }
-      logger.info('Save written, reloading page...');
-      skipLeaveUnequip = true; // don't strip+broadcast the discarded character's gear
+      skipLeaveUnequip = true;
       setTimeout(() => { window.location.reload(); }, 500);
-    } catch (e) {
-      logger.error('save_sync handling failed', e);
-      // Fallback: use the state snapshot instead.
-      logger.info('Falling back to state snapshot sync');
-      syncInstance.requestSnapshot();
     }
   });
 
@@ -7867,7 +7894,7 @@ export function setup(ctx) {
       if (auto) {
         sessionStorage.removeItem('rmp_autoconnect');
         const { server, name, clearEquip } = JSON.parse(auto);
-        hostSaveLoadedThisSession = true;
+        syncInstance._saveLoadedThisSession = true;
         if (clearEquip) {
           // Strip the host's gear that came with the save (see
           // Sync._clearLocalEquipment), then continue as a naked joiner who

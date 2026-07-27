@@ -71,17 +71,21 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   a key-mismatched peer are dropped in BOTH directions (`_gateWire` inside
   `Transport.send` and `Sync.handle`) — a foreign character can never mutate
   our state (a fresh peer's absolute 0-GP broadcast once deleted the host's
-  gold). Save handoff: host pushes `{save, saveLen, header}`; peer refuses
-  truncated/invalid saves outright and imports into the CURRENT slot
-  (`currentCharacter`, never hardcoded slot 0 — wrong-slot writes made the
-  loaded save look "wiped") via `importSaveToSlot`, after a confirm dialog
-  showing the save's name/level/GP. The gate is STRICT once any JOIN_INFO
+  gold). Save handoff: the peer requests the full save once per game launch
+  (`needSave` in JOIN_INFO, relay-peer only); the host pushes
+  `{save, saveLen, header}`; the peer refuses truncated saves, confirms with
+  the save's name/level/GP, and loads it IN PLACE — `SaveWriter` decode +
+  `game.decode` + `onSaveDataLoad()` (verified against the game source:
+  `loadSaveFromString` minus `loadGameInterface`, whose HTML re-injection
+  re-registers custom elements and crashes). No reload, no menu trip; the
+  slot is persisted in the background via `importSaveToSlot` on the CURRENT
+  slot. Reload+import remains as a catch fallback (`skipLeaveUnequip` guards
+  it so the discarded character's gear isn't broadcast). The gate is STRICT once any JOIN_INFO
   arrives (empty/mismatched key = foreign, all blocked); permissive only
   before any handshake (legacy peer). `_initCharKey` retries lazily —
   characterStorage throws before onCharacterLoaded. `MOD_VERSION` rides
   JOIN_INFO — bump it on every protocol/join-behavior change; mismatches and
-  missing handshakes (5s) raise a red panel warning. Import reloads set
-  `skipLeaveUnequip` so the discarded character's gear isn't broadcast.
+  missing handshakes (5s) raise a red panel warning.
 - **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
   pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
   (synced), so the pool stays consistent with no equipment messages at all.
