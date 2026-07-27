@@ -22,14 +22,14 @@ connection. **Equipment is the one exception** — it is per-player (see
 1. Both players open the panel, enter the **same relay server URL** (the
    default works) and their own name, then click **Connect**. The relay pairs
    the first two waiting clients; the first to connect becomes the **host**.
-2. On the **first join after a game launch**, the peer asks for the host's
-   full save. The save is imported into the peer's **current slot** and the
-   game reloads to load it — but fully unattended: the mod auto-boots the
-   imported slot on the character-select screen and auto-reconnects. One
-   confirm, zero menu clicks.
-3. **Reconnects within the same session never re-copy**: the join handshake
-   reconciles drift with an absolute state snapshot instead — instant, no
-   dialogs. Dropped connections auto-reconnect with backoff.
+2. On the **first join after a game launch**, the host pushes its **entire
+   save** and the peer's client imports it **automatically** — no confirm,
+   no menu clicks: anti-clobber guard, import into the current slot,
+   reload, auto-boot into the slot, auto-reconnect. Both clients now run
+   the exact same character.
+3. **Reconnects** skip the save copy: the host reconciles drift with an
+   absolute state snapshot (bank set exactly, currencies absolute,
+   progression maxed up). Dropped connections auto-reconnect with backoff.
 4. Either side can request a **full state snapshot** (every skill, bank item,
    currency, pet, plot, obstacle, etc.) so both clients
    converge.

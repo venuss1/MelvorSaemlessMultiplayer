@@ -96,6 +96,7 @@ const Msg = Object.freeze({
   COMBAT_LOOT: 'combat_loot',       // { drops: [{itemId, qty}], currency: {gp, sc, ...} }
   STATE_REQUEST: 'state_req', STATE_SNAPSHOT: 'state_snap',
   SAVE_SYNC: 'save_sync',
+  SAVE_LOADED: 'save_loaded',         // peer -> host: finished importing the save, open the gate
   JOIN_INFO: 'join_info',           // peer -> host: character key + game age; host decides push vs reconcile
   UNLOCK_ALL: 'unlock_all',
   LEVEL_CAP: 'level_cap',           // skill level cap increases purchased
@@ -401,10 +402,7 @@ const JOIN_SLACK_MS = 120000;
 // the wire protocol or join/save behavior — mixed builds must be LOUD, not
 // silently half-gated (a peer on an old build once applied host currency to
 // a foreign character and wrote the host save into the wrong slot).
-const MOD_VERSION = 8;
-
-// Short printable form of a character key for gate logs.
-function shortKey(k) { return k ? String(k).slice(0, 8) : 'none'; }
+const MOD_VERSION = 9;
 
 // ============================================================================
 // ACTION LOCK
@@ -537,9 +535,9 @@ class Sync {
   }
 
   install() {
-    if (this._installed) { logger.info('Sync already installed, skipping'); this._initCharKey(); return; }
+    if (this._installed) { logger.info('Sync already installed, skipping'); this._initJoinGate(); return; }
     this._installed = true;
-    this._initCharKey();
+    this._initJoinGate();
     logger.info('========== [MP] INSTALLING SYNC PATCHES ==========');
     const patches = [
       ['XP', '_patchXP'],
@@ -5432,17 +5430,11 @@ class Sync {
   // ---- Active-action watcher -------------------------------------------
 
   _startPeriodicStateSync() {
-    // Every 60 seconds, send a lightweight sync of only currencies.
-    // XP, mastery, and other state are already synced in real-time via
-    // individual patches. This is just a safety net for currencies.
-    this._stateSyncTimer = setInterval(() => {
-      if (!this._canSend()) return;
-      try {
-        if (game.currencies) for (const c of game.currencies.allObjects) {
-          this.transport.send({ t: Msg.CURRENCY, currencyId: c.id, qty: c._amount });
-        }
-      } catch (e) { logger.warn('periodic state sync failed', e); }
-    }, 60000);
+    // REMOVED: the 60s absolute-currency broadcast. When the two clients'
+    // gold diverged even slightly, each side's absolute value periodically
+    // overwrote the other's — sales appeared to jump to random values (the
+    // "3 gold, 38, 68" roller coaster). Currency is delta-synced live and
+    // reconciled absolutely on every join — this net only caused harm.
   }
 
   _startWatcher() {
@@ -5472,96 +5464,75 @@ class Sync {
 
   // ---- Full snapshot ----------------------------------------------------
 
-  // ---- Join handshake (smart rejoin) ---------------------------------------
-  // The peer never plays solo — the host is always the authority and its
-  // state is always >= the peer's. So the join decision is one-sided: the
-  // peer identifies its character, the host decides push-save vs reconcile.
-
-  // Character identity is derived from the save's OWN core fields — never
-  // from characterStorage. Root cause of the foreign-key blackout: the game
-  // stores mod characterStorage keyed by numeric mod id; directory-linked
-  // dev mods get id -1 (mod.js), which the save encoder writes as a Uint32
-  // and the decoder then fails to find on load — storage was silently
-  // discarded on EVERY reload, so stamped UUIDs never persisted, keys never
-  // matched, and the gate locked both players out.
-  // characterName + AccountCreationDate are encoded in the save itself and
-  // travel with it (including to the peer on save handoff).
-  _initCharKey() {
-    // The send gate must exist even if identity is unavailable yet — an
-    // ungated sender is how foreign state leaks to the peer.
+  // ---- Join layer (session-flag gated, no identity math) ------------------
+  // The peer never plays solo — the host is always the authority. The whole
+  // gate is ONE boolean per side: has the save been loaded from the host
+  // this page session? Until then the peer is SILENT (no sends, no applies)
+  // — a client that has not been initialized from the host's save must
+  // never broadcast, because its stale absolute values overwrite ours
+  // (that's how the host's gold/logs died). No keys, no matching: the save
+  // handoff itself guarantees both sides run the same character.
+  _initJoinGate() {
     if (!this.transport._sendGate) this.transport._sendGate = (m) => this._gateWire(m.t);
-    if (this._charKey) return;
-    try {
-      const name = game.characterName || '';
-      let created = 0;
-      try {
-        if (game.stats && game.stats.General && typeof GeneralStats !== 'undefined') {
-          created = game.stats.General.get(GeneralStats.AccountCreationDate) || 0;
-        }
-      } catch { /* noop */ }
-      this._charKey = created ? `${name}|${created}` : name;
-      if (!this._charKey) logger.warn('[JOIN] character identity unavailable (name not set yet)');
-    } catch (e) {
-      logger.warn('char key init failed (will retry)', e && e.message);
-    }
   }
 
-  // True when a wire message may flow to/from the peer. Permissive only
-  // before ANY JOIN_INFO arrives (legacy peer without the handshake). Once
-  // the peer announces itself, an empty or mismatched key means FOREIGN —
-  // everything but the handshake is blocked.
+  // May a wire message flow? Handshake messages always pass; game-state
+  // passes only when BOTH sides are initialized (us: save loaded; peer:
+  // they announced SAVE_LOADED). Before any JOIN_INFO (legacy peer) stay
+  // permissive — the first handshake arrives within milliseconds.
   _gateWire(t) {
+    if (t === Msg.JOIN_INFO || t === Msg.SAVE_LOADED) return true;
     if (!this._joinInfoReceived) return true;
-    if (this._peerCharKey && this._charKey && this._peerCharKey === this._charKey) return true;
-    return t === Msg.JOIN_INFO;
+    // The host is inherently initialized (it IS the save source); the peer
+    // is initialized once it has loaded the host's save this page session.
+    const selfReady = this.transport.role === 'peer' ? !!this._saveLoadedThisSession : true;
+    return selfReady && !!this._peerSaveLoaded;
   }
 
   _sendJoinInfo() {
-    if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
-    this.transport.send({ t: Msg.JOIN_INFO, key: this._charKey || '', tick: game.tickTimestamp || 0, v: MOD_VERSION });
+    // needSave: relay-peer that hasn't been initialized this page session
+    // asks for the full save. Otherwise it just wants a reconcile.
+    const needSave = !this._saveLoadedThisSession && this.transport.role === 'peer';
+    this.transport.send({ t: Msg.JOIN_INFO, v: MOD_VERSION, needSave, tick: game.tickTimestamp || 0 });
   }
 
   _applyJoinInfo(msg) {
-    // Track the peer's character identity regardless of role — the send/apply
-    // gates key off this. The push/reconcile DECISION stays host-only.
-    if (!this._charKey) this._initCharKey(); // lazy retry (storage may be ready now)
     this._joinInfoReceived = true;
-    this._peerCharKey = msg.key || '';
     if ((msg.v || 0) !== MOD_VERSION) {
       logger.error(`[JOIN] MOD VERSION MISMATCH: you=${MOD_VERSION}, peer=${msg.v || 'unknown'} — both players MUST run the same build`);
       this.transport._emit('version_mismatch', { mine: MOD_VERSION, theirs: msg.v || 0 });
     }
-    if (this._peerCharKey !== this._charKey) {
-      logger.warn(`[JOIN] Peer is on a FOREIGN character (mine=${shortKey(this._charKey)}, peer=${shortKey(this._peerCharKey)}) — game-state sync blocked until they load our save`);
-    }
+    // A peer that doesn't need a save is already initialized (same
+    // character from a previous handoff) — game messages may flow to it.
+    if (!msg.needSave) this._peerSaveLoaded = true;
     if (this.transport.role !== 'host') return; // only the authority decides
-    if (!msg.key || msg.key !== this._charKey) {
-      logger.info(`[JOIN] Peer key ${msg.key ? 'MISMATCH' : 'MISSING'} (mine=${shortKey(this._charKey)}, peer=${shortKey(msg.key)}) — pushing full save`);
+    if (msg.needSave) {
+      logger.info('[JOIN] Peer needs the save — pushing full save');
       this.transport._emit('send_save');
       return;
     }
-    logger.info(`[JOIN] Key match (${shortKey(this._charKey)}) — no save push, reconciling`);
-    const drift = (game.tickTimestamp || 0) - (typeof msg.tick === 'number' ? msg.tick : 0);
-    logger.info(`[JOIN] Same character (key match). Tick drift: ${drift}`);
-    if (Math.abs(drift) <= JOIN_SLACK_MS) {
-      // Within slack both saves hold the same converged state — no save, no
-      // snapshot. This is the fast path for quick reconnects.
-      logger.info('[JOIN] States converged — instant connect, no snapshot');
-      return;
-    }
-    if (drift < 0) {
-      // The JOIN_INFO sender is AHEAD of us — relay roles flipped after a
-      // double reconnect (we hold the stale state despite being relay-host).
-      // Pull their state as an absolute reconcile instead of pushing ours.
-      logger.info('[JOIN] Peer is ahead (role flip) — requesting absolute join snapshot');
-      this.transport.send({ t: Msg.STATE_REQUEST, join: true });
-      return;
-    }
-    logger.info('[JOIN] Reconciling peer with absolute join snapshot');
+    // Reconnect of an initialized peer: ALWAYS reconcile (absolute bank +
+    // absolute currencies + max progression). The old tick-slack fast path
+    // let diverged state through — that divergence is what deleted items
+    // and ping-ponged gold.
+    logger.info('[JOIN] Reconciling initialized peer with absolute join snapshot');
     const snap = this._buildSnapshot();
     snap.join = true;
     snap.absoluteBank = true;
     this.transport.send(snap);
+  }
+
+  // Peer finished loading our save and rebooted into it — open the gate.
+  _applySaveLoaded() {
+    logger.info('[JOIN] Peer loaded the save — sync open');
+    this._peerSaveLoaded = true;
+    // Their state now equals ours at push time; reconcile to cover the gap.
+    if (this.transport.role === 'host') {
+      const snap = this._buildSnapshot();
+      snap.join = true;
+      snap.absoluteBank = true;
+      this.transport.send(snap);
+    }
   }
 
   requestSnapshot() { this.transport.send({ t: Msg.STATE_REQUEST }); }
@@ -6956,6 +6927,7 @@ class Sync {
       },
       [Msg.STATE_SNAPSHOT]: (m) => this._applySnapshot(m),
       [Msg.JOIN_INFO]: (m) => this._applyJoinInfo(m),
+      [Msg.SAVE_LOADED]: () => this._applySaveLoaded(),
       [Msg.UNLOCK_ALL]: () => this._unlockAll(),
     };
   }
@@ -6969,10 +6941,10 @@ class Sync {
       logger.warn(`[RECV] No handler for message type: ${msgName}`);
       return;
     }
-    // Identity gate: a peer on a foreign character must not mutate our
-    // state. Only handshake messages pass until character keys match.
+    // Session gate: an uninitialized peer must not mutate our state. Only
+    // handshake messages pass until the peer has loaded our save.
     if (!this._gateWire(msg.t)) {
-      logger.warn(`[RECV] ${msgName} dropped — peer is on a foreign character`);
+      logger.warn(`[RECV] ${msgName} dropped — peer not initialized (save not loaded yet)`);
       return;
     }
     try {
@@ -7689,10 +7661,11 @@ export function setup(ctx) {
   // fires before panel handlers.
   transport.on('open', () => {
     try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
-    // NOTE: the host pushes its save ONLY when the peer's JOIN_INFO shows a
-    // missing/foreign character key (Sync._applyJoinInfo). Pushing on every
-    // open floods the socket with repeated save frames (sync appears dead)
-    // and spams the peer with load-save confirms (perma-asking).
+    // If we've already loaded the host's save this session, announce it so
+    // the host opens its gate immediately (also covers auto-reconnects).
+    if (syncInstance._saveLoadedThisSession && transport.role === 'peer') {
+      transport.send({ t: Msg.SAVE_LOADED });
+    }
     // If the peer never announces itself, it's running a pre-handshake build
     // (or worse). Stay permissive for compatibility but make it LOUD — mixed
     // builds silently half-sync, which is how foreign state once leaked in.
@@ -7745,14 +7718,18 @@ export function setup(ctx) {
     }
   });
 
-  // Peer: automatically load the host's save when received.
-  // We can't use loadSaveFromString() because it re-registers custom HTML
-  // elements that are already registered, causing a crash. Instead we import
-  // into the peer's CURRENT slot and reload the page — the game loads the
-  // save cleanly on startup.
+  // Peer: automatically load the host's save when received. NO confirm —
+  // the flow is fully automatic: import into the CURRENT slot, reload,
+  // auto-boot, auto-reconnect. Guards: relay-hosts never accept (role
+  // flip), stale saves are refused (sender's tick older than ours), and a
+  // truncated save is never written.
   transport.on('save_sync', async (msg) => {
     const saveString = msg && msg.save;
     if (!saveString) { logger.warn('save_sync event but no save string'); return; }
+    if (transport.role === 'host') {
+      logger.warn('[SAVE] Refusing save push — we are the relay host (role flip?)');
+      return;
+    }
     // One full-save load per game launch; reconnects reconcile instead.
     if (syncInstance._saveLoadedThisSession) {
       logger.info('Ignoring host save (already loaded one this session)');
@@ -7764,17 +7741,17 @@ export function setup(ctx) {
       alert('Multiplayer: the host save arrived corrupted (truncated in transit).\n\nYour save was NOT touched. Reconnect and try again.');
       return;
     }
-    const slot = (typeof currentCharacter === 'number' && currentCharacter >= 0) ? currentCharacter : 0;
+    // Staleness guard: never import a save OLDER than our own state — that
+    // only happens when relay roles flip and the stale side pushes.
     const header = msg.header;
-    const desc = header ? `\n\nCharacter: ${header.name} — total level ${header.level}, ${header.gp} GP` : '';
-    const ok = confirm(
-      'Multiplayer: Load the host\'s save now?' + desc +
-      `\n\nThis OVERWRITES the character in your current slot (slot ${slot + 1}) and reloads the game to load it.` +
-      '\n\nClick OK to load.'
-    );
-    if (!ok) { logger.info('User declined save sync'); return; }
+    if (header && typeof header.tick === 'number' && (game.tickTimestamp || 0) > header.tick + JOIN_SLACK_MS) {
+      logger.warn(`[SAVE] Refusing STALE save (ours is ahead: mine=${game.tickTimestamp}, theirs=${header.tick})`);
+      return;
+    }
+    const slot = (typeof currentCharacter === 'number' && currentCharacter >= 0) ? currentCharacter : 0;
+    const desc = header ? `${header.name} (total level ${header.level}, ${header.gp} GP)` : 'unknown';
+    logger.info(`[SAVE] Auto-importing host save: ${desc} -> slot ${slot} (occupant: ${game.characterName || '?'})`);
     try {
-      logger.info(`[SAVE] Accepted. Target slot ${slot}; current occupant: ${game.characterName || '?'} (total level ${game.completion?.skillLevelProgress?.currentCount?.getSum?.() ?? '?'})`);
       // ANTI-CLOBBER: freeze ALL saving before touching the slot. Without
       // this, the CURRENT (about-to-be-discarded) character's autosave can
       // fire in the import->reload window and overwrite the host save we

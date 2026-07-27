@@ -55,43 +55,34 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   (first = host) and shuttles messages. Works through any firewall that allows HTTPS.
 - `ActionLock` tracks who trains what; advisory conflict warning in the UI.
 - `Panel` is an imperative floating DOM panel (top-right).
-- **Join handshake (smart rejoin):** the peer never plays solo — the host is
-  always the authority. On 'open' both sides send `JOIN_INFO {key, tick, v}`;
-  the key is derived from the save's OWN fields (`characterName` +
-  AccountCreationDate stat) — NOT `characterStorage`: the game keys mod
-  storage by numeric mod id, directory-linked dev mods get id -1, and the
-  save encoder/decoder (Uint32 round-trip) silently drops it on load, so
-  storage-stamped UUIDs never survived a reload (root cause of the
-  foreign-key blackout). Save-intrinsic fields travel with the save,
-  including to the peer on handoff. Host decides: key mismatch -> push save (foreign
-  character, the reload path); `|tick drift| <= JOIN_SLACK_MS` -> nothing
-  (instant connect); drift > slack -> absolute join snapshot
-  (`join`/`absoluteBank` — bank set EXACTLY, phantoms removed; a peer that
-  never plays solo can only hold stale excess); drift < -slack (relay role
-  flip after a double reconnect) -> pull via `STATE_REQUEST {join:true}`.
-  Transport close carries a reason (`manual`/`peer_left`/`socket`); the panel
-  auto-reconnects only on `socket` with [2s, 5s, 15s] backoff — the relay
-  keeps a leaver's slot reserved, so roles never change on reconnect.
-  **Identity gate:** once JOIN_INFO is exchanged, game-state messages to/from
-  a key-mismatched peer are dropped in BOTH directions (`_gateWire` inside
-  `Transport.send` and `Sync.handle`) — a foreign character can never mutate
-  our state (a fresh peer's absolute 0-GP broadcast once deleted the host's
-  Save handoff: the host pushes its ENTIRE save on every pairing, no
-  similarity checks (`send_save` on 'open', relay-host only); the peer
-  applies it at most once per game launch, reconnects ignore it and
-  reconcile. Accept path: `blockCorruptSaving = true` FIRST (otherwise the
-  discarded character's autosave fires in the import->reload window and
-  clobbers the just-written host save — the peer boots their old character
-  and the save 'never arrived'), then `importSaveToSlot` on the CURRENT
-  slot, reload in 250ms, auto-boot via `loadLocalSave` (500/1500/3000ms
-  retries) from `rmp_autoconnect`, auto-reconnect. In-place decoding via
-  `game.decode` was tried and abandoned (one-time boot code throws on
-  re-run). `skipLeaveUnequip` guards the import reload.
-  arrives (empty/mismatched key = foreign, all blocked); permissive only
-  before any handshake (legacy peer). `_initCharKey` retries lazily —
-  characterStorage throws before onCharacterLoaded. `MOD_VERSION` rides
-  JOIN_INFO — bump it on every protocol/join-behavior change; mismatches and
-  missing handshakes (5s) raise a red panel warning.
+- **Join layer (session-flag gated, no identity math):** the peer never
+  plays solo — the host is always the authority. The gate is ONE boolean per
+  side: `_saveLoadedThisSession` (we loaded the host's save) and
+  `_peerSaveLoaded` (the peer announced readiness via JOIN_INFO
+  `needSave:false` or SAVE_LOADED). Until initialized, the peer is SILENT —
+  a client that hasn't been initialized from the host's save must never
+  broadcast, because its stale absolute values overwrite ours (that's how
+  the host's gold and logs died). The host is inherently initialized.
+  (Identity keys were tried and removed: `characterStorage` is dropped on
+  load for dev mods — id -1 / Uint32 encoder bug in the game — and cached
+  keys went stale across character switches.)
+  Flow on 'open': both sides send `JOIN_INFO {v, needSave, tick}`; the host
+  decides: `needSave` -> push the ENTIRE save (peer AUTO-IMPORTS, no
+  confirm: `blockCorruptSaving` anti-clobber -> `importSaveToSlot` on the
+  CURRENT slot -> reload -> auto-boot `loadLocalSave` with retries ->
+  auto-reconnect -> SAVE_LOADED); else -> ALWAYS send an absolute join
+  snapshot (bank set EXACTLY, currencies absolute, progression max) — the
+  tick-slack "converged" fast path was removed after diverged states
+  slipped through and deleted items. Guards: relay-hosts refuse save pushes
+  (role flip), stale saves refused (`header.tick` older than ours by >
+  JOIN_SLACK_MS), truncated saves refused, `MOD_VERSION` mismatch = red
+  panel warning (also when no JOIN_INFO arrives within 5s). The 60s
+  absolute currency net was removed (gold ping-pong source). In-place
+  `game.decode` loading was tried and abandoned (`updateWindow` is one-time
+  boot code that throws on re-run). `skipLeaveUnequip` guards the import
+  reload. Transport close carries a reason (`manual`/`peer_left`/`socket`);
+  the panel auto-reconnects only on `socket` with [2s, 5s, 15s] backoff —
+  the relay keeps a leaver's slot reserved, so roles never change.
 - **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
   pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
   (synced), so the pool stays consistent with no equipment messages at all.
