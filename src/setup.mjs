@@ -276,7 +276,7 @@ class Transport {
         // Peer messages (relayed by server)
         if (msg.t === Msg.SAVE_SYNC) {
           logger.info('Received save sync from host (' + (msg.save?.length || 0) + ' chars)');
-          this._emit('save_sync', msg.save);
+          this._emit('save_sync', msg);
           return;
         }
         if (msg.t === Msg.HELLO) {
@@ -330,6 +330,14 @@ class Transport {
   send(msg) {
     if (!this._paired) {
       logger.warn('send() called but not paired, msg.t =', msg.t);
+      return false;
+    }
+    // Character-identity gate (installed by Sync): when the peer is known to
+    // run a FOREIGN character, game-state messages are blocked — a foreign
+    // peer must never mutate our state (their 0-GP broadcast deleted the
+    // host's gold). Only handshake messages pass until keys match.
+    if (this._sendGate && !this._sendGate(msg)) {
+      logger.debug('send gated (foreign peer):', msg.t);
       return false;
     }
     // Batch: coalesce everything produced within a frame into one envelope —
@@ -5477,7 +5485,19 @@ class Sync {
         logger.info('[JOIN] Stamped new character key:', key);
       }
       this._charKey = key;
+      // Install the transport send gate: game-state messages only flow when
+      // the peer is known to run the SAME character.
+      this.transport._sendGate = (m) => this._gateWire(m.t);
     } catch (e) { logger.warn('char key init failed', e); }
+  }
+
+  // True when a wire message may flow to/from the peer. Unknown keys (no
+  // JOIN_INFO exchanged yet) are allowed — the first JOIN_INFO arrives with
+  // the first batch, so the gate engages within milliseconds of pairing.
+  _gateWire(t) {
+    if (!this._charKey || !this._peerCharKey) return true;
+    if (this._peerCharKey === this._charKey) return true;
+    return t === Msg.JOIN_INFO;
   }
 
   _sendJoinInfo() {
@@ -5485,6 +5505,12 @@ class Sync {
   }
 
   _applyJoinInfo(msg) {
+    // Track the peer's character identity regardless of role — the send/apply
+    // gates key off this. The push/reconcile DECISION stays host-only.
+    this._peerCharKey = msg.key || '';
+    if (this._peerCharKey !== this._charKey) {
+      logger.warn('[JOIN] Peer is on a FOREIGN character — game-state sync blocked until they load our save');
+    }
     if (this.transport.role !== 'host') return; // only the authority decides
     if (!msg.key || msg.key !== this._charKey) {
       logger.info('[JOIN] Peer has a foreign character — pushing save');
@@ -6919,6 +6945,12 @@ class Sync {
       logger.warn(`[RECV] No handler for message type: ${msgName}`);
       return;
     }
+    // Identity gate: a peer on a foreign character must not mutate our
+    // state. Only handshake messages pass until character keys match.
+    if (!this._gateWire(msg.t)) {
+      logger.warn(`[RECV] ${msgName} dropped — peer is on a foreign character`);
+      return;
+    }
     try {
       handler(msg);
       logger.debug(`[APPLY OK] ${msgName}`);
@@ -7622,13 +7654,12 @@ export function setup(ctx) {
   // by Sync.handle's table, everything else to the matching _applyX.
   transport.on('message', (msg) => syncInstance.handle(msg));
 
-  // Join handshake: on pairing, the peer identifies its character (key +
-  // in-game age) so the host can decide push-save vs reconcile vs instant
-  // connect. Registered at mod load so it fires before panel handlers.
+  // Join handshake: on pairing, BOTH sides announce their character (key +
+  // in-game age) so each can gate foreign peers, and the host can decide
+  // push-save vs reconcile vs instant connect. Registered at mod load so it
+  // fires before panel handlers.
   transport.on('open', () => {
-    if (transport.role === 'peer') {
-      try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
-    }
+    try { syncInstance._sendJoinInfo(); } catch (e) { logger.error('join info send failed', e); }
   });
 
   // Ghost-gear strip on join. If our last leave was CLEAN (unequip ran and
@@ -7653,13 +7684,18 @@ export function setup(ctx) {
   // save — used to ignore the automatic re-send after the reload.
   let hostSaveLoadedThisSession = false;
 
-  // Host: automatically send save to peer when they connect.
+  // Host: send save to a foreign peer (triggered by Sync._applyJoinInfo).
   transport.on('send_save', () => {
-    logger.info('Peer connected — auto-sending host save...');
+    logger.info('Sending save to peer...');
     try {
       const saveString = game.generateSaveString();
-      logger.info('Save string generated (' + saveString.length + ' chars), sending to peer');
-      transport._rawSend({ t: Msg.SAVE_SYNC, save: saveString });
+      let header = null;
+      try {
+        const h = game.getSaveHeader();
+        header = { name: h.characterName, level: h.totalSkillLevel, gp: h.gp, tick: h.tickTimestamp };
+      } catch { /* noop */ }
+      logger.info(`Save generated (${saveString.length} chars)`, header || '');
+      transport._rawSend({ t: Msg.SAVE_SYNC, save: saveString, saveLen: saveString.length, header });
     } catch (e) {
       logger.error('Failed to generate/send save for peer', e);
     }
@@ -7667,10 +7703,11 @@ export function setup(ctx) {
 
   // Peer: automatically load the host's save when received.
   // We can't use loadSaveFromString() because it re-registers custom HTML
-  // elements that are already registered, causing a crash. Instead we write
-  // the save to slot 0 in local storage and reload the page — the game loads
-  // the save cleanly on startup.
-  transport.on('save_sync', (saveString) => {
+  // elements that are already registered, causing a crash. Instead we import
+  // into the peer's CURRENT slot and reload the page — the game loads the
+  // save cleanly on startup.
+  transport.on('save_sync', async (msg) => {
+    const saveString = msg && msg.save;
     if (!saveString) { logger.warn('save_sync event but no save string'); return; }
     // The relay re-pairs (and the host re-sends its save) after every peer
     // reconnect — including OUR OWN reload right after loading the host's
@@ -7680,19 +7717,27 @@ export function setup(ctx) {
       logger.info('Ignoring duplicate host save (already loaded one this session)');
       return;
     }
-    logger.info('Received host save (' + saveString.length + ' chars)');
+    // Truncation guard: a save damaged in transit must never be written.
+    if (typeof msg.saveLen === 'number' && saveString.length !== msg.saveLen) {
+      logger.error(`Save corrupted in transit: got ${saveString.length} of ${msg.saveLen} chars — NOT writing`);
+      alert('Multiplayer: the host save arrived corrupted (truncated in transit).\n\nYour save was NOT touched. Reconnect and try again.');
+      return;
+    }
     try {
+      const header = msg.header;
+      const desc = header ? `\n\nCharacter: ${header.name} — total level ${header.level}, ${header.gp} GP` : '';
+      // Write into the slot the peer is CURRENTLY playing — not hardcoded
+      // slot 0. Writing the wrong slot is what made the loaded save appear
+      // "wiped": the host save sat untouched in slot 0 while the peer
+      // re-entered their own (fresh) slot after the reload.
+      const slot = (typeof currentCharacter === 'number' && currentCharacter >= 0) ? currentCharacter : 0;
       const ok = confirm(
-        'Multiplayer: The host has sent you their save file.\n\n' +
-        'Your game will reload with the host\'s character.\n\n' +
-        'Click OK to continue.'
+        'Multiplayer: The host has sent you their save file.' + desc +
+        `\n\nThis will OVERWRITE the save in your current slot (slot ${slot + 1}) and reload the game.` +
+        '\n\nClick OK to continue.'
       );
       if (!ok) { logger.info('User declined save sync'); return; }
 
-      // Write the save to slot 0 in local storage, then reload the page.
-      // The game will load this save on startup, avoiding the custom element
-      // registration conflict.
-      logger.info('Writing host save to slot 0...');
       // Remember the server URL and name so we can auto-reconnect after reload.
       try {
         sessionStorage.setItem('rmp_autoconnect', JSON.stringify({
@@ -7703,15 +7748,27 @@ export function setup(ctx) {
           clearEquip: true,
         }));
       } catch { /* noop */ }
-      setSlotToSaveString(0, saveString).then(() => {
-        logger.info('Save written to slot 0, reloading page...');
-        setTimeout(() => { window.location.reload(); }, 500);
-      }).catch((e) => {
-        logger.error('Failed to write save to slot', e);
-        // Fallback: use the state snapshot instead.
-        logger.info('Falling back to state snapshot sync');
-        syncInstance.requestSnapshot();
-      });
+
+      logger.info(`Importing host save into current slot (${slot})...`);
+      let imported = false;
+      // The game's own import path validates the save before writing — a
+      // corrupt string returns false instead of nuking the slot.
+      if (typeof importSaveToSlot === 'function') {
+        try { imported = await importSaveToSlot(saveString, slot); }
+        catch (e) { logger.warn('importSaveToSlot threw', e); }
+      }
+      if (!imported && typeof setSlotToSaveString === 'function') {
+        logger.warn('importSaveToSlot failed/unavailable — raw slot write fallback');
+        await setSlotToSaveString(slot, saveString);
+        imported = true;
+      }
+      if (!imported) {
+        logger.error('Host save failed validation — NOT written, your save is untouched');
+        alert('Multiplayer: the host save failed to validate.\n\nYour save was NOT touched.');
+        return;
+      }
+      logger.info('Save written, reloading page...');
+      setTimeout(() => { window.location.reload(); }, 500);
     } catch (e) {
       logger.error('save_sync handling failed', e);
       // Fallback: use the state snapshot instead.

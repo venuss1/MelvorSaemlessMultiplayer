@@ -67,6 +67,15 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   Transport close carries a reason (`manual`/`peer_left`/`socket`); the panel
   auto-reconnects only on `socket` with [2s, 5s, 15s] backoff — the relay
   keeps a leaver's slot reserved, so roles never change on reconnect.
+  **Identity gate:** once JOIN_INFO is exchanged, game-state messages to/from
+  a key-mismatched peer are dropped in BOTH directions (`_gateWire` inside
+  `Transport.send` and `Sync.handle`) — a foreign character can never mutate
+  our state (a fresh peer's absolute 0-GP broadcast once deleted the host's
+  gold). Save handoff: host pushes `{save, saveLen, header}`; peer refuses
+  truncated/invalid saves outright and imports into the CURRENT slot
+  (`currentCharacter`, never hardcoded slot 0 — wrong-slot writes made the
+  loaded save look "wiped") via `importSaveToSlot`, after a confirm dialog
+  showing the save's name/level/GP.
 - **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
   pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
   (synced), so the pool stays consistent with no equipment messages at all.
