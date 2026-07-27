@@ -1081,11 +1081,11 @@ class Sync {
     this._refreshEquipmentUI();
   }
 
-  // Join flow (save-sync only): the save just loaded carries the HOST's
-  // equipped gear, but the host still has those items equipped on their own
-  // client — they are already out of the shared bank pool. Strip them from
-  // local equipment WITHOUT returning them to the bank, or every equipped
-  // item would exist twice (worn by the host, banked by the joiner).
+  // Join flow: strip local equipment WITHOUT returning it to the bank.
+  // Used (a) after loading the host's save — the host still holds the gear
+  // the save shows equipped — and (b) on rejoin after a clean leave, where
+  // our stale save shows gear that was already returned to the shared bank.
+  // In both cases returning the items to the bank would duplicate them.
   _clearLocalEquipment() {
     const p = game.combat && game.combat.player;
     if (!p || !p.equipmentSets) return;
@@ -7176,9 +7176,14 @@ class Panel {
     });
 
     $('disconnectBtn').addEventListener('click', () => {
-      // Return our gear to the shared bank so the peer can use it, then leave.
-      try { this.sync._unequipAllToBank(); } catch (e) { logger.warn('leave unequip failed', e); }
-      this.transport._flushOutbox(); // bypass the 16ms batch — returns must go out NOW
+      if (this.transport.isConnected) {
+        // Return our gear to the shared bank so the peer can use it, then leave.
+        try { this.sync._unequipAllToBank(); } catch (e) { logger.warn('leave unequip failed', e); }
+        // Mark the clean leave: the returns were synced, so any gear our
+        // local save still shows equipped on the next join is a ghost.
+        try { localStorage.setItem('rmp_clean_leave', '1'); } catch (e) { /* noop */ }
+        this.transport._flushOutbox(); // bypass the 16ms batch — returns must go out NOW
+      }
       setTimeout(() => this.transport.close(), 250); // let the WS frame actually leave
     });
 
@@ -7501,6 +7506,24 @@ export function setup(ctx) {
   // by Sync.handle's table, everything else to the matching _applyX.
   transport.on('message', (msg) => syncInstance.handle(msg));
 
+  // Ghost-gear strip on join. If our last leave was CLEAN (unequip ran and
+  // was synced while paired — flagged in localStorage), any gear our local
+  // save still shows equipped is a ghost: those items were already returned
+  // to the shared bank, and the snapshot's additive bank heal would give us
+  // a second copy (the "ring equipped AND in bank" dupe). Strip without
+  // bank return. The flag is ONLY set when a peer was connected to receive
+  // the returns, so crash-gear and offline-leave gear is never stripped.
+  // Registered here (mod load) so it runs before the panel's 'open' handler
+  // fires requestSnapshot().
+  transport.on('open', () => {
+    let clean = false;
+    try { clean = localStorage.getItem('rmp_clean_leave') === '1'; } catch { /* noop */ }
+    if (!clean) return;
+    try { localStorage.removeItem('rmp_clean_leave'); } catch { /* noop */ }
+    logger.info('[JOIN] Clean-leave flag set — stripping ghost equipment from stale save');
+    try { syncInstance._clearLocalEquipment(); } catch (e) { logger.error('ghost strip failed', e); }
+  });
+
   // Tracks that this page session exists because we accepted the host's
   // save — used to ignore the automatic re-send after the reload.
   let hostSaveLoadedThisSession = false;
@@ -7587,6 +7610,11 @@ export function setup(ctx) {
   window.addEventListener('pagehide', () => {
     if (!transport.isConnected) return;
     try { syncInstance._unequipAllToBank(); } catch { /* noop */ }
+    // The returns above were synced while paired. The game's own save fires
+    // on beforeunload (BEFORE this pagehide handler), so our local save will
+    // very likely still show this gear equipped — the flag tells the next
+    // join to strip those ghosts (see the transport 'open' handler).
+    try { localStorage.setItem('rmp_clean_leave', '1'); } catch { /* noop */ }
     try { transport._flushOutbox(); } catch { /* noop */ }
     try { if (game && game.scheduleSave) game.scheduleSave(); } catch { /* noop */ }
   });

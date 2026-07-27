@@ -60,10 +60,15 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   (synced), so the pool stays consistent with no equipment messages at all.
   Invariant: an item is either in the shared bank OR in exactly one player's
   gear. Leave (Disconnect button or `pagehide`) = `_unequipAllToBank()` +
-  `transport._flushOutbox()` (the 16 ms send batch dies with the page otherwise).
-  Join via host save = `_clearLocalEquipment()` strips the save's equipped gear
-  WITHOUT bank return (the host still holds those items). Snapshots never touch
-  gear or `selectedEquipmentSet`. Tablet/ammo consumption
+  `transport._flushOutbox()` (the 16 ms send batch dies with the page otherwise)
+  + sets `localStorage.rmp_clean_leave` (ONLY when paired, so the returns
+  actually reached the pool). Join (any role): the clean-leave flag triggers
+  `_clearLocalEquipment()` — gear the stale local save still shows equipped is
+  stripped WITHOUT bank return, else the snapshot's additive bank heal dupes it
+  (equipped AND in bank). The same strip runs after a host-save load (the host
+  still holds the save's equipped gear). No flag (crash / offline leave) = gear
+  kept — truthful ownership. Snapshots never touch gear or
+  `selectedEquipmentSet`. Tablet/ammo consumption
   (`Equipment.removeQuantityFromSlot`) is local-only by design — that's what
   makes summoning tablets deplete correctly for both players.
 
