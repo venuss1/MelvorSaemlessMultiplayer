@@ -55,6 +55,17 @@ co-op over a shared save. No build step — `.mjs` files are loaded directly by 
   (first = host) and shuttles messages. Works through any firewall that allows HTTPS.
 - `ActionLock` tracks who trains what; advisory conflict warning in the UI.
 - `Panel` is an imperative floating DOM panel (top-right).
+- **Equipment is PER-PLAYER (never synced).** The shared bank is the single item
+  pool: equip -> `Bank.removeItemQuantity` (synced), unequip -> `Bank.addItem`
+  (synced), so the pool stays consistent with no equipment messages at all.
+  Invariant: an item is either in the shared bank OR in exactly one player's
+  gear. Leave (Disconnect button or `pagehide`) = `_unequipAllToBank()` +
+  `transport._flushOutbox()` (the 16 ms send batch dies with the page otherwise).
+  Join via host save = `_clearLocalEquipment()` strips the save's equipped gear
+  WITHOUT bank return (the host still holds those items). Snapshots never touch
+  gear or `selectedEquipmentSet`. Tablet/ammo consumption
+  (`Equipment.removeQuantityFromSlot`) is local-only by design — that's what
+  makes summoning tablets deplete correctly for both players.
 
 ### Single-file layout (src/setup.mjs, ~7.5k lines)
 The mod is ONE module on purpose — the loader cannot resolve static imports
@@ -70,7 +81,7 @@ between mod files. Sections, in order: logger -> protocol (`Msg`) -> `Transport`
   holds the re-entrancy guard, logs `${label} failed`, and schedules a save
   (some systems pass `save:false` — never change a site's save flag).
 - Shared scaffolding: `_canSend()`/`_send(payload)`, `_afterEach(Cls, names, cb)`.
-- Guard-neutral apply helpers (`_applyEquipmentSets`, `_applyArchaeologyBulk`,
+- Guard-neutral apply helpers (`_applyArchaeologyBulk`,
   per-skill `_apply<Skill>Selection`) NEVER touch `_applyingRemote`/`_scheduleSave`
   — `_applySnapshot` calls them with a data-dependent guard state that is
   load-bearing (some unguarded spans intentionally echo). Do not 'fix' the

@@ -67,7 +67,7 @@ const Msg = Object.freeze({
   ACTION_START: 'action_start', ACTION_STOP: 'action_stop',
   XP: 'xp', MASTERY: 'mastery', MASTERY_POOL: 'pool',
   BANK: 'bank', CURRENCY: 'currency',
-  EQUIPMENT: 'equip', PET: 'pet', ITEM_CHARGE: 'charge', POTION: 'potion',
+  PET: 'pet', ITEM_CHARGE: 'charge', POTION: 'potion',
   SHOP: 'shop',
   TUTORIAL: 'tutorial',
   ROCK_HP: 'rock_hp',
@@ -691,19 +691,6 @@ class Sync {
   _itemById(id) { return game.items.getObjectByID(id); }
   _currencyById(id) { return game.currencies.getObjectByID(id); }
 
-  // Check if an item is currently equipped in any equipment set.
-  // Used to prevent bank dupe when stale bank syncs arrive after equipment syncs.
-  _isItemEquipped(item) {
-    if (!game.combat || !game.combat.player || !game.combat.player.equipmentSets) return false;
-    for (const eqSet of game.combat.player.equipmentSets) {
-      if (!eqSet || !eqSet.equipment || !eqSet.equipment.equippedItems) continue;
-      for (const eqItem of Object.values(eqSet.equipment.equippedItems)) {
-        if (eqItem && eqItem.item && eqItem.item.id === item.id) return true;
-      }
-    }
-    return false;
-  }
-
   // ---- XP / Abyssal XP --------------------------------------------------
 
   _patchXP() {
@@ -895,15 +882,11 @@ class Sync {
     const current = bank.getQty(item);
     const delta = msg.qty - current;
     if (delta === 0) return;
-    // Prevent dupe: if the bank sync says to ADD an item (delta > 0) but the
-    // item is currently equipped by the local player, skip the add. This
-    // happens when a stale bank sync from an unequip arrives after the
-    // equipment sync from a re-equip. The item is already equipped, so adding
-    // it back to the bank would create a duplicate.
-    if (delta > 0 && this._isItemEquipped(item)) {
-      logger.info('Bank sync skip (item equipped):', msg.itemId, 'current:', current, 'target:', msg.qty);
-      return;
-    }
+    // Always apply. Equipment is per-player now, so the old "skip adds when
+    // the item is equipped locally" guard is gone — with a shared bank pool,
+    // a peer's unequip (bank add) must land even if we hold the same item in
+    // our own gear. All bank changes arrive over one ordered socket, so the
+    // stale-ordering dupe the guard defended against cannot occur.
     logger.info('Bank sync apply:', msg.itemId, 'current:', current, 'target:', msg.qty, 'delta:', delta);
     this._applyRemote('bank apply', () => {
       if (delta > 0) {
@@ -973,18 +956,13 @@ class Sync {
   // ---- Equipment --------------------------------------------------------
 
   _patchEquipment() {
-    // --- Gear / equipment sets ---
-    const sendEquip = () => {
-      if (sync._applyingRemote || !sync.transport.isConnected) return;
-      sync.transport.send({
-        t: Msg.EQUIPMENT, sets: sync._serializeEquipSets(),
-        selectedSet: game.combat.player.selectedEquipmentSet,
-      });
-    };
-    const afterEquip = function () { sendEquip(); };
-    for (const m of ['equipItem', 'unequipItem', 'changeEquipmentSet']) {
-      this.ctx.patch(Player, m).after(afterEquip);
-    }
+    // --- Gear is NOT synced ---
+    // Equipment is per-player by design: each player wears their own gear,
+    // drawn from (and returned to) the shared bank. Equipping fires
+    // Bank.removeItemQuantity / unequipping fires Bank.addItem — both are
+    // patched in _patchBank, so the shared bank pool stays consistent
+    // without any equipment messages. See _unequipAllToBank /
+    // _clearLocalEquipment for the leave/join lifecycle.
 
     // --- Food ---
     const sendFood = () => {
@@ -1036,29 +1014,6 @@ class Sync {
   // Wave-2 serializers: each returns the exact wire fragment its sender
   // emits today, reading state via game.combat.player (never callback this).
 
-  _serializeEquipSets() {
-    const sets = [];
-    for (let i = 0; i < game.combat.player.equipmentSets.length; i++) {
-      const eqSet = game.combat.player.equipmentSets[i];
-      const eq = eqSet.equipment;
-      const slots = {};
-      for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
-        slots[slotId] = { itemId: eqItem.item.id, qty: eqItem.quantity };
-      }
-      // Per-set spell/prayer selection
-      const spellSel = eqSet.spellSelection || {};
-      const prayerSel = eqSet.prayerSelection;
-      slots.__spellSelection = {
-        attackId: spellSel.attack ? spellSel.attack.id : null,
-        curseId: spellSel.curse ? spellSel.curse.id : null,
-        auroraId: spellSel.aurora ? spellSel.aurora.id : null,
-      };
-      slots.__prayerSelection = prayerSel ? [...prayerSel].map(ap => ap.id) : [];
-      sets.push(slots);
-    }
-    return sets;
-  }
-
   _serializeFood() {
     const food = [];
     if (game.combat.player.food && game.combat.player.food.slots) {
@@ -1101,116 +1056,72 @@ class Sync {
     return styles;
   }
 
-  _applyEquipment(msg) {
-    if (!msg.sets || !game.combat.player) return;
-    this._applyRemote('applyEquipment', () => {
-      this._applyEquipmentSets(msg.sets, { warn: true });
-      // Switch to the remote's selected equipment set.
-      if (typeof msg.selectedSet === 'number' && msg.selectedSet !== game.combat.player.selectedEquipmentSet) {
-        try { game.combat.player.changeEquipmentSet(msg.selectedSet); } catch (e) { /* skip */ }
+  // ---- Per-player equipment lifecycle -------------------------------------
+  // Gear is per-player; the shared bank is the single item pool. Invariant:
+  // an item is either in the shared bank OR in exactly one player's
+  // equipment — never both, never nowhere.
+
+  // Leave flow: return every equipped item (all sets) to the shared bank.
+  // forceAddAllToBank routes through Bank.addItem, whose patch broadcasts
+  // each return to the peer. Callers must flush the transport afterwards
+  // (the 16ms send batch would otherwise die with the page/socket).
+  _unequipAllToBank() {
+    const p = game.combat && game.combat.player;
+    if (!p || !p.equipmentSets) return;
+    let returned = 0;
+    for (const eqSet of p.equipmentSets) {
+      const eq = eqSet && eqSet.equipment;
+      if (!eq) continue;
+      for (const eqItem of Object.values(eq.equippedItems)) {
+        if (eqItem && !eqItem.isEmpty && !eqItem.occupiedBy) returned += eqItem.quantity || 1;
       }
-      this._updateEquipmentAfterSync();
-      // Update active skills/minibar
-      this._queueRender('xp');
-    });
+      try { eq.forceAddAllToBank(); } catch (e) { logger.warn('unequip-all failed', e); }
+    }
+    if (returned > 0) logger.info(`[LEAVE] Returned ${returned} equipped item(s) to the shared bank`);
+    this._refreshEquipmentUI();
   }
 
-  // Shared equipment-sets apply core (live EQUIPMENT message + snapshot
-  // equipSets block). Guard-neutral: never touches _applyingRemote or
-  // _scheduleSave — callers keep their wrappers. `warn` enables the live
-  // handler's per-slot warning logs; the snapshot applies silently.
-  // Callers must guard game.combat.player before calling.
-  _applyEquipmentSets(sets, { warn = false } = {}) {
-    const player = game.combat.player;
-    for (let i = 0; i < sets.length; i++) {
-      const remoteSlots = sets[i];
-      const eqSet = player.equipmentSets[i];
-      if (!eqSet) continue;
-      const eq = eqSet.equipment;
-      // Unequip slots that are no longer equipped remotely.
-      // unequipItem already returns the item to bank internally
-      for (const [slotId, eqItem] of Object.entries(eq.equippedItems)) {
-        if (remoteSlots[slotId] === undefined) {
-          const slot = game.equipmentSlots.getObjectByID(slotId);
-          if (slot) {
-            try { eq.unequipItem(slot); } catch (e) { if (warn) logger.warn(`unequip ${slotId} failed: ${e.message}`); }
-          }
+  // Join flow (save-sync only): the save just loaded carries the HOST's
+  // equipped gear, but the host still has those items equipped on their own
+  // client — they are already out of the shared bank pool. Strip them from
+  // local equipment WITHOUT returning them to the bank, or every equipped
+  // item would exist twice (worn by the host, banked by the joiner).
+  _clearLocalEquipment() {
+    const p = game.combat && game.combat.player;
+    if (!p || !p.equipmentSets) return;
+    this._applyingRemote = true; // suppress all sync sends during the strip
+    try {
+      for (const eqSet of p.equipmentSets) {
+        const eq = eqSet && eqSet.equipment;
+        if (!eq) continue;
+        // Sum quantities per item, skipping occupied shadow slots (2H weapons)
+        // so each physical item is counted once.
+        const perItem = new Map();
+        for (const eqItem of Object.values(eq.equippedItems)) {
+          if (!eqItem || eqItem.isEmpty || eqItem.occupiedBy) continue;
+          perItem.set(eqItem.item, (perItem.get(eqItem.item) || 0) + (eqItem.quantity || 1));
+        }
+        if (perItem.size === 0) continue;
+        try { eq.forceAddAllToBank(); } catch (e) { logger.warn('clear-equip: unequip failed', e); continue; }
+        for (const [item, qty] of perItem) {
+          try { game.bank.removeItemQuantity(item, qty, false); } catch (e) { logger.warn('clear-equip: bank remove failed', item && item.id, e); }
         }
       }
-      // Equip / update slots to match remote.
-      // equipItem already removes the item from bank internally
-      for (const [slotId, remote] of Object.entries(remoteSlots)) {
-        if (slotId === '__spellSelection' || slotId === '__prayerSelection') continue;
-        const local = eq.equippedItems[slotId];
-        const item = this._itemById(remote.itemId);
-        if (!item) { if (warn) logger.warn(`equip: item not found: ${remote.itemId}`); continue; }
-        const slot = game.equipmentSlots.getObjectByID(slotId);
-        if (!slot) { if (warn) logger.warn(`equip: slot not found: ${slotId}`); continue; }
-        if (local && local.item.id === remote.itemId && local.quantity === remote.qty) continue;
-        // Unequip current item if any (returns to bank)
-        if (local) {
-          try { eq.unequipItem(slot); } catch (e) { if (warn) logger.warn(`unequip before equip ${slotId} failed: ${e.message}`); }
-        }
-        // Ensure item is in bank (add if missing, since UNLOCK_ALL may have equipped it already)
-        if (!game.bank.hasItem(item)) {
-          try { game.bank.addItem(item, remote.qty, false, true, true, false); } catch (e) { /* skip */ }
-        }
-        // Equip — equipItem removes from bank internally
-        try {
-          eq.equipItem(item, slot, remote.qty);
-        } catch (e) {
-          if (warn) logger.warn(`equip ${slotId} with ${remote.itemId} failed: ${e.message}`);
-        }
-      }
-      // Per-set spell selection
-      if (remoteSlots.__spellSelection && eqSet.spellSelection) {
-        const ss = remoteSlots.__spellSelection;
-        try {
-          if (ss.attackId) {
-            const sp = game.attackSpells.getObjectByID(ss.attackId);
-            if (sp && player.selectAttackSpell) player.selectAttackSpell(sp, false);
-          }
-          if (ss.curseId) {
-            const sp = game.curseSpells && game.curseSpells.getObjectByID(ss.curseId);
-            if (sp && player.toggleCurse) player.toggleCurse(sp, false);
-          }
-          if (ss.auroraId) {
-            const sp = game.auroraSpells && game.auroraSpells.getObjectByID(ss.auroraId);
-            if (sp && player.toggleAurora) player.toggleAurora(sp, false);
-          }
-        } catch { /* skip */ }
-      }
-      // Per-set prayer selection
-      if (remoteSlots.__prayerSelection && eqSet.prayerSelection) {
-        try {
-          eqSet.prayerSelection.clear();
-          for (const pid of remoteSlots.__prayerSelection) {
-            // game.prayers is NamespaceRegistry<ActivePrayer>, so
-            // getObjectByID already returns an ActivePrayer instance.
-            const ap = game.prayers && game.prayers.getObjectByID(pid);
-            if (ap) eqSet.prayerSelection.add(ap);
-          }
-        } catch { /* skip */ }
-      }
-    }
+    } finally { this._applyingRemote = false; }
+    logger.info('[JOIN] Stripped host-save equipment — re-equip from the shared bank');
+    this._refreshEquipmentUI();
   }
 
-  // Post-equipment-sync refresh: stat recalc, equip-set UI update, render
-  // flags, bank re-render. Guard-neutral. Shared by the live EQUIPMENT
-  // handler and the snapshot equipSets block (the live handler's selectedSet
-  // switch and extra xp render stay at its call site, between the two calls).
-  _updateEquipmentAfterSync() {
-    const player = game.combat.player;
-    // Properly update stats and UI — updateForEquipmentChange does stat recalc + UI update
-    try { player.updateForEquipmentChange(); } catch (e) { /* skip */ }
-    // Render equipment sets menu
-    try { player.updateForEquipSetChange(); } catch (e) { /* skip */ }
-    // Set render queue flags for equipment and bank
-    if (player.renderQueue) {
-      player.renderQueue.equipment = true;
-      player.renderQueue.equipmentSets = true;
+  // Stat recalc + equipment/bank UI refresh after local equipment surgery.
+  _refreshEquipmentUI() {
+    const p = game.combat && game.combat.player;
+    if (!p) return;
+    try { p.updateForEquipmentChange(); } catch (e) { /* skip */ }
+    try { p.updateForEquipSetChange(); } catch (e) { /* skip */ }
+    if (p.renderQueue) {
+      p.renderQueue.equipment = true;
+      p.renderQueue.equipmentSets = true;
     }
-    // Force bank to re-render (items moved in/out of bank)
     this._queueRender('bank');
   }
 
@@ -5552,12 +5463,11 @@ class Sync {
     for (const [item, bi] of game.bank.items) bank.push({ id: item.id, qty: bi.quantity });
     const currencies = [];
     for (const c of game.currencies.allObjects) currencies.push({ id: c.id, qty: c._amount });
-    const equipSets = [];
     const playerState = {};
     if (game.combat.player) {
-      equipSets.push(...this._serializeEquipSets());
-      // Player combat state
-      playerState.selectedSet = game.combat.player.selectedEquipmentSet;
+      // Equipment is per-player — deliberately absent from the snapshot.
+      // The joiner keeps whatever their own save has equipped; see
+      // _clearLocalEquipment for the save-sync join path.
       // Destructured to keep the historical key order (prayerPoints, soulPoints, prayers)
       const { prayers, prayerPoints, soulPoints } = this._serializePrayers();
       Object.assign(playerState, { prayerPoints, soulPoints, prayers });
@@ -5594,7 +5504,7 @@ class Sync {
     // Active potions
     const potions = (game.potions && game.potions.activePotions) ? this._serializePotions() : [];
 
-    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, equipSets, playerState, pets, charges, shopUpgrades, bankTabCount, tutorial, rockHP, harvestingVeins, farming: farmingPlots, combat: combatState, combatEventState, potions };
+    const snapshot = { t: Msg.STATE_SNAPSHOT, skills, bank, currencies, playerState, pets, charges, shopUpgrades, bankTabCount, tutorial, rockHP, harvestingVeins, farming: farmingPlots, combat: combatState, combatEventState, potions };
 
     // Mastery (per-action XP + mastery pool XP per realm)
     const mastery = [];
@@ -5835,7 +5745,7 @@ class Sync {
   _applySnapshot(msg) {
     logger.info('========== [MP] APPLYING SNAPSHOT ==========');
     logger.info(`[SNAPSHOT] Received: ${msg.skills?.length || 0} skills, ${msg.bank?.length || 0} bank items, ` +
-      `${msg.currencies?.length || 0} currencies, ${msg.equipSets?.length || 0} equip sets, ${msg.pets?.length || 0} pets, ` +
+      `${msg.currencies?.length || 0} currencies, ${msg.pets?.length || 0} pets, ` +
       `${msg.charges?.length || 0} charges, ${msg.rockHP?.length || 0} rocks, ${msg.farming?.length || 0} farming plots`);
     this._applyingRemote = true;
     try {
@@ -5895,11 +5805,7 @@ class Sync {
         if (cur.renderAmount) cur.renderAmount();
         if (cur.onAmountChange) cur.onAmountChange();
       }
-      // Equipment sets — unequipItem/equipItem handle bank internally
-      if (msg.equipSets && game.combat.player) {
-        this._applyEquipmentSets(msg.equipSets);
-        this._updateEquipmentAfterSync();
-      }
+      // Equipment is per-player: the snapshot must not touch gear.
       // ---- Player state ----
       if (msg.playerState && game.combat.player) {
         const ps = msg.playerState;
@@ -5934,7 +5840,7 @@ class Sync {
             if (style) p.attackStyles[a.attackType] = style;
           }
         }
-        if (typeof ps.selectedSet === 'number') p.selectedEquipmentSet = ps.selectedSet;
+        // selectedSet is per-player like the gear itself — not applied.
         if (ps.attackSpellId) {
           const spell = game.attackSpells.getObjectByID(ps.attackSpellId);
           if (spell && p.selectAttackSpell) p.selectAttackSpell(spell, false);
@@ -6859,7 +6765,6 @@ class Sync {
       [Msg.MASTERY_POOL]: (m) => this._applyMasteryPool(m),
       [Msg.BANK]: (m) => this._applyBank(m),
       [Msg.CURRENCY]: (m) => this._applyCurrency(m),
-      [Msg.EQUIPMENT]: (m) => this._applyEquipment(m),
       [Msg.PET]: (m) => this._applyPet(m),
       [Msg.ITEM_CHARGE]: (m) => this._applyItemCharge(m),
       [Msg.POTION]: (m) => this._applyPotion(m),
@@ -7264,7 +7169,12 @@ class Panel {
       }
     });
 
-    $('disconnectBtn').addEventListener('click', () => this.transport.close());
+    $('disconnectBtn').addEventListener('click', () => {
+      // Return our gear to the shared bank so the peer can use it, then leave.
+      try { this.sync._unequipAllToBank(); } catch (e) { logger.warn('leave unequip failed', e); }
+      this.transport._flushOutbox(); // bypass the 16ms batch — returns must go out NOW
+      setTimeout(() => this.transport.close(), 250); // let the WS frame actually leave
+    });
 
     $('copySaveBtn').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -7585,6 +7495,10 @@ export function setup(ctx) {
   // by Sync.handle's table, everything else to the matching _applyX.
   transport.on('message', (msg) => syncInstance.handle(msg));
 
+  // Tracks that this page session exists because we accepted the host's
+  // save — used to ignore the automatic re-send after the reload.
+  let hostSaveLoadedThisSession = false;
+
   // Host: automatically send save to peer when they connect.
   transport.on('send_save', () => {
     logger.info('Peer connected — auto-sending host save...');
@@ -7604,6 +7518,14 @@ export function setup(ctx) {
   // the save cleanly on startup.
   transport.on('save_sync', (saveString) => {
     if (!saveString) { logger.warn('save_sync event but no save string'); return; }
+    // The relay re-pairs (and the host re-sends its save) after every peer
+    // reconnect — including OUR OWN reload right after loading the host's
+    // save. Accepting again would reload-loop forever, so only ever load one
+    // host save per page session; ignore later pushes.
+    if (hostSaveLoadedThisSession) {
+      logger.info('Ignoring duplicate host save (already loaded one this session)');
+      return;
+    }
     logger.info('Received host save (' + saveString.length + ' chars)');
     try {
       const ok = confirm(
@@ -7622,6 +7544,9 @@ export function setup(ctx) {
         sessionStorage.setItem('rmp_autoconnect', JSON.stringify({
           server: transport._serverUrl || '',
           name: transport.myName || 'Player',
+          // The host save we're about to load has the host's gear equipped —
+          // it must be stripped (not returned to bank) after the reload.
+          clearEquip: true,
         }));
       } catch { /* noop */ }
       setSlotToSaveString(0, saveString).then(() => {
@@ -7646,6 +7571,18 @@ export function setup(ctx) {
     logger.info('Character loaded, installing sync patches');
     try { syncInstance.install(); }
     catch (e) { logger.error('sync.install() failed', e); }
+  });
+
+  // Leaving the page mid-session (refresh/close): return our gear to the
+  // shared bank so the peer isn't locked out of it. Best-effort — the
+  // batched sender is flushed synchronously since timers won't run during
+  // unload. If the browser kills the page first, the gear simply stays with
+  // our save and comes back when we rejoin.
+  window.addEventListener('pagehide', () => {
+    if (!transport.isConnected) return;
+    try { syncInstance._unequipAllToBank(); } catch { /* noop */ }
+    try { transport._flushOutbox(); } catch { /* noop */ }
+    try { if (game && game.scheduleSave) game.scheduleSave(); } catch { /* noop */ }
   });
 
   // Fallback: if character is already loaded (onCharacterLoaded may have
@@ -7673,7 +7610,14 @@ export function setup(ctx) {
       const auto = sessionStorage.getItem('rmp_autoconnect');
       if (auto) {
         sessionStorage.removeItem('rmp_autoconnect');
-        const { server, name } = JSON.parse(auto);
+        const { server, name, clearEquip } = JSON.parse(auto);
+        hostSaveLoadedThisSession = true;
+        if (clearEquip) {
+          // Strip the host's gear that came with the save (see
+          // Sync._clearLocalEquipment), then continue as a naked joiner who
+          // re-equips from the shared bank.
+          try { syncInstance._clearLocalEquipment(); } catch (e) { logger.error('clear-equip on join failed', e); }
+        }
         if (server) {
           logger.info('Auto-reconnecting after save sync...', server, name);
           setTimeout(() => {

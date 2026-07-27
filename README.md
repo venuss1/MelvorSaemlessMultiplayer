@@ -3,9 +3,10 @@
 A seamless **co-op multiplayer** mod for [Melvor Idle](https://melvoridle.com).
 Two players share **one profile/save** and each train different things at the
 same time. Whatever one player earns (XP, mastery, bank items, currencies,
-equipment, pets, shop upgrades, farming plots, agility courses, and much more)
+pets, shop upgrades, farming plots, agility courses, and much more)
 is mirrored onto the other player's game in real time over a WebSocket relay
-connection.
+connection. **Equipment is the one exception** — it is per-player (see
+[Inventory & equipment](#inventory--equipment)).
 
 > **Repo:** <https://github.com/venuss1/melvor-idle-real-multiplayer>
 
@@ -25,12 +26,12 @@ connection.
    reloads — both clients now run the exact same character.
 3. After reload, the peer **auto-reconnects** to the host automatically.
 4. Either side can request a **full state snapshot** (every skill, bank item,
-   currency, equipment set, pet, plot, obstacle, etc.) so both clients
+   currency, pet, plot, obstacle, etc.) so both clients
    converge.
 5. Each player trains a different skill (e.g. one woodcuts, the other mines).
 6. The mod patches dozens of game methods (`Skill.addXP`,
    `SkillWithMastery.addMasteryXP`, `Bank.addItem` / `removeItemQuantity`,
-   `Currency.add/remove/set`, `Player.equipItem`, `Farming.plantPlot`,
+   `Currency.add/remove/set`, `Farming.plantPlot`,
    `Agility.buildObstacle`, `Shop.buyItemOnClick`, and many more) to broadcast
    the **absolute new value** of any state change to the peer.
 8. The peer writes that value straight into the game's internal fields and
@@ -76,7 +77,7 @@ Nearly every game system is synchronised in real time:
 |--------|----------|
 | **Bank** | Item quantities (add/remove/sell), corrupted entry cleanup, render queue batching |
 | **Currencies** | GP, Slayer Coins, Raid Coins, Abyssal Pieces, Abyssal Slayer Coins, and all modded currencies — with 60s periodic safety-net sync |
-| **Equipment** | All equipment sets, slots, quantities, spell/prayer selections |
+| **Equipment** | **Per-player, not synced.** Each player wears their own gear, drawn from the shared bank (equipping removes from the bank for both; unequipping returns it for both). On disconnect/page close your gear is auto-returned to the shared bank; on joining via the host's save you start naked and re-equip from the bank |
 | **Equipment set count** | Number of unlocked equipment set slots |
 | **Food** | Equipped food slots and selected slot |
 | **Prayers / Curses / Auroras** | Active prayers, prayer/soul points |
